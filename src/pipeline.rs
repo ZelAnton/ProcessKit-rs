@@ -675,7 +675,9 @@ impl Pipeline {
             // `gather` (however long the drain takes to notice) still finishes
             // and wins the `select!` rather than hanging next to a pending kill.
             let gather = async {
-                let joined = drain_unordered(tasks, &teardown).await?;
+                let joined = drain_unordered(tasks, &teardown)
+                    .await
+                    .map_err(|failure| failure.error)?;
                 let mut inner_outcomes: Vec<Option<StageOutcome>> =
                     (0..inner_count).map(|_| None).collect();
                 let mut last_slot: Option<(ProcessResult<T>, bool)> = None;
@@ -1168,16 +1170,20 @@ impl PipelineSession {
         // arbiter is race-free against the watchdog: whichever of `Exited`/`TimedOut`
         // CASes from `PENDING` first decides.
         if self.chain_timed_out() {
-            return Ok(Finished {
-                outcome: Outcome::TimedOut,
-                stderr: String::new(),
-                stderr_truncated: false,
-            });
+            return Ok(timeout_finished(
+                inner_res,
+                last_res,
+                &self.last_program,
+                &self.last_ok_codes,
+                self.last_unchecked,
+                self.last_timeout,
+                last_torn_down,
+            ));
         }
 
         // Surface a raw `Err` from either side (Cancelled / OutputTooLarge / Stdin / Io).
         let last_finished = last_res?;
-        let mut inner = inner_res?;
+        let mut inner = inner_res.map_err(|failure| failure.error)?;
 
         // Rebuild the inner stages in left-to-right order (a clean drain returns all
         // `inner_count` items, each tagged with its unique launch index), then append
@@ -1362,6 +1368,59 @@ async fn finish_inner_stage(
     ))
 }
 
+/// Fold the stage results that survived a chain-wide timeout. The deadline wins
+/// only for the public outcome; stderr still follows the same pipefail attribution
+/// as a natural finish. A raw stage error has no `Finished` payload of its own, so
+/// it is ignored here while any completed sibling snapshots are still preserved.
+fn timeout_finished(
+    inner_res: InnerDrain,
+    last_res: Result<Finished>,
+    last_program: &str,
+    last_ok_codes: &[i32],
+    last_unchecked: bool,
+    last_timeout: Option<Duration>,
+    last_torn_down: bool,
+) -> Finished {
+    let mut inner = match inner_res {
+        Ok(inner) => inner,
+        // A raw error ends the drain early, but the stages that joined before it
+        // still have complete stderr snapshots. Preserve those for the timeout
+        // fold; the raw error itself is intentionally ignored because the chain
+        // deadline owns the public outcome on this path.
+        Err(failure) => failure.completed,
+    };
+    inner.sort_by_key(|(index, _)| *index);
+    let mut stages: Vec<StageOutcome> = inner.into_iter().map(|(_, outcome)| outcome).collect();
+
+    if let Ok(last_finished) = last_res {
+        stages.push(StageOutcome {
+            program: last_program.to_owned(),
+            outcome: last_finished.outcome,
+            stderr: last_finished.stderr,
+            unchecked: last_unchecked,
+            ok_codes: last_ok_codes.to_vec(),
+            timeout: last_timeout,
+            torn_down: last_torn_down,
+            stderr_truncated: last_finished.stderr_truncated,
+        });
+    }
+
+    if stages.is_empty() {
+        return Finished {
+            outcome: Outcome::TimedOut,
+            stderr: String::new(),
+            stderr_truncated: false,
+        };
+    }
+
+    let folded = pipefail(stages, ());
+    Finished {
+        outcome: Outcome::TimedOut,
+        stderr: folded.stderr().to_owned(),
+        stderr_truncated: folded.truncated(),
+    }
+}
+
 /// True for SIGPIPE (Unix signal 13) — the usual victim symptom, not the culprit.
 fn is_sigpipe(outcome: &Outcome) -> bool {
     #[cfg(unix)]
@@ -1481,6 +1540,15 @@ fn join_error(err: tokio::task::JoinError) -> crate::Error {
     )))
 }
 
+#[derive(Debug)]
+struct PartialDrainError<Item> {
+    completed: Vec<Item>,
+    error: crate::Error,
+}
+
+type InnerStage = (usize, StageOutcome);
+type InnerDrain = std::result::Result<Vec<InnerStage>, PartialDrainError<InnerStage>>;
+
 /// Drain every task in `tasks` to completion in **true completion order**
 /// (`JoinSet::join_next`, not a left-to-right positional await), firing
 /// `teardown` the instant *any* task ends badly — a raw `Err` (a stage's own
@@ -1514,18 +1582,24 @@ fn join_error(err: tokio::task::JoinError) -> crate::Error {
 async fn drain_unordered<Item: 'static>(
     mut tasks: tokio::task::JoinSet<Result<Item>>,
     teardown: &tokio_util::sync::CancellationToken,
-) -> Result<Vec<Item>> {
+) -> std::result::Result<Vec<Item>, PartialDrainError<Item>> {
     let mut collected = Vec::with_capacity(tasks.len());
     while let Some(joined) = tasks.join_next().await {
         match joined {
             Ok(Ok(item)) => collected.push(item),
             Ok(Err(err)) => {
                 teardown.cancel();
-                return Err(err);
+                return Err(PartialDrainError {
+                    completed: collected,
+                    error: err,
+                });
             }
             Err(join_err) => {
                 teardown.cancel();
-                return Err(join_error(join_err));
+                return Err(PartialDrainError {
+                    completed: collected,
+                    error: join_error(join_err),
+                });
             }
         }
     }
@@ -1740,6 +1814,56 @@ mod tests {
             !untruncated.truncated(),
             "an inner failure with no dropped stderr must not report truncated: {untruncated:?}"
         );
+    }
+
+    #[test]
+    fn chain_timeout_keeps_pipefail_stderr_and_truncation() {
+        let mut culprit = stage("culprit", Outcome::Signalled(None));
+        culprit.stderr = "retained diagnostic".into();
+        culprit.stderr_truncated = true;
+        let finished = timeout_finished(
+            Ok(vec![(0, culprit)]),
+            Ok(Finished {
+                outcome: Outcome::Signalled(None),
+                stderr: String::new(),
+                stderr_truncated: false,
+            }),
+            "last",
+            &[0],
+            false,
+            None,
+            false,
+        );
+
+        assert_eq!(finished.outcome, Outcome::TimedOut);
+        assert_eq!(finished.stderr, "retained diagnostic");
+        assert!(finished.stderr_truncated);
+    }
+
+    #[test]
+    fn chain_timeout_keeps_completed_stderr_when_another_stage_returns_raw_error() {
+        let mut culprit = unclean("completed", Outcome::Exited(7), "retained diagnostic");
+        culprit.stderr_truncated = true;
+        let finished = timeout_finished(
+            Err(PartialDrainError {
+                completed: vec![(0, culprit)],
+                error: crate::Error::io(std::io::Error::other("raw stage error")),
+            }),
+            Ok(Finished {
+                outcome: Outcome::Signalled(None),
+                stderr: String::new(),
+                stderr_truncated: false,
+            }),
+            "last",
+            &[0],
+            false,
+            None,
+            false,
+        );
+
+        assert_eq!(finished.outcome, Outcome::TimedOut);
+        assert_eq!(finished.stderr, "retained diagnostic");
+        assert!(finished.stderr_truncated);
     }
 
     #[test]
@@ -2039,7 +2163,7 @@ mod tests {
              once the sibling's raw error has fired teardown",
                 );
 
-        match drained.map_err(|e| e.into_reason()) {
+        match drained.map_err(|e| e.error.into_reason()) {
             Err(crate::ErrorReason::Io(err)) => {
                 assert_eq!(err.to_string(), "downstream boom");
             }
@@ -2082,7 +2206,7 @@ mod tests {
              once the sibling's panic has fired teardown",
                 );
 
-        match drained.map_err(|e| e.into_reason()) {
+        match drained.map_err(|e| e.error.into_reason()) {
             Err(crate::ErrorReason::Io(err)) => {
                 assert!(
                     err.to_string().contains("pipeline stage task failed"),

@@ -23,7 +23,57 @@ use std::os::unix::process::CommandExt;
 use std::sync::Mutex;
 use std::time::Duration;
 
+#[cfg(test)]
+use std::sync::{Arc, Condvar};
+
 use tokio::process::{Child, Command};
+
+#[cfg(test)]
+struct AdoptionPause {
+    state: Mutex<AdoptionPauseState>,
+    changed: Condvar,
+}
+
+#[cfg(test)]
+#[derive(Default)]
+struct AdoptionPauseState {
+    entered: bool,
+    released: bool,
+}
+
+#[cfg(test)]
+impl AdoptionPause {
+    fn new() -> Self {
+        Self {
+            state: Mutex::new(AdoptionPauseState::default()),
+            changed: Condvar::new(),
+        }
+    }
+
+    fn pause(&self) {
+        let mut state = self.state.lock().expect("adoption pause poisoned");
+        state.entered = true;
+        self.changed.notify_all();
+        while !state.released {
+            state = self.changed.wait(state).expect("adoption pause poisoned");
+        }
+    }
+
+    fn wait_until_entered(&self, timeout: Duration) -> bool {
+        let state = self.state.lock().expect("adoption pause poisoned");
+        let (state, result) = self
+            .changed
+            .wait_timeout_while(state, timeout, |state| !state.entered)
+            .expect("adoption pause poisoned");
+        state.entered && !result.timed_out()
+    }
+
+    fn release(&self) {
+        let mut state = self.state.lock().expect("adoption pause poisoned");
+        state.released = true;
+        self.changed.notify_all();
+    }
+}
 
 #[cfg(feature = "process-control")]
 use crate::member::MemberInfo;
@@ -686,10 +736,13 @@ impl Tracked {
     }
 
     /// Whether this set already tracks **the very process instance** `id` names,
-    /// `identity` being the start-time token just read for it — the de-dup gate the
-    /// two adoption entries ([`ProcessGroup::adopt`], [`ProcessGroup::adopt_external`])
-    /// ask before adding a solo entry for a pid that may already be tracked here as
-    /// a group leader.
+    /// `identity` being the start-time token just read for it — the de-dup gate
+    /// [`ProcessGroup::adopt`] asks before adding a solo entry for a pid that may
+    /// already be tracked here as a group leader. Identity-anchored external
+    /// adoption uses [`prepare_identity_adoption`](Self::prepare_identity_adoption)
+    /// instead, because it must also remove stale same-pid group entries before
+    /// publishing the solo entry. The caller's `ProcessGroup` ownership lock
+    /// covers both operations so a cross-table broadcast cannot split the move.
     ///
     /// Two properties carry the weight, and a plain membership scan has neither:
     ///
@@ -720,6 +773,42 @@ impl Tracked {
         ids.iter().any(|e| e.id == id && e.identity == identity)
     }
 
+    /// Reconcile an identity-anchored external adoption without adding an entry.
+    ///
+    /// The failed-`setpgid` path moves a pid from the group table's semantics to
+    /// the solo table's semantics. A stale group entry with no identity cannot be
+    /// pruned by [`probe_entry`](Self::probe_entry), so merely asking
+    /// [`holds_same_process`](Self::holds_same_process) whether the group already
+    /// owns this process would leave that bare pid in the table beside the fresh
+    /// solo entry. Remove every same-pid entry that does not carry this anchor,
+    /// retain one matching entry for the same-process fast path, and report whether
+    /// that matching entry was already present. The caller's `ProcessGroup` ownership
+    /// transition holds its lock across this cleanup and solo publication, so a
+    /// broadcast cannot observe either a split move or both representations.
+    #[cfg(feature = "process-control")]
+    fn prepare_identity_adoption(&self, id: i32, identity: u64) -> bool {
+        let mut ids = self.ids.lock().unwrap_or_else(|e| e.into_inner());
+        ids.retain_mut(|e| self.probe_entry(e));
+
+        let mut same_process = false;
+        ids.retain(|entry| {
+            if entry.id != id {
+                return true;
+            }
+            if entry.identity == Some(identity) {
+                if same_process {
+                    false
+                } else {
+                    same_process = true;
+                    true
+                }
+            } else {
+                false
+            }
+        });
+        same_process
+    }
+
     /// Track `id`, pruning drained entries and de-duplicating (re-adopting a
     /// child this set already tracks must not make `members()`/`stats()`
     /// over-report). `group_seen` seeds the latch: `true` only when *this process
@@ -745,24 +834,54 @@ impl Tracked {
     /// that the token was captured *before* the adoption's own syscalls rather than
     /// after them: re-reading it here could hand back `None` for a process that
     /// exited in between, leaving a number-only entry on a path that promises an
-    /// anchored one.
+    /// anchored one. A matching anchor preserves the existing entry; a different
+    /// anchor replaces same-pid entries, including an unanchored stale record that
+    /// cannot be pruned by the identity gate. With no anchor, the existing
+    /// number-only de-dup remains in effect for targets without an identity reader.
     fn track_with(&self, id: i32, group_seen: bool, identity: Option<u64>) {
         // Recover a poisoned lock instead of dropping the child from tracking,
         // which would void the kill-on-drop guarantee.
         let mut ids = self.ids.lock().unwrap_or_else(|e| e.into_inner());
         ids.retain_mut(|e| self.probe_entry(e));
-        if !ids.iter().any(|e| e.id == id) {
-            // A de-dup (re-adopt of an id still present above) keeps the existing
-            // entry's identity untouched; had the number been recycled since,
-            // `probe_entry` would already have pruned the stale entry in the
-            // `retain` above, so this pushes a fresh entry carrying the new
-            // identity.
-            ids.push(Entry {
-                id,
-                group_seen,
-                identity,
+
+        if let Some(identity) = identity {
+            // A number-only entry cannot prove that it is this identity: it may
+            // be the residue of a process that was reaped before the number was
+            // recycled. Replace every same-pid entry that is not this anchor so a
+            // stale solo record cannot mask a fresh adoption or keep a bare pid
+            // alive beside its identity-anchored replacement.
+            let mut same_process = false;
+            ids.retain(|entry| {
+                if entry.id != id {
+                    return true;
+                }
+                if entry.identity == Some(identity) {
+                    if same_process {
+                        false
+                    } else {
+                        same_process = true;
+                        true
+                    }
+                } else {
+                    false
+                }
             });
+            if same_process {
+                return;
+            }
+        } else if ids.iter().any(|entry| entry.id == id) {
+            // Preserve the long-standing number-only de-dup on targets without
+            // an identity reader. If an anchored entry already exists but this
+            // best-effort read failed, retaining the anchored entry also avoids
+            // downgrading the protection it already provides.
+            return;
         }
+
+        ids.push(Entry {
+            id,
+            group_seen,
+            identity,
+        });
     }
 
     /// Send `sig` to every still-existing entry, pruning the drained ones.
@@ -913,6 +1032,10 @@ impl Tracked {
 /// them. Its [`Drop`] hard-kills every still-live group, so an exiting or
 /// panicking owner never leaks subprocesses.
 pub(crate) struct ProcessGroup {
+    /// Serializes transitions between the group and solo ownership tables with
+    /// broadcasts and cross-table teardown observations. The lock order is always
+    /// ownership → `groups` → `solos`.
+    ownership: Mutex<()>,
     /// Group ids we own. A group id is the leader child's pid.
     groups: Tracked,
     /// Adopted children that could not be re-grouped: POSIX forbids
@@ -924,14 +1047,23 @@ pub(crate) struct ProcessGroup {
     /// Set by `graceful_shutdown(escalate=false)` to tell `Drop` not to
     /// hard-kill survivors (the caller deliberately chose not to escalate).
     skip_drop_kill: super::SkipDropKill,
+    #[cfg(test)]
+    adoption_pause: Option<Arc<AdoptionPause>>,
+    #[cfg(test)]
+    group_adoption_pause: Option<Arc<AdoptionPause>>,
 }
 
 impl ProcessGroup {
     pub(crate) fn new() -> Self {
         ProcessGroup {
+            ownership: Mutex::new(()),
             groups: Tracked::new(true),
             solos: Tracked::new(false),
             skip_drop_kill: super::SkipDropKill::new(),
+            #[cfg(test)]
+            adoption_pause: None,
+            #[cfg(test)]
+            group_adoption_pause: None,
         }
     }
 
@@ -972,6 +1104,14 @@ impl ProcessGroup {
     /// [`SkipDropKill::restore`](super::SkipDropKill::restore)).
     #[cfg(feature = "pty")]
     pub(crate) fn rollback_pty_spawn(&self, pid: u32, displaced: super::DisplacedSpare) {
+        // Keep the kill-and-forget rollback one ownership transition: a concurrent
+        // broadcast must not sweep the table between the raw kill and removal, or
+        // it could observe a half-rolled-back member while another adoption is
+        // reconciling the two tables.
+        let _ownership = self
+            .ownership
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner());
         hard_kill_fresh_spawn(pid as i32);
         self.groups.remove(pid as i32);
         self.skip_drop_kill.restore(displaced);
@@ -1052,12 +1192,59 @@ impl ProcessGroup {
         Ok((guard.disarm(), displaced))
     }
 
+    /// Reconcile a failed-`setpgid` adoption as one ownership transition. An
+    /// identity anchor lets the group table discard stale same-pid entries before
+    /// the solo entry is published; without an anchor, preserve the historical
+    /// number-only fast path. The ownership lock is held across both tables and
+    /// every cross-table observer uses the same lock.
+    #[cfg(all(feature = "process-control", test))]
+    fn reconcile_solo_adoption(&self, pid: i32, identity: Option<u64>) {
+        // Recover a poisoned lock rather than allowing a concurrent teardown to
+        // observe or leave a split ownership transition.
+        let _ownership = self
+            .ownership
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner());
+        self.reconcile_solo_adoption_locked(pid, identity);
+    }
+
+    /// The locked half of [`reconcile_solo_adoption`](Self::reconcile_solo_adoption).
+    /// `adopt_external` already owns the transaction while it decides whether
+    /// `setpgid` succeeded, so taking the mutex again there would deadlock.
+    #[cfg(feature = "process-control")]
+    fn reconcile_solo_adoption_locked(&self, pid: i32, identity: Option<u64>) {
+        let same_process = match identity {
+            Some(identity) => self.groups.prepare_identity_adoption(pid, identity),
+            None => self.groups.holds_same_process(pid, None),
+        };
+        if same_process {
+            return;
+        }
+
+        // A new killable solo member joined — re-arm Drop's backstop.
+        self.skip_drop_kill.clear();
+        #[cfg(test)]
+        if let Some(pause) = &self.adoption_pause {
+            pause.pause();
+        }
+        self.solos.track_with(pid, false, identity);
+    }
+
     #[cfg(feature = "process-control")]
     pub(crate) fn adopt(&self, child: &Child) -> io::Result<()> {
         let pid = child
             .id()
             .ok_or_else(|| io::Error::other("child has no pid (already exited?)"))?
             as i32;
+
+        // Serialize the setpgid outcome with its ownership publication. A concurrent
+        // bare-pid adoption can otherwise publish a solo entry after this syscall
+        // succeeds but before the group entry is recorded.
+        let _ownership = self
+            .ownership
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner());
+
         // Try to make the external child its own group leader. Only the child
         // itself is moved — already running descendants keep their group.
         // SAFETY: setpgid on a live pid is a sound call.
@@ -1069,6 +1256,10 @@ impl ProcessGroup {
             // A new killable member joined — re-arm Drop's backstop so a prior
             // graceful_shutdown(escalate=false) latch doesn't spare it.
             self.skip_drop_kill.clear();
+            #[cfg(test)]
+            if let Some(pause) = &self.group_adoption_pause {
+                pause.pause();
+            }
             self.groups.track(pid, true);
             return Ok(());
         }
@@ -1101,11 +1292,7 @@ impl ProcessGroup {
                 // the identity read here (once, and handed to both the check and the
                 // entry, so they cannot disagree) is what it is decided on.
                 let identity = read_identity(pid);
-                if !self.groups.holds_same_process(pid, identity) {
-                    // A new killable solo member joined — re-arm Drop's backstop.
-                    self.skip_drop_kill.clear();
-                    self.solos.track_with(pid, false, identity);
-                }
+                self.reconcile_solo_adoption_locked(pid, identity);
                 Ok(())
             }
             _ => Err(err),
@@ -1155,6 +1342,17 @@ impl ProcessGroup {
                 format!("no process with pid {pid} to adopt"),
             ));
         };
+
+        // Serialize the setpgid outcome with its ownership publication. Two
+        // concurrent callers can observe different results for the same child:
+        // one may move it before exec, while the other reaches setpgid after
+        // exec and must reconcile as a solo. If only the table update were
+        // locked, the failed caller could publish the solo entry before the
+        // successful caller records the group, leaving both representations.
+        let _ownership = self
+            .ownership
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner());
         let anchor = capture_adoption_anchor(pid)?;
         // Try to make the external process its own group leader. Only the process
         // itself is moved — already running descendants keep their group.
@@ -1169,6 +1367,10 @@ impl ProcessGroup {
             // the latch true. A new killable member joined — re-arm Drop's backstop
             // so a prior graceful_shutdown(escalate=false) latch doesn't spare it.
             self.skip_drop_kill.clear();
+            #[cfg(test)]
+            if let Some(pause) = &self.group_adoption_pause {
+                pause.pause();
+            }
             self.groups.track_with(pid, true, Some(anchor));
         } else {
             let err = io::Error::last_os_error();
@@ -1186,15 +1388,15 @@ impl ProcessGroup {
                     // (that would double-count in `members()`/`stats()` and
                     // double-deliver every broadcast). The de-dup is decided on the
                     // anchor this call just captured, against the tracked entry's own
-                    // token and only after a sweep — a bare "is the number on the
-                    // books" test would let an entry whose process was reaped, and
-                    // whose number the OS has since reassigned, skip the tracking
-                    // and return an `Ok` that contains nothing
-                    // ([`Tracked::holds_same_process`]).
-                    if !self.groups.holds_same_process(pid, Some(anchor)) {
-                        self.skip_drop_kill.clear();
-                        self.solos.track_with(pid, false, Some(anchor));
-                    }
+                    // token and only after a sweep. The reconciliation also removes
+                    // same-pid group entries that cannot prove this identity,
+                    // including a stale bare-pid entry, before the fresh solo entry
+                    // is published. A bare "is the number on the books" test would
+                    // otherwise let an entry whose process was reaped, and whose
+                    // number the OS has since been reassigned, skip the tracking and
+                    // return an `Ok` that contains nothing
+                    // ([`Tracked::prepare_identity_adoption`]).
+                    self.reconcile_solo_adoption_locked(pid, Some(anchor));
                 }
                 _ => return Err(err),
             }
@@ -1248,6 +1450,13 @@ impl ProcessGroup {
     /// `GracefulTarget::signal_all`) consume the result; explicit control operations
     /// propagate it.
     fn broadcast(&self, sig: i32) -> io::Result<()> {
+        // Hold the ownership lock across both tables: an adoption may remove a
+        // stale group entry before publishing its solo replacement, and teardown
+        // must linearize either before or after that complete transition.
+        let _ownership = self
+            .ownership
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner());
         let groups = self.groups.signal_all(sig);
         let solos = self.solos.signal_all(sig);
         // `and` keeps the groups error if present, else the solos one — both sweeps
@@ -1257,6 +1466,10 @@ impl ProcessGroup {
 
     /// Whether anything tracked is still alive.
     fn any_alive(&self) -> bool {
+        let _ownership = self
+            .ownership
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner());
         self.groups.any_alive() || self.solos.any_alive()
     }
 
@@ -1265,6 +1478,10 @@ impl ProcessGroup {
     /// here. Dead entries are pruned on the way.
     #[cfg(feature = "process-control")]
     pub(crate) fn members(&self) -> Vec<i32> {
+        let _ownership = self
+            .ownership
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner());
         let mut members = self.groups.live_snapshot();
         members.extend_from_slice(&self.solos.live_snapshot());
         members
@@ -1313,6 +1530,10 @@ impl ProcessGroup {
 
     #[cfg(feature = "stats")]
     pub(crate) fn stats(&self) -> io::Result<ProcessGroupStats> {
+        let _ownership = self
+            .ownership
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner());
         // We track group ids (plus solo-adopted pids), not every individual
         // process, so report the number of live entries and leave cpu/memory
         // absent.
@@ -1347,6 +1568,10 @@ impl super::graceful::GracefulTarget for ProcessGroup {
         // member set `members()` reports (descendants inside the groups are not
         // enumerated). Probe-only (no pruning), and infallible for this in-memory
         // tracked set, so always `Some`.
+        let _ownership = self
+            .ownership
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner());
         Some(self.groups.count_alive() + self.solos.count_alive())
     }
 
@@ -1459,6 +1684,23 @@ mod tests {
     use tokio::process::Command;
 
     use super::*;
+
+    /// Make a raw tokio command start in its own session for tests that need a
+    /// deterministic `EPERM` from the parent's `setpgid` adoption attempt.
+    fn make_session_leader(command: &mut Command) {
+        // SAFETY: the pre-exec hook calls only `setsid` and reads errno, both of
+        // which are async-signal-safe. It runs in the child after fork and before
+        // exec, where the child is not yet a process-group leader.
+        unsafe {
+            command.as_std_mut().pre_exec(|| {
+                if libc::setsid() == -1 {
+                    Err(std::io::Error::last_os_error())
+                } else {
+                    Ok(())
+                }
+            });
+        }
+    }
 
     /// A signal number well past any real or real-time signal (`SIGRTMAX` is ~64 on
     /// Linux, and macOS/BSD have no RT signals), so `kill`/`killpg` reject it with
@@ -1851,6 +2093,87 @@ mod tests {
         let _ = child.wait().await;
     }
 
+    /// A failed `setpgid` adoption of a child must reconcile a stale bare group
+    /// entry before publishing the identity-anchored solo entry. This is the
+    /// `Child`-handle counterpart of the bare-pid adoption regression below.
+    #[cfg(all(
+        feature = "process-control",
+        any(target_os = "linux", target_os = "android", target_vendor = "apple")
+    ))]
+    #[tokio::test]
+    #[ignore = "spawns a real subprocess"]
+    async fn adopt_child_reconciles_a_stale_unanchored_group_entry() {
+        let pg = ProcessGroup::new();
+        let marker = std::env::temp_dir().join(format!(
+            "processkit_pgroup_adopt_child_{}_{}.ready",
+            std::process::id(),
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .expect("system clock after epoch")
+                .as_nanos()
+        ));
+        let _ = std::fs::remove_file(&marker);
+
+        // The child becomes a session leader before the shell writes the marker,
+        // making the parent's setpgid fail with EPERM deterministically even if the
+        // shell has not reached exec yet.
+        let mut cmd = Command::new("sh");
+        cmd.arg("-c")
+            .arg("echo ready > \"$PK_ADOPT_CHILD_READY\"; exec sleep 60")
+            .env("PK_ADOPT_CHILD_READY", &marker)
+            .kill_on_drop(true);
+        make_session_leader(&mut cmd);
+        let mut child = cmd.spawn().unwrap();
+        let pid = child.id().unwrap() as i32;
+        for _ in 0..200 {
+            if marker.exists() {
+                break;
+            }
+            tokio::time::sleep(Duration::from_millis(5)).await;
+        }
+        assert!(
+            marker.exists(),
+            "the session-leader child must report readiness"
+        );
+        let _ = std::fs::remove_file(&marker);
+        let anchor = read_identity(pid).expect("this target reports a start-time identity");
+
+        // Model the stale group entry left by an earlier occupant of this pid.
+        pg.groups.track_with(pid, false, None);
+        pg.adopt(&child)
+            .expect("adopt the session-leader child as a solo");
+
+        let group_count = {
+            let groups = pg.groups.ids.lock().unwrap_or_else(|e| e.into_inner());
+            groups.iter().filter(|entry| entry.id == pid).count()
+        };
+        let (solo_count, solo_identity) = {
+            let solos = pg.solos.ids.lock().unwrap_or_else(|e| e.into_inner());
+            (
+                solos.iter().filter(|entry| entry.id == pid).count(),
+                solos
+                    .iter()
+                    .find(|entry| entry.id == pid)
+                    .map(|entry| entry.identity),
+            )
+        };
+
+        drop(pg);
+        let _ = unsafe { libc::kill(pid, libc::SIGKILL) };
+        let _ = child.wait().await;
+
+        assert_eq!(group_count, 0, "the stale group entry must be removed");
+        assert_eq!(
+            solo_count, 1,
+            "the adopted child must be tracked once as a solo"
+        );
+        assert_eq!(
+            solo_identity,
+            Some(Some(anchor)),
+            "the solo entry must retain the child's identity anchor"
+        );
+    }
+
     /// A bare-pid adoption must leave an entry that is **identity-anchored**, not a
     /// number-only one: that token is the whole of what stands between a later
     /// recycle of the number and a `SIGKILL` aimed at whoever holds it, since no
@@ -1902,6 +2225,59 @@ mod tests {
             "a bare-pid adoption must track the pid, anchored on the identity read \
              during the call — never a number-only entry"
         );
+    }
+
+    /// A stale solo entry without an identity must not mask a fresh anchored
+    /// entry for the same number. This uses the current test process as the live
+    /// holder, so it models the recycled-pid table state without depending on pid
+    /// allocation or subprocess timing; the old entry is never signalled because
+    /// only the replacement remains in the solo table.
+    #[cfg(all(
+        feature = "process-control",
+        any(target_os = "linux", target_os = "android", target_vendor = "apple")
+    ))]
+    #[test]
+    fn solo_track_with_replaces_a_stale_unanchored_entry() {
+        let solos = Tracked::new(false);
+        let pid = std::process::id() as i32;
+        let anchor = read_identity(pid).expect("this target reports a start-time identity");
+
+        solos.track_with(pid, false, None);
+        solos.track_with(pid, false, Some(anchor));
+        solos.track_with(pid, false, Some(anchor));
+
+        let ids = solos.ids.lock().unwrap_or_else(|e| e.into_inner());
+        assert_eq!(
+            ids.len(),
+            1,
+            "the same anchored process must remain deduplicated"
+        );
+        assert_eq!(ids[0].id, pid);
+        assert_eq!(ids[0].identity, Some(anchor));
+    }
+
+    /// The same shared `Tracked` path keeps its historical numeric de-dup when
+    /// the target has no identity reader (the BSD fallback).
+    #[cfg(all(
+        feature = "process-control",
+        not(any(target_os = "linux", target_os = "android", target_vendor = "apple"))
+    ))]
+    #[test]
+    fn solo_track_with_keeps_number_only_dedup_without_identity_reader() {
+        let solos = Tracked::new(false);
+        let pid = std::process::id() as i32;
+
+        solos.track_with(pid, false, None);
+        solos.track_with(pid, false, None);
+
+        let ids = solos.ids.lock().unwrap_or_else(|e| e.into_inner());
+        assert_eq!(
+            ids.len(),
+            1,
+            "number-only targets must retain numeric de-dup"
+        );
+        assert_eq!(ids[0].id, pid);
+        assert_eq!(ids[0].identity, None);
     }
 
     /// The negative control for the entry above: once the number no longer names
@@ -1994,18 +2370,35 @@ mod tests {
         feature = "process-control",
         any(target_os = "linux", target_os = "android", target_vendor = "apple")
     ))]
-    #[tokio::test]
+    #[tokio::test(flavor = "current_thread")]
     #[ignore = "spawns a real subprocess"]
     async fn adopt_external_is_not_silenced_by_a_stale_entry_for_the_same_number() {
-        for stale_carries_a_token in [true, false] {
+        for (case, stale_carries_a_token) in [("anchored", true), ("bare", false)] {
             let pg = ProcessGroup::new();
+            let ready = std::env::temp_dir().join(format!(
+                "processkit_pgroup_adopt_external_{case}_{}.ready",
+                std::process::id()
+            ));
+            let _ = std::fs::remove_file(&ready);
             let mut child = Command::new("sh")
                 .arg("-c")
-                .arg("sleep 60")
+                .arg("echo ready > \"$PK_ADOPT_READY\"; exec sleep 60")
+                .env("PK_ADOPT_READY", &ready)
                 .kill_on_drop(true)
                 .spawn()
                 .unwrap();
             let pid = child.id().unwrap() as i32;
+            for _ in 0..200 {
+                if ready.exists() {
+                    break;
+                }
+                tokio::time::sleep(Duration::from_millis(5)).await;
+            }
+            assert!(
+                ready.exists(),
+                "the child must reach the post-exec adoption point"
+            );
+            let _ = std::fs::remove_file(&ready);
             let real = read_identity(pid).expect("this target reports a start-time identity");
 
             // The books as the reaped child left them: the number tracked as a group
@@ -2018,34 +2411,587 @@ mod tests {
             pg.adopt_external(pid as u32)
                 .expect("a live process is adoptable by pid on this target");
 
-            // Wherever it landed (solo is the ordinary outcome — this process forked
-            // it and it has exec'd, so `setpgid` is refused), an entry for it must
-            // exist carrying the identity captured during the call.
-            let tracked = {
+            // The child has already exec'd, so setpgid is refused and the adoption
+            // must move the pid from the group table to the solo table. In
+            // particular, the stale group entry must not remain beside the anchor.
+            let (group_count, solo_count, solo_identity) = {
                 let solos = pg.solos.ids.lock().unwrap_or_else(|e| e.into_inner());
                 let groups = pg.groups.ids.lock().unwrap_or_else(|e| e.into_inner());
-                solos
-                    .iter()
-                    .chain(groups.iter())
-                    .any(|e| e.id == pid && e.identity == Some(real))
+                (
+                    groups.iter().filter(|e| e.id == pid).count(),
+                    solos.iter().filter(|e| e.id == pid).count(),
+                    solos.iter().find(|e| e.id == pid).map(|e| e.identity),
+                )
             };
+
+            assert_eq!(group_count, 0, "the stale group entry must be removed");
+            assert_eq!(
+                solo_count, 1,
+                "the adopted pid must be tracked once as a solo"
+            );
+            assert_eq!(solo_identity, Some(Some(real)));
+
+            // Fault every delivery so this regression can observe the number of
+            // targets without signalling the live holder. A clean cross-table move
+            // has one solo delivery; leaving the stale group entry would make the
+            // broadcast attempt both killpg and kill.
+            let faults = crate::sys::fault_injection::Faults::new()
+                .fail_every(
+                    crate::sys::fault_injection::Site::PgroupSignalDelivery,
+                    None,
+                    libc::EINVAL,
+                )
+                .arm();
+            let outcome = pg.kill_all();
+            assert_eq!(
+                faults.fired(crate::sys::fault_injection::Site::PgroupSignalDelivery),
+                1
+            );
+            assert_eq!(
+                outcome
+                    .expect_err("the injected delivery failure must reach kill_all")
+                    .raw_os_error(),
+                Some(libc::EINVAL)
+            );
+            assert_eq!(
+                unsafe { libc::kill(pid, 0) },
+                0,
+                "the holder was not signalled"
+            );
+            drop(faults);
 
             drop(pg);
             // SAFETY: a best-effort kill of a child this test started.
             let _ = unsafe { libc::kill(pid, libc::SIGKILL) };
             let _ = child.wait().await;
-
-            assert!(
-                tracked,
-                "an entry left over from a reaped process (token: {}) must not make \
-                 the adoption of the number's new holder a silent no-op",
-                if stale_carries_a_token {
-                    "stale"
-                } else {
-                    "none"
-                },
-            );
         }
+    }
+
+    /// The group-to-solo move must be indivisible to a concurrent broadcast. The
+    /// pause is placed after stale-group eviction and before solo publication, so
+    /// the broadcast thread deterministically observes the ownership lock held and
+    /// cannot return during the transition with an empty target set.
+    #[cfg(all(
+        feature = "process-control",
+        any(target_os = "linux", target_os = "android", target_vendor = "apple")
+    ))]
+    #[tokio::test(flavor = "current_thread")]
+    #[ignore = "spawns a real subprocess"]
+    async fn adoption_reconcile_serializes_with_concurrent_broadcast() {
+        let pause = Arc::new(AdoptionPause::new());
+        let mut process_group = ProcessGroup::new();
+        process_group.adoption_pause = Some(Arc::clone(&pause));
+        let pg = Arc::new(process_group);
+        let marker = std::env::temp_dir().join(format!(
+            "processkit_pgroup_adoption_race_{}_{}.ready",
+            std::process::id(),
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .expect("system clock after epoch")
+                .as_nanos()
+        ));
+        let _ = std::fs::remove_file(&marker);
+
+        let mut cmd = Command::new("sh");
+        cmd.arg("-c")
+            .arg("echo ready > \"$PK_ADOPTION_RACE_READY\"; exec sleep 60")
+            .env("PK_ADOPTION_RACE_READY", &marker)
+            .kill_on_drop(true);
+        make_session_leader(&mut cmd);
+        let mut child = cmd.spawn().unwrap();
+        let pid = child.id().unwrap() as i32;
+        for _ in 0..200 {
+            if marker.exists() {
+                break;
+            }
+            tokio::time::sleep(Duration::from_millis(5)).await;
+        }
+        assert!(
+            marker.exists(),
+            "the session-leader child must report readiness"
+        );
+        let _ = std::fs::remove_file(&marker);
+
+        // This bare group entry is removed by the adoption reconcile, creating the
+        // exact window in which the old two-lock implementation lost the pid.
+        pg.groups.track_with(pid, false, None);
+
+        let adopter_pg = Arc::clone(&pg);
+        let adopter = std::thread::spawn(move || adopter_pg.adopt_external(pid as u32));
+        let entered = pause.wait_until_entered(Duration::from_secs(1));
+
+        let (started_tx, started_rx) = std::sync::mpsc::channel();
+        let (finished_tx, finished_rx) = std::sync::mpsc::channel();
+        let broadcaster_pg = Arc::clone(&pg);
+        let broadcaster = std::thread::spawn(move || {
+            started_tx.send(()).expect("broadcast start receiver");
+            let result = broadcaster_pg.broadcast(0);
+            finished_tx.send(result).expect("broadcast result receiver");
+        });
+        started_rx
+            .recv_timeout(Duration::from_secs(1))
+            .expect("broadcast thread started");
+        let early_broadcast_result = finished_rx.recv_timeout(Duration::from_millis(100)).ok();
+        let completed_during_reconcile = early_broadcast_result.is_some();
+
+        pause.release();
+        let adoption_result = adopter.join().expect("adoption thread");
+        let broadcast_result = early_broadcast_result.unwrap_or_else(|| {
+            finished_rx
+                .recv_timeout(Duration::from_secs(1))
+                .expect("broadcast result receiver")
+        });
+        broadcaster.join().expect("broadcast thread");
+        drop(pg);
+        let _ = unsafe { libc::kill(pid, libc::SIGKILL) };
+        let _ = child.wait().await;
+
+        assert!(entered, "adoption must reach the paused reconcile point");
+        assert!(
+            adoption_result.is_ok(),
+            "adoption should complete after publishing the solo entry: {adoption_result:?}"
+        );
+        assert!(
+            broadcast_result.is_ok(),
+            "signal-0 broadcast should complete: {broadcast_result:?}"
+        );
+        assert!(
+            !completed_during_reconcile,
+            "broadcast must wait for the group-to-solo ownership transition"
+        );
+    }
+
+    /// The ownership transition itself is testable without a child: signal 0
+    /// performs the same cross-table sweep without delivering a signal. The pause
+    /// makes the stale-group-eviction/solo-publication window explicit, while the
+    /// bounded receive proves a broadcast cannot complete in that window.
+    #[cfg(all(
+        feature = "process-control",
+        any(target_os = "linux", target_os = "android", target_vendor = "apple")
+    ))]
+    #[test]
+    fn adoption_reconcile_serializes_with_broadcast_without_a_subprocess() {
+        let pause = Arc::new(AdoptionPause::new());
+        let mut process_group = ProcessGroup::new();
+        process_group.adoption_pause = Some(Arc::clone(&pause));
+        let pg = Arc::new(process_group);
+        let pid = std::process::id() as i32;
+        let anchor = read_identity(pid).expect("this target reports a start-time identity");
+
+        // This live, unanchored entry models the stale group record. Signal 0 is
+        // harmless even when the test process is the current process-group leader.
+        pg.groups.track_with(pid, false, None);
+
+        let adopter_pg = Arc::clone(&pg);
+        let adopter = std::thread::spawn(move || {
+            adopter_pg.reconcile_solo_adoption(pid, Some(anchor));
+        });
+        assert!(
+            pause.wait_until_entered(Duration::from_secs(1)),
+            "reconciliation must pause after evicting the stale group entry"
+        );
+
+        let (started_tx, started_rx) = std::sync::mpsc::channel();
+        let (finished_tx, finished_rx) = std::sync::mpsc::channel();
+        let broadcaster_pg = Arc::clone(&pg);
+        let broadcaster = std::thread::spawn(move || {
+            started_tx.send(()).expect("broadcast start receiver");
+            finished_tx
+                .send(broadcaster_pg.broadcast(0))
+                .expect("broadcast result");
+        });
+        started_rx
+            .recv_timeout(Duration::from_secs(1))
+            .expect("broadcast thread started");
+        assert!(
+            finished_rx
+                .recv_timeout(Duration::from_millis(100))
+                .is_err(),
+            "broadcast must remain blocked until solo publication completes"
+        );
+
+        pause.release();
+        adopter.join().expect("adoption thread");
+        let broadcast_result = finished_rx
+            .recv_timeout(Duration::from_secs(1))
+            .expect("broadcast result receiver");
+        broadcaster.join().expect("broadcast thread");
+        assert!(
+            broadcast_result.is_ok(),
+            "signal-0 broadcast should complete after reconciliation"
+        );
+
+        let groups = pg.groups.ids.lock().unwrap_or_else(|e| e.into_inner());
+        assert!(
+            groups.iter().all(|entry| entry.id != pid),
+            "stale group entry must not survive the ownership transition"
+        );
+        drop(groups);
+        let mut solos = pg.solos.ids.lock().unwrap_or_else(|e| e.into_inner());
+        assert_eq!(
+            solos.iter().filter(|entry| entry.id == pid).count(),
+            1,
+            "the reconciled process must be tracked once as a solo"
+        );
+        assert_eq!(
+            solos
+                .iter()
+                .find(|entry| entry.id == pid)
+                .map(|entry| entry.identity),
+            Some(Some(anchor)),
+            "the solo entry must retain the identity anchor"
+        );
+        // This test models adoption with the test process itself. Remove that
+        // synthetic entry before `ProcessGroup::drop` can signal the current pid.
+        solos.clear();
+    }
+
+    /// A successful external adoption must keep the ownership transaction held
+    /// from its `setpgid` outcome through group publication. The child is paused
+    /// in `pre_exec` so the first adopter deterministically succeeds; it then
+    /// execs while the successful adopter is paused, making the second adopter's
+    /// `setpgid` deterministically fail and exercise the solo reconciliation path.
+    /// Without the ownership lock in the successful branch, the second adopter
+    /// publishes a solo entry before the first publishes its group entry.
+    #[cfg(all(
+        feature = "process-control",
+        any(target_os = "linux", target_os = "android", target_vendor = "apple")
+    ))]
+    #[tokio::test(flavor = "current_thread")]
+    #[ignore = "spawns a real subprocess"]
+    async fn adopt_external_group_publication_serializes_with_failed_adoption() {
+        use std::io::{Read, Write};
+        use std::os::fd::FromRawFd;
+
+        fn make_pipe() -> [libc::c_int; 2] {
+            let mut fds = [0; 2];
+            // SAFETY: `pipe` initializes both elements of this valid array.
+            assert_eq!(unsafe { libc::pipe(fds.as_mut_ptr()) }, 0);
+            fds
+        }
+
+        let group_pause = Arc::new(AdoptionPause::new());
+        let mut process_group = ProcessGroup::new();
+        process_group.group_adoption_pause = Some(Arc::clone(&group_pause));
+        let pg = Arc::new(process_group);
+
+        let [ready_read, ready_write] = make_pipe();
+        let [release_read, release_write] = make_pipe();
+        let [exec_ready_read, exec_ready_write] = make_pipe();
+
+        let mut cmd = Command::new("sh");
+        cmd.arg("-c").arg("printf x >&3; exec sleep 60");
+        cmd.kill_on_drop(true);
+        let child_ready_write = ready_write;
+        let child_release_read = release_read;
+        let child_exec_ready_write = exec_ready_write;
+        // SAFETY: the hook only uses async-signal-safe fd operations between
+        // fork and exec. fd 3 is intentionally inherited by the shell so the
+        // parent can distinguish the pre-exec and post-exec phases.
+        unsafe {
+            cmd.as_std_mut().pre_exec(move || {
+                if libc::dup2(child_exec_ready_write, 3) == -1 {
+                    return Err(std::io::Error::last_os_error());
+                }
+                let ready = [1u8];
+                if libc::write(child_ready_write, ready.as_ptr().cast(), ready.len())
+                    != ready.len() as isize
+                {
+                    return Err(std::io::Error::last_os_error());
+                }
+                let mut release = [0u8];
+                if libc::read(
+                    child_release_read,
+                    release.as_mut_ptr().cast(),
+                    release.len(),
+                ) != release.len() as isize
+                {
+                    return Err(std::io::Error::last_os_error());
+                }
+                Ok(())
+            });
+        }
+        let mut child = cmd.spawn().expect("spawn adoption race child");
+        // The parent retains only the read ends and the release write end.
+        // SAFETY: these are the child-side descriptors created above.
+        unsafe {
+            libc::close(ready_write);
+            libc::close(release_read);
+            libc::close(exec_ready_write);
+        }
+        let mut release = unsafe { std::fs::File::from_raw_fd(release_write) };
+
+        let ready_wait = tokio::task::spawn_blocking(move || {
+            let mut file = unsafe { std::fs::File::from_raw_fd(ready_read) };
+            let mut byte = [0u8];
+            file.read_exact(&mut byte)
+        });
+        tokio::time::timeout(Duration::from_secs(1), ready_wait)
+            .await
+            .expect("pre-exec readiness must not hang")
+            .expect("pre-exec readiness waiter must not panic")
+            .expect("child must reach the pre-exec barrier");
+
+        let pid = child.id().expect("race child pid") as i32;
+        let anchor = read_identity(pid).expect("this target reports a start-time identity");
+
+        let adopter_pg = Arc::clone(&pg);
+        let successful = std::thread::spawn(move || adopter_pg.adopt_external(pid as u32));
+        assert!(
+            group_pause.wait_until_entered(Duration::from_secs(1)),
+            "successful adoption must pause after taking ownership"
+        );
+
+        // Let the child exec while the successful adoption still owns the
+        // transaction. The second adopter will therefore take the failed branch
+        // once it is allowed to acquire the lock.
+        release
+            .write_all(&[1])
+            .expect("release the pre-exec barrier");
+        drop(release);
+        let exec_ready_wait = tokio::task::spawn_blocking(move || {
+            let mut file = unsafe { std::fs::File::from_raw_fd(exec_ready_read) };
+            let mut byte = [0u8];
+            file.read_exact(&mut byte)
+        });
+        tokio::time::timeout(Duration::from_secs(1), exec_ready_wait)
+            .await
+            .expect("post-exec readiness must not hang")
+            .expect("post-exec readiness waiter must not panic")
+            .expect("child must reach the post-exec barrier");
+
+        let (started_tx, started_rx) = std::sync::mpsc::channel();
+        let (finished_tx, finished_rx) = std::sync::mpsc::channel();
+        let failed_pg = Arc::clone(&pg);
+        let failed = std::thread::spawn(move || {
+            started_tx.send(()).expect("failed adoption start receiver");
+            finished_tx
+                .send(failed_pg.adopt_external(pid as u32))
+                .expect("failed adoption result receiver");
+        });
+        started_rx
+            .recv_timeout(Duration::from_secs(1))
+            .expect("failed adoption thread started");
+        assert!(
+            finished_rx
+                .recv_timeout(Duration::from_millis(100))
+                .is_err(),
+            "failed adoption must wait for successful group publication"
+        );
+
+        group_pause.release();
+        let successful_result = successful.join().expect("successful adoption thread");
+        let failed_result = finished_rx
+            .recv_timeout(Duration::from_secs(1))
+            .expect("failed adoption result receiver");
+        failed.join().expect("failed adoption thread");
+        assert!(
+            successful_result.is_ok(),
+            "successful adoption: {successful_result:?}"
+        );
+        assert!(failed_result.is_ok(), "failed adoption: {failed_result:?}");
+
+        let groups = pg.groups.ids.lock().unwrap_or_else(|e| e.into_inner());
+        let solos = pg.solos.ids.lock().unwrap_or_else(|e| e.into_inner());
+        assert_eq!(
+            groups.iter().filter(|entry| entry.id == pid).count(),
+            1,
+            "successful adoption must publish one group entry"
+        );
+        assert_eq!(
+            groups
+                .iter()
+                .find(|entry| entry.id == pid)
+                .map(|entry| entry.identity),
+            Some(Some(anchor)),
+            "the group entry must retain the adoption anchor"
+        );
+        assert_eq!(
+            solos.iter().filter(|entry| entry.id == pid).count(),
+            0,
+            "failed reconciliation must not split the adopted process into solos"
+        );
+        drop(solos);
+        drop(groups);
+        drop(pg);
+        let _ = child.kill().await;
+        let _ = child.wait().await;
+    }
+
+    /// A successful `adopt(&Child)` must keep the ownership transaction held from
+    /// `setpgid` through group publication. The first adopter pauses after the
+    /// successful syscall; a concurrent bare-pid adopter therefore waits until the
+    /// group entry exists and de-duplicates against it instead of publishing a solo.
+    #[cfg(all(
+        feature = "process-control",
+        any(target_os = "linux", target_os = "android", target_vendor = "apple")
+    ))]
+    #[tokio::test(flavor = "current_thread")]
+    #[ignore = "spawns a real subprocess"]
+    async fn adopt_child_group_publication_serializes_with_external_adoption() {
+        use std::io::{Read, Write};
+        use std::os::fd::FromRawFd;
+
+        fn make_pipe() -> [libc::c_int; 2] {
+            let mut fds = [0; 2];
+            // SAFETY: `pipe` initializes both elements of this valid array.
+            assert_eq!(unsafe { libc::pipe(fds.as_mut_ptr()) }, 0);
+            fds
+        }
+
+        let group_pause = Arc::new(AdoptionPause::new());
+        let mut process_group = ProcessGroup::new();
+        process_group.group_adoption_pause = Some(Arc::clone(&group_pause));
+        let pg = Arc::new(process_group);
+
+        let [ready_read, ready_write] = make_pipe();
+        let [release_read, release_write] = make_pipe();
+        let [exec_ready_read, exec_ready_write] = make_pipe();
+
+        let mut cmd = Command::new("sh");
+        cmd.arg("-c").arg("printf x >&3; exec sleep 60");
+        cmd.kill_on_drop(true);
+        let child_ready_write = ready_write;
+        let child_release_read = release_read;
+        let child_exec_ready_write = exec_ready_write;
+        // SAFETY: the hook only uses async-signal-safe fd operations between
+        // fork and exec. fd 3 is intentionally inherited by the shell so the
+        // parent can distinguish the pre-exec and post-exec phases.
+        unsafe {
+            cmd.as_std_mut().pre_exec(move || {
+                if libc::dup2(child_exec_ready_write, 3) == -1 {
+                    return Err(std::io::Error::last_os_error());
+                }
+                let ready = [1u8];
+                if libc::write(child_ready_write, ready.as_ptr().cast(), ready.len())
+                    != ready.len() as isize
+                {
+                    return Err(std::io::Error::last_os_error());
+                }
+                let mut release = [0u8];
+                if libc::read(
+                    child_release_read,
+                    release.as_mut_ptr().cast(),
+                    release.len(),
+                ) != release.len() as isize
+                {
+                    return Err(std::io::Error::last_os_error());
+                }
+                Ok(())
+            });
+        }
+        let child = cmd.spawn().expect("spawn child adoption race");
+        // The parent retains only the read ends and the release write end.
+        // SAFETY: these are the child-side descriptors created above.
+        unsafe {
+            libc::close(ready_write);
+            libc::close(release_read);
+            libc::close(exec_ready_write);
+        }
+        let mut release = unsafe { std::fs::File::from_raw_fd(release_write) };
+
+        let ready_wait = tokio::task::spawn_blocking(move || {
+            let mut file = unsafe { std::fs::File::from_raw_fd(ready_read) };
+            let mut byte = [0u8];
+            file.read_exact(&mut byte)
+        });
+        tokio::time::timeout(Duration::from_secs(1), ready_wait)
+            .await
+            .expect("pre-exec readiness must not hang")
+            .expect("pre-exec readiness waiter must not panic")
+            .expect("child must reach the pre-exec barrier");
+
+        let pid = child.id().expect("race child pid") as i32;
+        let anchor = read_identity(pid).expect("this target reports a start-time identity");
+
+        let adopter_pg = Arc::clone(&pg);
+        let successful = std::thread::spawn(move || {
+            let result = adopter_pg.adopt(&child);
+            (result, child)
+        });
+        assert!(
+            group_pause.wait_until_entered(Duration::from_secs(1)),
+            "successful child adoption must pause after taking ownership"
+        );
+
+        // Let the child exec while the successful adoption still owns the
+        // transaction. The second adopter must wait for the group publication.
+        release
+            .write_all(&[1])
+            .expect("release the pre-exec barrier");
+        drop(release);
+        let exec_ready_wait = tokio::task::spawn_blocking(move || {
+            let mut file = unsafe { std::fs::File::from_raw_fd(exec_ready_read) };
+            let mut byte = [0u8];
+            file.read_exact(&mut byte)
+        });
+        tokio::time::timeout(Duration::from_secs(1), exec_ready_wait)
+            .await
+            .expect("post-exec readiness must not hang")
+            .expect("post-exec readiness waiter must not panic")
+            .expect("child must reach the post-exec barrier");
+
+        let (started_tx, started_rx) = std::sync::mpsc::channel();
+        let (finished_tx, finished_rx) = std::sync::mpsc::channel();
+        let failed_pg = Arc::clone(&pg);
+        let failed = std::thread::spawn(move || {
+            started_tx
+                .send(())
+                .expect("external adoption start receiver");
+            finished_tx
+                .send(failed_pg.adopt_external(pid as u32))
+                .expect("external adoption result receiver");
+        });
+        started_rx
+            .recv_timeout(Duration::from_secs(1))
+            .expect("external adoption thread started");
+        assert!(
+            finished_rx
+                .recv_timeout(Duration::from_millis(100))
+                .is_err(),
+            "external adoption must wait for successful child publication"
+        );
+
+        group_pause.release();
+        let (successful_result, mut child) = successful.join().expect("child adoption thread");
+        let failed_result = finished_rx
+            .recv_timeout(Duration::from_secs(1))
+            .expect("external adoption result receiver");
+        failed.join().expect("external adoption thread");
+        assert!(
+            successful_result.is_ok(),
+            "successful child adoption: {successful_result:?}"
+        );
+        assert!(
+            failed_result.is_ok(),
+            "external adoption: {failed_result:?}"
+        );
+
+        let groups = pg.groups.ids.lock().unwrap_or_else(|e| e.into_inner());
+        let solos = pg.solos.ids.lock().unwrap_or_else(|e| e.into_inner());
+        assert_eq!(
+            groups.iter().filter(|entry| entry.id == pid).count(),
+            1,
+            "successful child adoption must publish one group entry"
+        );
+        assert_eq!(
+            groups
+                .iter()
+                .find(|entry| entry.id == pid)
+                .map(|entry| entry.identity),
+            Some(Some(anchor)),
+            "the group entry must retain the adoption anchor"
+        );
+        assert_eq!(
+            solos.iter().filter(|entry| entry.id == pid).count(),
+            0,
+            "external adoption must not split the child into solos"
+        );
+        drop(solos);
+        drop(groups);
+        drop(pg);
+        let _ = child.kill().await;
+        let _ = child.wait().await;
     }
 
     /// A number that names no process is refused by the anchor capture — the bare-pid

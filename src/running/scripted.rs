@@ -48,45 +48,56 @@ pub(crate) struct ScriptedOutcome {
     pub(crate) signal: Option<i32>,
 }
 
-/// Split already-decoded `text` into the exact lines the streaming pump
-/// ([`pump_lines_core`](crate::pump)) would yield for `terminator` — CRLF/CR
-/// terminators collapsed and stripped, with no trailing empty line for a final
-/// terminator. Joining the result with `\n` reproduces the live bulk path's
-/// `stdout_lines.join("\n")` byte-for-byte, so the test doubles' canned text
-/// reads identically on the fake and a real run (and across the bulk and `start`
-/// verbs). Models no buffer cap — the bulk replay never truncates.
+/// Split already-decoded `text` into the exact frames the streaming pump
+/// ([`pump_lines_core`](crate::pump)) would yield for `terminator`, retaining
+/// each frame's terminator for the scripted feeder. CRLF/CR terminators are
+/// collapsed, and a final terminator does not create a trailing empty frame.
 ///
-/// Mirrors `pump_lines_core`'s terminator handling on whole in-hand text, so a
-/// `\r` in `\r`-aware mode is trailing only at the very end. Kept beside the
-/// scripted handle it serves rather than reaching into the pump's private,
-/// chunk-oriented line splitter.
-pub(crate) fn split_pump_lines(text: &str, terminator: LineTerminator) -> Vec<String> {
+/// Kept beside the scripted handle rather than reaching into the pump's
+/// private, chunk-oriented line splitter. The same framing drives both feeder
+/// pacing and lifetime calculation, so a stream with carriage-return progress
+/// cannot be written or considered finished as one newline-delimited chunk.
+pub(crate) fn split_pump_frames(text: &str, terminator: LineTerminator) -> Vec<&str> {
     match terminator {
-        // `str::lines` splits on `\n`, dropping one preceding `\r` (a CRLF
-        // terminator) and yielding no trailing empty line — exactly the pump's
-        // `Newline` mode. A lone `\r` stays content, as it does there.
-        LineTerminator::Newline => text.lines().map(str::to_owned).collect(),
+        // `Newline` splits on `\n`, preserving a preceding `\r` in the frame so
+        // the line mapper below can remove CRLF as one terminator.
+        LineTerminator::Newline => {
+            let mut frames = Vec::new();
+            let mut start = 0;
+            for (i, byte) in text.bytes().enumerate() {
+                if byte == b'\n' {
+                    frames.push(&text[start..=i]);
+                    start = i + 1;
+                }
+            }
+            if start < text.len() {
+                frames.push(&text[start..]);
+            }
+            frames
+        }
         // `\r`-aware: split on the earliest `\r` or `\n`; a `\r\n` pair is one
         // terminator; a bare `\r` ends a frame; the final un-terminated segment is
-        // the last line. (Indices land on ASCII `\r`/`\n`, always char boundaries.)
+        // the last frame. (Indices land on ASCII `\r`/`\n`, always char boundaries.)
         LineTerminator::CarriageReturn => {
-            let mut lines = Vec::new();
+            let mut frames = Vec::new();
             let bytes = text.as_bytes();
             let (mut start, mut i) = (0usize, 0usize);
             while i < bytes.len() {
                 match bytes[i] {
                     b'\n' => {
-                        lines.push(text[start..i].to_owned());
-                        i += 1;
+                        let end = i + 1;
+                        frames.push(&text[start..end]);
+                        i = end;
                     }
                     b'\r' => {
-                        lines.push(text[start..i].to_owned());
                         // A `\r\n` pair is a single terminator; drop both.
-                        i += if bytes.get(i + 1) == Some(&b'\n') {
+                        let end = i + if bytes.get(i + 1) == Some(&b'\n') {
                             2
                         } else {
                             1
                         };
+                        frames.push(&text[start..end]);
+                        i = end;
                     }
                     _ => {
                         i += 1;
@@ -96,11 +107,30 @@ pub(crate) fn split_pump_lines(text: &str, terminator: LineTerminator) -> Vec<St
                 start = i;
             }
             if start < bytes.len() {
-                lines.push(text[start..].to_owned());
+                frames.push(&text[start..]);
             }
-            lines
+            frames
         }
     }
+}
+
+pub(crate) fn split_pump_lines(text: &str, terminator: LineTerminator) -> Vec<String> {
+    split_pump_frames(text, terminator)
+        .into_iter()
+        .map(|frame| match terminator {
+            LineTerminator::Newline => frame
+                .strip_suffix('\n')
+                .map(|frame| frame.strip_suffix('\r').unwrap_or(frame))
+                .unwrap_or(frame)
+                .to_owned(),
+            LineTerminator::CarriageReturn => frame
+                .strip_suffix("\r\n")
+                .or_else(|| frame.strip_suffix('\r'))
+                .or_else(|| frame.strip_suffix('\n'))
+                .unwrap_or(frame)
+                .to_owned(),
+        })
+        .collect()
 }
 
 /// Shared kill state for a scripted child, clonable so a detached watchdog can
@@ -196,17 +226,19 @@ pub(crate) struct ScriptedProc {
 impl ScriptedProc {
     /// Assemble a scripted child. Each output's text is fed through a duplex
     /// pipe by a detached writer task — with `line_delay`, the writer sleeps
-    /// before each line (virtual-time friendly under a paused clock). The
+    /// before each output frame (virtual-time friendly under a paused clock). The
     /// "process" exits after `lifetime` (`None` = never on its own).
     pub(crate) fn new(
         stdout_text: String,
         stderr_text: String,
+        stdout_terminator: LineTerminator,
+        stderr_terminator: LineTerminator,
         outcome: ScriptedOutcome,
         lifetime: Option<Duration>,
         line_delay: Option<Duration>,
     ) -> Self {
         let mut feeders = Vec::new();
-        let mut feed = |text: String| {
+        let mut feed = |text: String, terminator: LineTerminator| {
             let (mut tx, rx) = tokio::io::duplex(64 * 1024);
             if text.is_empty() {
                 return rx; // dropped tx → immediate EOF
@@ -219,9 +251,9 @@ impl ScriptedProc {
                         let _ = tx.write_all(text.as_bytes()).await;
                     }
                     Some(delay) => {
-                        for line in text.split_inclusive('\n') {
+                        for frame in split_pump_frames(&text, terminator) {
                             tokio::time::sleep(delay).await;
-                            if tx.write_all(line.as_bytes()).await.is_err() {
+                            if tx.write_all(frame.as_bytes()).await.is_err() {
                                 break;
                             }
                         }
@@ -232,8 +264,8 @@ impl ScriptedProc {
             feeders.push(task.abort_handle());
             rx
         };
-        let stdout = feed(stdout_text);
-        let stderr = feed(stderr_text);
+        let stdout = feed(stdout_text, stdout_terminator);
+        let stderr = feed(stderr_text, stderr_terminator);
         Self {
             stdout: Some(stdout),
             stderr: Some(stderr),
@@ -524,6 +556,8 @@ impl RunningProcess {
             stdout_pump: None,
             stderr_pump: None,
             stdin_error: None,
+            #[cfg(test)]
+            test_stdin_task: None,
             stdout_piped: command.stdout_is_piped(),
             // PTY mode has one merged output reader exposed as stdout, just like
             // the real PTY backend; never advertise a separate stderr probe.

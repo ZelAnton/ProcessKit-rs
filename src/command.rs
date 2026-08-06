@@ -2040,7 +2040,8 @@ impl Command {
     /// sinks, and the
     /// [`stdout_raw_tee`](Self::stdout_raw_tee)/[`stderr_raw_tee`](Self::stderr_raw_tee)
     /// sinks — removed. Used by the record/replay cassette's streaming `start`: its
-    /// internal whole-run capture pass (`inner.output_string`) must stay silent,
+    /// internal whole-run capture pass (`inner.output_string` for piped stdout,
+    /// or `inner.start` + `finish` for non-piped stdout) must stay silent,
     /// because the scripted handle it hands back fires the caller's handlers/tees
     /// once when the caller consumes it — exactly as a live `start` would. Without
     /// the strip they would fire twice (once for the capture, once for the replay).
