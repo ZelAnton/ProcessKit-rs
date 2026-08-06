@@ -65,11 +65,12 @@ type ScrubHook = dyn Fn(CassetteField, &str) -> String
     + std::panic::RefUnwindSafe;
 
 /// The on-disk format revision. Bumped if the cassette schema ever changes
-/// incompatibly; loading a cassette with an unknown version fails loudly
-/// instead of misreading it. [`RecordReplayRunner::replay`] checks this
-/// *before* attempting the full `Cassette` decode, so a future version whose
-/// entries this build genuinely can't parse still reports the clear "version N
-/// is not supported" message rather than a raw serde type-mismatch error.
+/// incompatibly; the supported range is `1..=CASSETTE_VERSION`, and loading a
+/// cassette outside that range fails loudly instead of misreading it.
+/// [`RecordReplayRunner::replay`] checks this *before* attempting the full
+/// `Cassette` decode, so an unsupported version whose entries this build
+/// genuinely can't parse still reports the clear "version N is not supported"
+/// message rather than a raw serde type-mismatch error.
 ///
 /// Bumped to `2`: entries may now carry an optional `error` (see
 /// [`CassetteError`]) recording an `Err` the inner runner returned in record
@@ -1521,18 +1522,19 @@ pub fn fuzz_cassette_replay(text: &str, calls: &[(String, Vec<String>)]) {
 }
 
 /// Parse and validate the textual cassette before arranging entries into their
-/// per-key replay slots. Both file loading and fuzz-only callers use this one
-/// path so their version-gate and malformed-entry behavior cannot drift.
+/// per-key replay slots. Only versions `1..=CASSETTE_VERSION` are supported.
+/// Both file loading and fuzz-only callers use this one path so their
+/// version-gate and malformed-entry behavior cannot drift.
 fn replay_slots_from_text(text: &str) -> Result<HashMap<Key, ReplaySlot>> {
-    // Gate on `version` before the full `Cassette` decode, so a future schema
-    // reports its unsupported version instead of a misleading entry type error.
+    // Gate on `version` before the full `Cassette` decode, so an unsupported
+    // schema reports its version instead of a misleading entry type error.
     #[derive(Deserialize)]
     struct CassetteHeader {
         version: u32,
     }
     let header: CassetteHeader =
         serde_json::from_str(text).map_err(|e| ErrorReason::Io(std::io::Error::from(e)))?;
-    if header.version > CASSETTE_VERSION {
+    if !(1..=CASSETTE_VERSION).contains(&header.version) {
         return Err(Error::io(std::io::Error::new(
             std::io::ErrorKind::InvalidData,
             format!(
@@ -2795,6 +2797,24 @@ mod tests {
                 assert_eq!(e.kind(), std::io::ErrorKind::InvalidData);
                 assert!(
                     e.to_string().contains("version 99"),
+                    "expected the clear version-gate message, got: {e}"
+                );
+            }
+            other => panic!("expected the version-gate error, got {other:?}"),
+        }
+    }
+
+    #[tokio::test]
+    async fn version_zero_is_rejected_by_the_version_gate() {
+        let (_dir, path) = temp_cassette();
+        std::fs::write(&path, r#"{ "version": 0, "entries": [] }"#).unwrap();
+
+        match RecordReplayRunner::replay(&path).map_err(|e| e.into_reason()) {
+            Err(ErrorReason::Io(e)) => {
+                assert_eq!(e.kind(), std::io::ErrorKind::InvalidData);
+                assert!(
+                    e.to_string()
+                        .contains("cassette version 0 is not supported"),
                     "expected the clear version-gate message, got: {e}"
                 );
             }
