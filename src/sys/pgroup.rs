@@ -1808,7 +1808,7 @@ mod tests {
                     libc::execl(
                         shell.as_ptr().cast::<libc::c_char>(),
                         argv0.as_ptr().cast::<libc::c_char>(),
-                        b"-c\0".as_ptr().cast::<libc::c_char>(),
+                        c"-c".as_ptr().cast::<libc::c_char>(),
                         command.as_ptr().cast::<libc::c_char>(),
                         std::ptr::null::<libc::c_char>(),
                     );
