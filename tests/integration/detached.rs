@@ -116,15 +116,17 @@ async fn repeated_short_lived_detached_children_are_reaped_while_owner_lives() {
     // wait operation. kill(pid, 0) reports zombies as existing, so observing
     // ESRCH after every launch proves the child was actually reaped.
     for index in 0..CHILDREN {
-        let detached = crate::common::failing_exit(0)
-            .spawn_detached()
-            .unwrap_or_else(|error| panic!("spawn short-lived child {index}: {error}"));
-        let pid = detached.pid();
-        assert!(
-            pids.insert(pid),
-            "pid {pid} was reused during the reaping loop"
-        );
-        drop(detached);
+        let pid = {
+            let detached = crate::common::failing_exit(0)
+                .spawn_detached()
+                .unwrap_or_else(|error| panic!("spawn short-lived child {index}: {error}"));
+            let pid = detached.pid();
+            assert!(
+                pids.insert(pid),
+                "pid {pid} was reused during the reaping loop"
+            );
+            pid
+        };
 
         poll_until(
             Duration::from_secs(2),

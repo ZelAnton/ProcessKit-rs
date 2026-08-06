@@ -23,25 +23,25 @@ use std::os::unix::process::CommandExt;
 use std::sync::Mutex;
 use std::time::Duration;
 
-#[cfg(test)]
+#[cfg(all(test, feature = "process-control"))]
 use std::sync::{Arc, Condvar};
 
 use tokio::process::{Child, Command};
 
-#[cfg(test)]
+#[cfg(all(test, feature = "process-control"))]
 struct AdoptionPause {
     state: Mutex<AdoptionPauseState>,
     changed: Condvar,
 }
 
-#[cfg(test)]
+#[cfg(all(test, feature = "process-control"))]
 #[derive(Default)]
 struct AdoptionPauseState {
     entered: bool,
     released: bool,
 }
 
-#[cfg(test)]
+#[cfg(all(test, feature = "process-control"))]
 impl AdoptionPause {
     fn new() -> Self {
         Self {
@@ -1047,9 +1047,9 @@ pub(crate) struct ProcessGroup {
     /// Set by `graceful_shutdown(escalate=false)` to tell `Drop` not to
     /// hard-kill survivors (the caller deliberately chose not to escalate).
     skip_drop_kill: super::SkipDropKill,
-    #[cfg(test)]
+    #[cfg(all(test, feature = "process-control"))]
     adoption_pause: Option<Arc<AdoptionPause>>,
-    #[cfg(test)]
+    #[cfg(all(test, feature = "process-control"))]
     group_adoption_pause: Option<Arc<AdoptionPause>>,
 }
 
@@ -1060,9 +1060,9 @@ impl ProcessGroup {
             groups: Tracked::new(true),
             solos: Tracked::new(false),
             skip_drop_kill: super::SkipDropKill::new(),
-            #[cfg(test)]
+            #[cfg(all(test, feature = "process-control"))]
             adoption_pause: None,
-            #[cfg(test)]
+            #[cfg(all(test, feature = "process-control"))]
             group_adoption_pause: None,
         }
     }
@@ -1208,7 +1208,7 @@ impl ProcessGroup {
         self.reconcile_solo_adoption_locked(pid, identity);
     }
 
-    /// The locked half of [`reconcile_solo_adoption`](Self::reconcile_solo_adoption).
+    /// The locked half of the test-only `reconcile_solo_adoption` helper.
     /// `adopt_external` already owns the transaction while it decides whether
     /// `setpgid` succeeded, so taking the mutex again there would deadlock.
     #[cfg(feature = "process-control")]
@@ -1223,7 +1223,7 @@ impl ProcessGroup {
 
         // A new killable solo member joined — re-arm Drop's backstop.
         self.skip_drop_kill.clear();
-        #[cfg(test)]
+        #[cfg(all(test, feature = "process-control"))]
         if let Some(pause) = &self.adoption_pause {
             pause.pause();
         }
@@ -1237,6 +1237,14 @@ impl ProcessGroup {
             .ok_or_else(|| io::Error::other("child has no pid (already exited?)"))?
             as i32;
 
+        self.adopt_pid(pid)
+    }
+
+    /// Adopt a child by its already validated pid. Keeping the ownership
+    /// transaction in this pid-based core lets the real-child entry point and
+    /// the Unix race tests exercise exactly the same setpgid/publication path.
+    #[cfg(feature = "process-control")]
+    fn adopt_pid(&self, pid: i32) -> io::Result<()> {
         // Serialize the setpgid outcome with its ownership publication. A concurrent
         // bare-pid adoption can otherwise publish a solo entry after this syscall
         // succeeds but before the group entry is recorded.
@@ -1256,7 +1264,7 @@ impl ProcessGroup {
             // A new killable member joined — re-arm Drop's backstop so a prior
             // graceful_shutdown(escalate=false) latch doesn't spare it.
             self.skip_drop_kill.clear();
-            #[cfg(test)]
+            #[cfg(all(test, feature = "process-control"))]
             if let Some(pause) = &self.group_adoption_pause {
                 pause.pause();
             }
@@ -1367,7 +1375,7 @@ impl ProcessGroup {
             // the latch true. A new killable member joined — re-arm Drop's backstop
             // so a prior graceful_shutdown(escalate=false) latch doesn't spare it.
             self.skip_drop_kill.clear();
-            #[cfg(test)]
+            #[cfg(all(test, feature = "process-control"))]
             if let Some(pause) = &self.group_adoption_pause {
                 pause.pause();
             }
@@ -1687,6 +1695,7 @@ mod tests {
 
     /// Make a raw tokio command start in its own session for tests that need a
     /// deterministic `EPERM` from the parent's `setpgid` adoption attempt.
+    #[cfg(feature = "process-control")]
     fn make_session_leader(command: &mut Command) {
         // SAFETY: the pre-exec hook calls only `setsid` and reads errno, both of
         // which are async-signal-safe. It runs in the child after fork and before
@@ -1699,6 +1708,197 @@ mod tests {
                     Ok(())
                 }
             });
+        }
+    }
+
+    /// `Command::spawn` waits for a forked child's `pre_exec` hook to finish
+    /// before it returns, so a hook that waits for the parent would deadlock the
+    /// test before the parent can send its release byte. Raw `fork` is confined
+    /// to these Unix race tests so the parent can observe the pre-exec child,
+    /// run the adoption transaction, then release it to exec.
+    #[cfg(all(
+        feature = "process-control",
+        any(target_os = "linux", target_os = "android", target_vendor = "apple")
+    ))]
+    struct AdoptionRaceChild {
+        pid: libc::pid_t,
+        release: Option<std::fs::File>,
+        ready: Option<std::fs::File>,
+        exec_ready: Option<std::fs::File>,
+    }
+
+    #[cfg(all(
+        feature = "process-control",
+        any(target_os = "linux", target_os = "android", target_vendor = "apple")
+    ))]
+    impl AdoptionRaceChild {
+        fn make_pipe() -> [libc::c_int; 2] {
+            let mut fds = [0; 2];
+            // SAFETY: `pipe` initializes both elements of this valid array.
+            assert_eq!(unsafe { libc::pipe(fds.as_mut_ptr()) }, 0);
+            // Keep the test protocol fds away from fd 3, which is the stable
+            // descriptor the post-exec shell uses for its readiness byte.
+            for fd in &mut fds {
+                let moved = unsafe { libc::fcntl(*fd, libc::F_DUPFD, 10) };
+                assert!(moved >= 0, "duplicate adoption-race pipe fd");
+                // SAFETY: `*fd` is the just-created pipe descriptor and is no
+                // longer needed after the duplicate is installed.
+                unsafe {
+                    libc::close(*fd);
+                }
+                *fd = moved;
+            }
+            fds
+        }
+
+        fn spawn() -> Self {
+            use std::os::fd::FromRawFd;
+
+            let [ready_read, ready_write] = Self::make_pipe();
+            let [release_read, release_write] = Self::make_pipe();
+            let [exec_ready_read, exec_ready_write] = Self::make_pipe();
+            // SAFETY: the child branch below uses only async-signal-safe fd,
+            // process-control, and exec operations before replacing itself.
+            let pid = unsafe { libc::fork() };
+            if pid == -1 {
+                // SAFETY: these are the six descriptors opened above.
+                unsafe {
+                    libc::close(ready_read);
+                    libc::close(ready_write);
+                    libc::close(release_read);
+                    libc::close(release_write);
+                    libc::close(exec_ready_read);
+                    libc::close(exec_ready_write);
+                }
+                panic!(
+                    "fork adoption race child: {}",
+                    std::io::Error::last_os_error()
+                );
+            }
+            if pid == 0 {
+                // SAFETY: the child closes the parent-side ends before waiting
+                // on the release byte, then execs a bounded-lived shell.
+                unsafe {
+                    libc::close(ready_read);
+                    libc::close(release_write);
+                    libc::close(exec_ready_read);
+                    if libc::dup2(exec_ready_write, 3) == -1 {
+                        libc::_exit(127);
+                    }
+                    if exec_ready_write != 3 {
+                        libc::close(exec_ready_write);
+                    }
+                    let ready = [1u8];
+                    if libc::write(ready_write, ready.as_ptr().cast(), ready.len())
+                        != ready.len() as isize
+                    {
+                        libc::_exit(127);
+                    }
+                    let mut release = [0u8];
+                    if libc::read(release_read, release.as_mut_ptr().cast(), release.len())
+                        != release.len() as isize
+                    {
+                        libc::_exit(127);
+                    }
+                    let shell = b"/bin/sh\0";
+                    let argv0 = b"sh\0";
+                    let command = b"printf x >&3; exec sleep 60\0";
+                    libc::execl(
+                        shell.as_ptr().cast::<libc::c_char>(),
+                        argv0.as_ptr().cast::<libc::c_char>(),
+                        b"-c\0".as_ptr().cast::<libc::c_char>(),
+                        command.as_ptr().cast::<libc::c_char>(),
+                        std::ptr::null::<libc::c_char>(),
+                    );
+                    libc::_exit(127);
+                }
+            }
+
+            // SAFETY: the parent keeps only its read ends and release writer;
+            // each closed descriptor belongs to this fork's child-side setup.
+            unsafe {
+                libc::close(ready_write);
+                libc::close(release_read);
+                libc::close(exec_ready_write);
+            }
+            Self {
+                pid,
+                release: Some(unsafe { std::fs::File::from_raw_fd(release_write) }),
+                ready: Some(unsafe { std::fs::File::from_raw_fd(ready_read) }),
+                exec_ready: Some(unsafe { std::fs::File::from_raw_fd(exec_ready_read) }),
+            }
+        }
+
+        fn pid(&self) -> i32 {
+            self.pid
+        }
+
+        fn release(&mut self) -> &mut std::fs::File {
+            self.release
+                .as_mut()
+                .expect("adoption race release pipe is present")
+        }
+
+        fn take_ready(&mut self) -> std::fs::File {
+            self.ready
+                .take()
+                .expect("adoption race ready pipe is present")
+        }
+
+        fn take_exec_ready(&mut self) -> std::fs::File {
+            self.exec_ready
+                .take()
+                .expect("adoption race exec-ready pipe is present")
+        }
+
+        fn kill_and_reap(&mut self) {
+            let pid = std::mem::replace(&mut self.pid, -1);
+            if pid <= 0 {
+                return;
+            }
+            // SAFETY: this test owns the unreaped child and uses SIGKILL only
+            // for bounded cleanup; waitpid closes the ownership/reaping loop.
+            unsafe {
+                let _ = libc::kill(pid, libc::SIGKILL);
+                loop {
+                    let waited = libc::waitpid(pid, std::ptr::null_mut(), 0);
+                    if waited == pid {
+                        break;
+                    }
+                    if waited == -1
+                        && std::io::Error::last_os_error().raw_os_error() == Some(libc::EINTR)
+                    {
+                        continue;
+                    }
+                    break;
+                }
+            }
+        }
+    }
+
+    #[cfg(all(
+        feature = "process-control",
+        any(target_os = "linux", target_os = "android", target_vendor = "apple")
+    ))]
+    impl Drop for AdoptionRaceChild {
+        fn drop(&mut self) {
+            self.kill_and_reap();
+        }
+    }
+
+    #[cfg(all(
+        feature = "process-control",
+        any(target_os = "linux", target_os = "android", target_vendor = "apple")
+    ))]
+    struct AdoptionPauseRelease(Arc<AdoptionPause>);
+
+    #[cfg(all(
+        feature = "process-control",
+        any(target_os = "linux", target_os = "android", target_vendor = "apple")
+    ))]
+    impl Drop for AdoptionPauseRelease {
+        fn drop(&mut self) {
+            self.0.release();
         }
     }
 
@@ -2647,8 +2847,8 @@ mod tests {
     }
 
     /// A successful external adoption must keep the ownership transaction held
-    /// from its `setpgid` outcome through group publication. The child is paused
-    /// in `pre_exec` so the first adopter deterministically succeeds; it then
+    /// from its `setpgid` outcome through group publication. The raw-fork child is
+    /// paused before exec so the first adopter deterministically succeeds; it then
     /// execs while the successful adopter is paused, making the second adopter's
     /// `setpgid` deterministically fail and exercise the solo reconciliation path.
     /// Without the ownership lock in the successful branch, the second adopter
@@ -2661,68 +2861,20 @@ mod tests {
     #[ignore = "spawns a real subprocess"]
     async fn adopt_external_group_publication_serializes_with_failed_adoption() {
         use std::io::{Read, Write};
-        use std::os::fd::FromRawFd;
-
-        fn make_pipe() -> [libc::c_int; 2] {
-            let mut fds = [0; 2];
-            // SAFETY: `pipe` initializes both elements of this valid array.
-            assert_eq!(unsafe { libc::pipe(fds.as_mut_ptr()) }, 0);
-            fds
-        }
 
         let group_pause = Arc::new(AdoptionPause::new());
         let mut process_group = ProcessGroup::new();
         process_group.group_adoption_pause = Some(Arc::clone(&group_pause));
         let pg = Arc::new(process_group);
 
-        let [ready_read, ready_write] = make_pipe();
-        let [release_read, release_write] = make_pipe();
-        let [exec_ready_read, exec_ready_write] = make_pipe();
+        let mut race_child = AdoptionRaceChild::spawn();
+        // If any later assertion fails while an adopter owns the lock, release
+        // the hook during unwinding so the spawned thread cannot strand the test.
+        let _pause_release = AdoptionPauseRelease(Arc::clone(&group_pause));
 
-        let mut cmd = Command::new("sh");
-        cmd.arg("-c").arg("printf x >&3; exec sleep 60");
-        cmd.kill_on_drop(true);
-        let child_ready_write = ready_write;
-        let child_release_read = release_read;
-        let child_exec_ready_write = exec_ready_write;
-        // SAFETY: the hook only uses async-signal-safe fd operations between
-        // fork and exec. fd 3 is intentionally inherited by the shell so the
-        // parent can distinguish the pre-exec and post-exec phases.
-        unsafe {
-            cmd.as_std_mut().pre_exec(move || {
-                if libc::dup2(child_exec_ready_write, 3) == -1 {
-                    return Err(std::io::Error::last_os_error());
-                }
-                let ready = [1u8];
-                if libc::write(child_ready_write, ready.as_ptr().cast(), ready.len())
-                    != ready.len() as isize
-                {
-                    return Err(std::io::Error::last_os_error());
-                }
-                let mut release = [0u8];
-                if libc::read(
-                    child_release_read,
-                    release.as_mut_ptr().cast(),
-                    release.len(),
-                ) != release.len() as isize
-                {
-                    return Err(std::io::Error::last_os_error());
-                }
-                Ok(())
-            });
-        }
-        let mut child = cmd.spawn().expect("spawn adoption race child");
-        // The parent retains only the read ends and the release write end.
-        // SAFETY: these are the child-side descriptors created above.
-        unsafe {
-            libc::close(ready_write);
-            libc::close(release_read);
-            libc::close(exec_ready_write);
-        }
-        let mut release = unsafe { std::fs::File::from_raw_fd(release_write) };
-
+        let ready_read = race_child.take_ready();
         let ready_wait = tokio::task::spawn_blocking(move || {
-            let mut file = unsafe { std::fs::File::from_raw_fd(ready_read) };
+            let mut file = ready_read;
             let mut byte = [0u8];
             file.read_exact(&mut byte)
         });
@@ -2732,7 +2884,7 @@ mod tests {
             .expect("pre-exec readiness waiter must not panic")
             .expect("child must reach the pre-exec barrier");
 
-        let pid = child.id().expect("race child pid") as i32;
+        let pid = race_child.pid();
         let anchor = read_identity(pid).expect("this target reports a start-time identity");
 
         let adopter_pg = Arc::clone(&pg);
@@ -2745,12 +2897,13 @@ mod tests {
         // Let the child exec while the successful adoption still owns the
         // transaction. The second adopter will therefore take the failed branch
         // once it is allowed to acquire the lock.
-        release
+        race_child
+            .release()
             .write_all(&[1])
             .expect("release the pre-exec barrier");
-        drop(release);
+        let exec_ready_read = race_child.take_exec_ready();
         let exec_ready_wait = tokio::task::spawn_blocking(move || {
-            let mut file = unsafe { std::fs::File::from_raw_fd(exec_ready_read) };
+            let mut file = exec_ready_read;
             let mut byte = [0u8];
             file.read_exact(&mut byte)
         });
@@ -2814,14 +2967,14 @@ mod tests {
         drop(solos);
         drop(groups);
         drop(pg);
-        let _ = child.kill().await;
-        let _ = child.wait().await;
+        race_child.kill_and_reap();
     }
 
     /// A successful `adopt(&Child)` must keep the ownership transaction held from
-    /// `setpgid` through group publication. The first adopter pauses after the
-    /// successful syscall; a concurrent bare-pid adopter therefore waits until the
-    /// group entry exists and de-duplicates against it instead of publishing a solo.
+    /// `setpgid` through group publication. The pid-core used by the real-child
+    /// entry point is paused after the successful syscall; a concurrent bare-pid
+    /// adopter therefore waits until the group entry exists and de-duplicates
+    /// against it instead of publishing a solo.
     #[cfg(all(
         feature = "process-control",
         any(target_os = "linux", target_os = "android", target_vendor = "apple")
@@ -2830,68 +2983,18 @@ mod tests {
     #[ignore = "spawns a real subprocess"]
     async fn adopt_child_group_publication_serializes_with_external_adoption() {
         use std::io::{Read, Write};
-        use std::os::fd::FromRawFd;
-
-        fn make_pipe() -> [libc::c_int; 2] {
-            let mut fds = [0; 2];
-            // SAFETY: `pipe` initializes both elements of this valid array.
-            assert_eq!(unsafe { libc::pipe(fds.as_mut_ptr()) }, 0);
-            fds
-        }
 
         let group_pause = Arc::new(AdoptionPause::new());
         let mut process_group = ProcessGroup::new();
         process_group.group_adoption_pause = Some(Arc::clone(&group_pause));
         let pg = Arc::new(process_group);
 
-        let [ready_read, ready_write] = make_pipe();
-        let [release_read, release_write] = make_pipe();
-        let [exec_ready_read, exec_ready_write] = make_pipe();
+        let mut race_child = AdoptionRaceChild::spawn();
+        let _pause_release = AdoptionPauseRelease(Arc::clone(&group_pause));
 
-        let mut cmd = Command::new("sh");
-        cmd.arg("-c").arg("printf x >&3; exec sleep 60");
-        cmd.kill_on_drop(true);
-        let child_ready_write = ready_write;
-        let child_release_read = release_read;
-        let child_exec_ready_write = exec_ready_write;
-        // SAFETY: the hook only uses async-signal-safe fd operations between
-        // fork and exec. fd 3 is intentionally inherited by the shell so the
-        // parent can distinguish the pre-exec and post-exec phases.
-        unsafe {
-            cmd.as_std_mut().pre_exec(move || {
-                if libc::dup2(child_exec_ready_write, 3) == -1 {
-                    return Err(std::io::Error::last_os_error());
-                }
-                let ready = [1u8];
-                if libc::write(child_ready_write, ready.as_ptr().cast(), ready.len())
-                    != ready.len() as isize
-                {
-                    return Err(std::io::Error::last_os_error());
-                }
-                let mut release = [0u8];
-                if libc::read(
-                    child_release_read,
-                    release.as_mut_ptr().cast(),
-                    release.len(),
-                ) != release.len() as isize
-                {
-                    return Err(std::io::Error::last_os_error());
-                }
-                Ok(())
-            });
-        }
-        let child = cmd.spawn().expect("spawn child adoption race");
-        // The parent retains only the read ends and the release write end.
-        // SAFETY: these are the child-side descriptors created above.
-        unsafe {
-            libc::close(ready_write);
-            libc::close(release_read);
-            libc::close(exec_ready_write);
-        }
-        let mut release = unsafe { std::fs::File::from_raw_fd(release_write) };
-
+        let ready_read = race_child.take_ready();
         let ready_wait = tokio::task::spawn_blocking(move || {
-            let mut file = unsafe { std::fs::File::from_raw_fd(ready_read) };
+            let mut file = ready_read;
             let mut byte = [0u8];
             file.read_exact(&mut byte)
         });
@@ -2901,14 +3004,11 @@ mod tests {
             .expect("pre-exec readiness waiter must not panic")
             .expect("child must reach the pre-exec barrier");
 
-        let pid = child.id().expect("race child pid") as i32;
+        let pid = race_child.pid();
         let anchor = read_identity(pid).expect("this target reports a start-time identity");
 
         let adopter_pg = Arc::clone(&pg);
-        let successful = std::thread::spawn(move || {
-            let result = adopter_pg.adopt(&child);
-            (result, child)
-        });
+        let successful = std::thread::spawn(move || adopter_pg.adopt_pid(pid));
         assert!(
             group_pause.wait_until_entered(Duration::from_secs(1)),
             "successful child adoption must pause after taking ownership"
@@ -2916,12 +3016,13 @@ mod tests {
 
         // Let the child exec while the successful adoption still owns the
         // transaction. The second adopter must wait for the group publication.
-        release
+        race_child
+            .release()
             .write_all(&[1])
             .expect("release the pre-exec barrier");
-        drop(release);
+        let exec_ready_read = race_child.take_exec_ready();
         let exec_ready_wait = tokio::task::spawn_blocking(move || {
-            let mut file = unsafe { std::fs::File::from_raw_fd(exec_ready_read) };
+            let mut file = exec_ready_read;
             let mut byte = [0u8];
             file.read_exact(&mut byte)
         });
@@ -2953,7 +3054,7 @@ mod tests {
         );
 
         group_pause.release();
-        let (successful_result, mut child) = successful.join().expect("child adoption thread");
+        let successful_result = successful.join().expect("child adoption thread");
         let failed_result = finished_rx
             .recv_timeout(Duration::from_secs(1))
             .expect("external adoption result receiver");
@@ -2990,8 +3091,7 @@ mod tests {
         drop(solos);
         drop(groups);
         drop(pg);
-        let _ = child.kill().await;
-        let _ = child.wait().await;
+        race_child.kill_and_reap();
     }
 
     /// A number that names no process is refused by the anchor capture — the bare-pid
