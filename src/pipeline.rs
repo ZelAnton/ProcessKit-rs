@@ -1168,11 +1168,15 @@ impl PipelineSession {
         // arbiter is race-free against the watchdog: whichever of `Exited`/`TimedOut`
         // CASes from `PENDING` first decides.
         if self.chain_timed_out() {
-            return Ok(Finished {
-                outcome: Outcome::TimedOut,
-                stderr: String::new(),
-                stderr_truncated: false,
-            });
+            return Ok(timeout_finished(
+                inner_res,
+                last_res,
+                &self.last_program,
+                &self.last_ok_codes,
+                self.last_unchecked,
+                self.last_timeout,
+                last_torn_down,
+            ));
         }
 
         // Surface a raw `Err` from either side (Cancelled / OutputTooLarge / Stdin / Io).
@@ -1360,6 +1364,52 @@ async fn finish_inner_stage(
             stderr_truncated,
         },
     ))
+}
+
+/// Fold the stage results that survived a chain-wide timeout. The deadline wins
+/// only for the public outcome; stderr still follows the same pipefail attribution
+/// as a natural finish. A raw stage error has no `Finished` payload to salvage, so
+/// it is ignored here just as the timeout itself takes precedence over that error.
+fn timeout_finished(
+    inner_res: Result<Vec<(usize, StageOutcome)>>,
+    last_res: Result<Finished>,
+    last_program: &str,
+    last_ok_codes: &[i32],
+    last_unchecked: bool,
+    last_timeout: Option<Duration>,
+    last_torn_down: bool,
+) -> Finished {
+    let mut inner = inner_res.unwrap_or_default();
+    inner.sort_by_key(|(index, _)| *index);
+    let mut stages: Vec<StageOutcome> = inner.into_iter().map(|(_, outcome)| outcome).collect();
+
+    if let Ok(last_finished) = last_res {
+        stages.push(StageOutcome {
+            program: last_program.to_owned(),
+            outcome: last_finished.outcome,
+            stderr: last_finished.stderr,
+            unchecked: last_unchecked,
+            ok_codes: last_ok_codes.to_vec(),
+            timeout: last_timeout,
+            torn_down: last_torn_down,
+            stderr_truncated: last_finished.stderr_truncated,
+        });
+    }
+
+    if stages.is_empty() {
+        return Finished {
+            outcome: Outcome::TimedOut,
+            stderr: String::new(),
+            stderr_truncated: false,
+        };
+    }
+
+    let folded = pipefail(stages, ());
+    Finished {
+        outcome: Outcome::TimedOut,
+        stderr: folded.stderr().to_owned(),
+        stderr_truncated: folded.truncated(),
+    }
 }
 
 /// True for SIGPIPE (Unix signal 13) — the usual victim symptom, not the culprit.
@@ -1740,6 +1790,30 @@ mod tests {
             !untruncated.truncated(),
             "an inner failure with no dropped stderr must not report truncated: {untruncated:?}"
         );
+    }
+
+    #[test]
+    fn chain_timeout_keeps_pipefail_stderr_and_truncation() {
+        let mut culprit = stage("culprit", Outcome::Signalled(None));
+        culprit.stderr = "retained diagnostic".into();
+        culprit.stderr_truncated = true;
+        let finished = timeout_finished(
+            Ok(vec![(0, culprit)]),
+            Ok(Finished {
+                outcome: Outcome::Signalled(None),
+                stderr: String::new(),
+                stderr_truncated: false,
+            }),
+            "last",
+            &[0],
+            false,
+            None,
+            false,
+        );
+
+        assert_eq!(finished.outcome, Outcome::TimedOut);
+        assert_eq!(finished.stderr, "retained diagnostic");
+        assert!(finished.stderr_truncated);
     }
 
     #[test]
