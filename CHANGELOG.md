@@ -215,6 +215,50 @@ to a dated version section.
   than after its diagnostics are collected: a *grandchild* still writing into that
   stage's stderr pipe past the grace can be cut off, though the bytes the stage
   itself emitted are still read out.
+- Reject cassette replay `version: 0` instead of decoding it as if it were a
+  real cassette. `replay_slots_from_text`'s version gate only ever checked
+  `header.version > CASSETTE_VERSION`, so a cassette declaring `0` — not a
+  version any writer has ever emitted, since numbering starts at `1` — passed
+  the gate and fell through to a full `Cassette` decode of whatever entries it
+  actually held, instead of the loud "version N is not supported" error the
+  gate exists to give a genuinely-too-new cassette. `RecordReplayRunner::replay`
+  now checks membership in `1..=CASSETTE_VERSION`, so `0` (and any other value
+  below the format's floor) is rejected before the decode with the same
+  `ErrorKind::InvalidData` "cassette version 0 is not supported" message
+  already used above the supported range. A cassette written by this or an
+  earlier supported version is unaffected.
+- Recheck process identity a second time on the Linux metrics path — after the
+  `/proc/<pid>/status` read, not only before the `/proc/<pid>/stat` read that
+  opens the snapshot — so `RunningProcess::peak_memory_bytes`,
+  `RunProfile.peak_memory_bytes`, and the Linux cgroup backend's own use of
+  `process_metrics` for group memory can no longer pair one process's CPU time
+  with a different process's peak RSS. `process_metrics` already refused to
+  report a caller-demanded identity's counters unless the opening stat read's
+  `starttime` matched it, but the pid can exit and be recycled by an unrelated
+  process in the gap between that stat read and the status read moments later,
+  and the status read was trusted regardless — so a losing race quietly handed
+  the original process's `cpu_time` and the replacement's `VmHWM` back as one
+  metrics sample for a pid that, by the time of the second read, named someone
+  else. A demanded identity is now reconfirmed with a second stat read taken
+  right after the status read; a mismatch discards both samples
+  (`ProcMetrics::default()`, `None` where a number would have been reported)
+  rather than keeping the CPU-time half. This closes the specific window
+  between two reads the code already checked around — not a new identity
+  guarantee for every metrics field or platform — and the pre-existing
+  number-only best-effort path (no identity demanded) still reads `status`
+  straight through, unchanged.
+- Reject a pid of `0` before the bare-BSD `kill(pid, 0)` existence probe
+  behind `process_info`/`process_is_alive` on the non-Linux, non-Apple Unix
+  backend (the plain POSIX process-group fallback used where there is no
+  `/proc` or `proc_pidinfo` to read). `kill(0, sig)` signals the *caller's
+  own* process group, not an individual process, so a query for the
+  honestly-nonexistent pid `0` previously answered with whatever that probe
+  of this process's own group produced — typically `Ok(Some(_))` while the
+  group had a live member, misreporting a process that was never there as
+  found and alive. A pid of `0` is now answered `Ok(None)`/`false` before any
+  syscall, the same treatment already given to a pid too large to fit
+  `pid_t`. Linux and Apple resolve identity through their own
+  `/proc`/`proc_pidinfo` paths and are untouched by this change.
 
 ## [3.2.0] - 2026-08-03
 
