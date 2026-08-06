@@ -1181,7 +1181,12 @@ async fn pipeline_start_timeout_kills_the_live_chain() {
         .expect("start the live chain");
 
     let start = Instant::now();
-    let Finished { outcome, .. } = completes_within(
+    let Finished {
+        outcome,
+        stderr,
+        stderr_truncated,
+        ..
+    } = completes_within(
         Duration::from_secs(15),
         "finishing a chain-wide-timed-out live session",
         session.finish(),
@@ -1193,10 +1198,81 @@ async fn pipeline_start_timeout_kills_the_live_chain() {
         Outcome::TimedOut,
         "a chain-wide timeout reports TimedOut: {outcome:?}"
     );
+    assert!(stderr.is_empty(), "no diagnostic was collected: {stderr:?}");
+    assert!(!stderr_truncated, "no diagnostic was collected: {stderr:?}");
     assert!(
         start.elapsed() < Duration::from_secs(15),
         "the chain-wide timeout must fire promptly, took {:?}",
         start.elapsed()
+    );
+}
+
+#[tokio::test]
+#[ignore = "spawns a real live chain that writes stderr before a chain-wide timeout"]
+async fn pipeline_start_timeout_preserves_collected_stderr_and_truncation() {
+    use processkit::{Finished, Outcome, OutputBufferPolicy};
+
+    let diagnostic_stage = if cfg!(windows) {
+        Command::new("powershell").args([
+            "-NoProfile",
+            "-Command",
+            "[Console]::Error.WriteLine('diagnostic-before'); [Console]::Error.WriteLine('diagnostic-after'); [Console]::Out.WriteLine('ready'); Start-Sleep -Seconds 30",
+        ])
+    } else {
+        Command::new("sh").args([
+            "-c",
+            "printf 'diagnostic-before\\n' >&2; printf 'diagnostic-after\\n' >&2; printf 'ready\\n'; sleep 30",
+        ])
+    }
+    .output_buffer(OutputBufferPolicy::bounded(1));
+
+    let mut session = if cfg!(windows) {
+        Command::new("cmd").args(["/d", "/c", "exit 0"])
+    } else {
+        Command::new("sh").args(["-c", "exit 0"])
+    }
+    .pipe(diagnostic_stage)
+    .timeout(if cfg!(windows) {
+        Duration::from_secs(8)
+    } else {
+        Duration::from_secs(2)
+    })
+    .start()
+    .await
+    .expect("start the live chain");
+
+    // The readiness line is written after both diagnostics. Waiting for it makes
+    // the test independent of how quickly a freshly spawned child is scheduled,
+    // while stderr remains a background drain owned by the stage's RunningProcess.
+    let ready = completes_within(
+        Duration::from_secs(10),
+        "waiting for the post-diagnostic readiness line",
+        session.wait_for_line(|line| line == "ready", Duration::from_secs(8)),
+    )
+    .await
+    .expect("the stage wrote diagnostics before readiness");
+    assert_eq!(ready, "ready");
+    let Finished {
+        outcome,
+        stderr,
+        stderr_truncated,
+        ..
+    } = completes_within(
+        Duration::from_secs(15),
+        "finishing a chain-wide-timed-out live session with stderr",
+        session.finish(),
+    )
+    .await
+    .expect("finish folds a timed-out result");
+
+    assert_eq!(outcome, Outcome::TimedOut, "timeout result: {outcome:?}");
+    assert_eq!(
+        stderr, "diagnostic-after",
+        "pipefail keeps the attributed stage's retained stderr"
+    );
+    assert!(
+        stderr_truncated,
+        "the dropped earlier diagnostic must remain visible as truncation"
     );
 }
 
