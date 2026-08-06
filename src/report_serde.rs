@@ -393,15 +393,50 @@ mod tests {
         assert_eq!(value["cpu_time_secs"], Value::Null);
         assert_eq!(value["peak_memory_bytes"], Value::Null);
 
+        // A mechanism that keeps no whole-tree accounting at all — the POSIX
+        // process group, the FreeBSD reaper — reports the count and nothing else,
+        // and every measurement must reach the wire as `null`.
         let stats = crate::ProcessGroupStats {
             active_process_count: 3,
             total_cpu_time: None,
             peak_memory_bytes: None,
+            io_read_bytes: None,
+            io_write_bytes: None,
+            peak_process_count: None,
         };
         let value = json(&stats);
         assert_eq!(value["active_process_count"], 3);
         assert_eq!(value["total_cpu_time_secs"], Value::Null);
         assert_eq!(value["peak_memory_bytes"], Value::Null);
+        assert_eq!(value["io_read_bytes"], Value::Null);
+        assert_eq!(value["io_write_bytes"], Value::Null);
+        assert_eq!(value["peak_process_count"], Value::Null);
+    }
+
+    /// The per-field version of the same rule: a mechanism can account for some of
+    /// these and not others — a Windows job has the I/O counters but no peak
+    /// process count — and each field carries its own availability onto the wire.
+    /// A zero is a *measurement* here and must stay distinguishable from the gap.
+    #[cfg(feature = "stats")]
+    #[test]
+    fn a_partially_accounting_mechanism_nulls_only_what_it_cannot_measure() {
+        let stats = crate::ProcessGroupStats {
+            active_process_count: 1,
+            total_cpu_time: Some(Duration::ZERO),
+            peak_memory_bytes: Some(0),
+            io_read_bytes: Some(0),
+            io_write_bytes: Some(4096),
+            peak_process_count: None,
+        };
+        let value = json(&stats);
+        assert_eq!(value["total_cpu_time_secs"], 0.0);
+        assert_eq!(value["peak_memory_bytes"], 0);
+        assert_eq!(
+            value["io_read_bytes"], 0,
+            "a measured zero must not be indistinguishable from an absent measurement"
+        );
+        assert_eq!(value["io_write_bytes"], 4096);
+        assert_eq!(value["peak_process_count"], Value::Null);
     }
 
     #[cfg(feature = "stats")]
@@ -411,11 +446,20 @@ mod tests {
             active_process_count: 2,
             total_cpu_time: Some(Duration::from_millis(1500)),
             peak_memory_bytes: Some(65_536),
+            io_read_bytes: Some(4096),
+            io_write_bytes: Some(8192),
+            peak_process_count: Some(5),
         };
         let value = json(&stats);
         assert_eq!(value["active_process_count"], 2);
         assert_eq!(value["total_cpu_time_secs"], 1.5);
         assert_eq!(value["peak_memory_bytes"], 65_536);
+        assert_eq!(value["io_read_bytes"], 4096);
+        assert_eq!(value["io_write_bytes"], 8192);
+        assert_eq!(
+            value["peak_process_count"], 5,
+            "the terminal peak is its own key, not folded into the live count"
+        );
     }
 
     #[cfg(feature = "process-control")]

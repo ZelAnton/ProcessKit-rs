@@ -881,6 +881,15 @@ availability follows the platform: full CPU/memory on Windows and Linux,
 `None` where the kernel doesn't account per-process cheaply — see
 [Platform support](platform-support.md).
 
+That boundary is why `RunProfile` carries no whole-tree counters — no I/O bytes,
+no peak process count — even though `ProcessGroupStats` does. Those come from the
+containment object, and a run has no whole-tree scope of its own to report them
+under: started into a shared `ProcessGroup`, it shares that container with every
+other run in it, and a container's counters cannot be split into per-run shares.
+When you want a run's *tree*, give it a group of its own and read
+[`ProcessGroup::stats`](process-groups.md#stats-and-sampling) — the same numbers,
+named as the group's.
+
 ### Lifecycle narration (`tracing`)
 
 With the opt-in **`tracing`** feature, a run narrates its lifecycle on the

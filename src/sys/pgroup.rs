@@ -1542,19 +1542,41 @@ impl ProcessGroup {
         &self.skip_drop_kill
     }
 
+    /// The live entry count, and nothing else: **every measurement is `None` on
+    /// this mechanism**, and none of them is a gap this backend could close by
+    /// reading harder.
+    ///
+    /// A POSIX process group is a delivery address, not an accounting object. The
+    /// kernel keeps no counter of any kind against it — no CPU or memory
+    /// accumulator, no I/O byte counters, no high-water mark of how many processes
+    /// it held — so there is no source to read, whereas a cgroup and a Job Object
+    /// each own theirs. What this backend does know is what it tracks: the group ids
+    /// (plus solo-adopted pids) it put there. Even the count is therefore coarser
+    /// than a cgroup's, entry by entry rather than process by process — the caveat
+    /// `ProcessGroupStats::active_process_count` documents for this mechanism.
+    ///
+    /// Summing per-process counters over the members, as the Linux cgroup backend
+    /// does for CPU and memory, would not reconstruct these either. What this
+    /// backend enumerates is *group leaders*, not the tree — a contained child that
+    /// forks helpers is one entry — so such a sum would be a different measurement
+    /// under the same name; and on the platforms this backend is the whole mechanism
+    /// for, no per-process reader is wired up at all (see `sys::unix`'s
+    /// `process_metrics`, which is a not-implemented default rather than an
+    /// impossibility). So the fields stay honestly absent rather than carrying a
+    /// zero or a partial figure that would read like a measurement.
     #[cfg(feature = "stats")]
     pub(crate) fn stats(&self) -> io::Result<ProcessGroupStats> {
         let _ownership = self
             .ownership
             .lock()
             .unwrap_or_else(|poisoned| poisoned.into_inner());
-        // We track group ids (plus solo-adopted pids), not every individual
-        // process, so report the number of live entries and leave cpu/memory
-        // absent.
         Ok(ProcessGroupStats {
             active_process_count: self.groups.count_alive() + self.solos.count_alive(),
             total_cpu_time: None,
             peak_memory_bytes: None,
+            io_read_bytes: None,
+            io_write_bytes: None,
+            peak_process_count: None,
         })
     }
 }
@@ -1707,6 +1729,35 @@ mod tests {
     fn zero_pid_is_not_a_process_lookup() {
         assert!(process_info(0).expect("zero pid lookup").is_none());
         assert!(!crate::process_is_alive(0, None).expect("zero pid liveness"));
+    }
+
+    /// This mechanism keeps no accounting at all, and the snapshot says so: the
+    /// entry count is the only fact in it and **every** measurement is `None` — a
+    /// pin against the fabricated `0` that would read like a real measurement of an
+    /// idle tree.
+    ///
+    /// It covers three of the four mechanisms that report nothing, because they are
+    /// all *this* function: macOS/BSD (`sys::unix`'s `Job` delegates straight to
+    /// it), the Linux cgroup-less fallback (`sys::linux`'s `Backend::ProcessGroup`
+    /// arm) and a FreeBSD process that could not acquire reaper status
+    /// (`sys::freebsd`'s `!reaper.active` arm). The fourth — FreeBSD *with* an
+    /// active reaper — is a distinct arm, whose only difference is where the count
+    /// comes from (`PROC_REAP_GETPIDS`); it needs a live reaper and so is covered by
+    /// the mechanism-matching integration test rather than from here.
+    #[cfg(feature = "stats")]
+    #[test]
+    fn every_measurement_is_absent_on_the_process_group_mechanism() {
+        let group = ProcessGroup::new();
+        let stats = group
+            .stats()
+            .expect("an empty process group reports its count");
+
+        assert_eq!(stats.active_process_count, 0);
+        assert_eq!(stats.total_cpu_time, None);
+        assert_eq!(stats.peak_memory_bytes, None);
+        assert_eq!(stats.io_read_bytes, None);
+        assert_eq!(stats.io_write_bytes, None);
+        assert_eq!(stats.peak_process_count, None);
     }
 
     /// Make a raw tokio command start in its own session for tests that need a

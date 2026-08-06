@@ -15,10 +15,26 @@ use crate::result::Outcome;
 
 /// A snapshot of a process group's resource usage.
 ///
-/// `total_cpu_time` and `peak_memory_bytes` are `None` when the platform can't
-/// report them — notably the POSIX process-group mechanism (no cgroup
-/// accounting), i.e. macOS/BSD and the Linux fallback, and the FreeBSD process
-/// reaper, which contains a tree without accounting for it.
+/// Every measurement except [`active_process_count`](Self::active_process_count)
+/// is an `Option`, and `None` always means *this mechanism does not account for
+/// it* — never a plausible-looking zero. The POSIX process-group mechanism
+/// (macOS/BSD and the Linux cgroup-less fallback) and the FreeBSD process reaper
+/// contain a tree without accounting for it, so on them the count is the whole
+/// snapshot and every other field is `None`.
+///
+/// Where a measurement *is* available it comes from one of two kinds of source,
+/// and each field names which one it read on which backend, because they answer
+/// different questions:
+///
+/// - **A counter the container itself keeps** — the Windows Job Object's
+///   accounting block, a Linux cgroup's controller files. Whole-tree and
+///   cumulative over the container's life: a member that has already exited is
+///   still part of the number.
+/// - **A sum over the members that are live right now** — what the Linux cgroup
+///   backend does for [`total_cpu_time`](Self::total_cpu_time) and
+///   [`peak_memory_bytes`](Self::peak_memory_bytes), reading each member's
+///   `/proc` counters. A member that exits drops out of the *next* snapshot,
+///   taking its share with it.
 ///
 /// Non-exhaustive: a read-only snapshot the crate produces — new metrics can
 /// be added without a breaking change.
@@ -62,21 +78,91 @@ pub struct ProcessGroupStats {
     /// - **POSIX process-group / macOS, and the FreeBSD process reaper** — always
     ///   `None`; no kernel accumulator.
     pub peak_memory_bytes: Option<u64>,
+    /// Bytes **read** by the whole tree, if the mechanism accounts for I/O.
+    ///
+    /// A counter the container keeps, so — unlike
+    /// [`total_cpu_time`](Self::total_cpu_time) and
+    /// [`peak_memory_bytes`](Self::peak_memory_bytes) on the Linux backend, which
+    /// sum over the live members — it is cumulative: a member that has already
+    /// exited is still part of the number. The two
+    /// mechanisms that report it nevertheless count **different traffic**, so like
+    /// [`peak_memory_bytes`](Self::peak_memory_bytes) it is *not directly
+    /// comparable across platforms*:
+    ///
+    /// - **Windows Job Object** — `IO_COUNTERS::ReadTransferCount` from the job's
+    ///   accounting block: bytes moved by the read operations the job's processes
+    ///   issued, whatever the target — file, pipe or device — not storage traffic
+    ///   alone.
+    /// - **Linux cgroup v2** — `io.stat`'s `rbytes`, summed over the devices that
+    ///   file lists: bytes this tree fetched **through the block layer**, so a read
+    ///   served from the page cache, or from a pipe, socket or tmpfs, is not in it.
+    ///   `None` unless the `io` controller is enabled for the group's cgroup, which
+    ///   is what makes `io.stat` exist at all; this crate does not enable it, since
+    ///   it enables exactly the controllers a requested `ResourceLimits` needs
+    ///   (`memory`, `pids`, `cpu`) and no others.
+    /// - **POSIX process-group / macOS, and the FreeBSD process reaper** — always
+    ///   `None`; no kernel accumulator.
+    pub io_read_bytes: Option<u64>,
+    /// Bytes **written** by the whole tree, if the mechanism accounts for I/O —
+    /// the write half of [`io_read_bytes`](Self::io_read_bytes), read from the same
+    /// counter block (Windows `IO_COUNTERS::WriteTransferCount`, Linux cgroup v2
+    /// `io.stat`'s `wbytes` summed over devices) with the same per-platform meaning
+    /// and the same honest `None`.
+    ///
+    /// One caveat is specific to this half on **Linux**: a write reaches the block
+    /// layer when the kernel writes the page back, which can be after the member
+    /// that dirtied it exited — or, for a page still dirty when the group is torn
+    /// down, not at all. A short write-and-exit run can therefore report fewer
+    /// bytes here than it handed to `write(2)`.
+    pub io_write_bytes: Option<u64>,
+    /// The high-water mark of how many processes the group held **at once**, if the
+    /// mechanism keeps one: as high as it ever got up to this snapshot, where
+    /// [`active_process_count`](Self::active_process_count) is how many there are
+    /// *now*.
+    ///
+    /// - **Linux cgroup v2** — `pids.peak`, the pids controller's own high-water
+    ///   mark for this cgroup and its descendants. That controller charges every
+    ///   **task**, so each thread of a multi-threaded member counts towards it:
+    ///   read it as a peak task count, which equals a process count only while
+    ///   every member is single-threaded. `None` where the file is not there — a
+    ///   kernel whose pids controller predates `pids.peak`, or the `pids` controller
+    ///   not enabled for the group's cgroup (this crate enables it only for a
+    ///   requested `max_processes` cap).
+    /// - **Windows Job Object** — always `None`. A job keeps no peak-concurrency
+    ///   counter: its `ActiveProcesses` is how many are in it *now* and
+    ///   `TotalProcesses` how many have *ever* been assigned to it, and a peak is
+    ///   neither. This crate also does not stand in a maximum taken over its own
+    ///   `stats()` calls, which would describe when the caller happened to look
+    ///   rather than what the tree did — a caller who wants that can take it
+    ///   knowingly over a [`sample_stats`](ProcessGroup::sample_stats) series.
+    /// - **POSIX process-group / macOS, and the FreeBSD process reaper** — always
+    ///   `None`; no kernel accumulator.
+    pub peak_process_count: Option<usize>,
 }
 
 /// *(feature `report-serde`)* The snapshot, field for field — a sampler tick as
 /// one report line:
 ///
 /// ```json
-/// {"active_process_count": 3, "total_cpu_time_secs": 1.5, "peak_memory_bytes": 65536}
+/// {
+///   "active_process_count": 3,
+///   "total_cpu_time_secs": 1.5,
+///   "peak_memory_bytes": 65536,
+///   "io_read_bytes": 4096,
+///   "io_write_bytes": 8192,
+///   "peak_process_count": 5
+/// }
 /// ```
 ///
-/// Both measurements stay `null` on a mechanism that keeps no whole-tree
-/// accounting (the POSIX process group and the FreeBSD reaper), never a
-/// plausible-looking `0` — the `Option`'s honesty carried onto the wire. The
-/// per-backend meaning of each number is unchanged and still documented on the
-/// fields themselves; a consumer comparing series across platforms must read
-/// those caveats, the wire form cannot make them comparable.
+/// Every measurement stays `null` where the mechanism does not account for it —
+/// all of them on a mechanism that keeps no whole-tree accounting at all (the
+/// POSIX process group and the FreeBSD reaper), and individually elsewhere (a
+/// Windows job has no peak-process counter; a Linux cgroup has `io.stat` only
+/// where the `io` controller is enabled) — never a plausible-looking `0`: the
+/// `Option`'s honesty carried onto the wire. The per-backend meaning of each
+/// number is unchanged and still documented on the fields themselves; a consumer
+/// comparing series across platforms must read those caveats, the wire form
+/// cannot make them comparable.
 #[cfg(feature = "report-serde")]
 #[cfg_attr(docsrs, doc(cfg(feature = "report-serde")))]
 impl Serialize for ProcessGroupStats {
@@ -92,14 +178,20 @@ impl Serialize for ProcessGroupStats {
             active_process_count,
             total_cpu_time,
             peak_memory_bytes,
+            io_read_bytes,
+            io_write_bytes,
+            peak_process_count,
         } = self;
-        let mut state = serializer.serialize_struct("ProcessGroupStats", 3)?;
+        let mut state = serializer.serialize_struct("ProcessGroupStats", 6)?;
         state.serialize_field("active_process_count", active_process_count)?;
         state.serialize_field(
             "total_cpu_time_secs",
             &crate::report_serde::secs_opt(*total_cpu_time),
         )?;
         state.serialize_field("peak_memory_bytes", peak_memory_bytes)?;
+        state.serialize_field("io_read_bytes", io_read_bytes)?;
+        state.serialize_field("io_write_bytes", io_write_bytes)?;
+        state.serialize_field("peak_process_count", peak_process_count)?;
         state.end()
     }
 }
@@ -308,6 +400,29 @@ impl tokio_stream::Stream for OwnedStatsSampler {
 /// [`peak_memory_bytes`](crate::RunningProcess::peak_memory_bytes)), so they
 /// are `None` where per-process metrics are unavailable (macOS/BSD) or when
 /// the run exited before the first sample landed.
+///
+/// # Scope: the run's own process, not its tree
+///
+/// Everything here describes the process this run started. A child that process
+/// forks is contained by the group the run belongs to, but its CPU and memory
+/// are not in these numbers, and the whole-tree counters a containment mechanism
+/// keeps — [`ProcessGroupStats::io_read_bytes`], [`io_write_bytes`] and
+/// [`peak_process_count`] — are deliberately **not** mirrored onto this summary.
+///
+/// They are group-level facts, and a run does not have a whole-tree scope of its
+/// own to report them under. A run started through
+/// [`Command::start`](crate::Command::start) gets a fresh private group, whose
+/// tree is exactly this run's; a run started into a
+/// [`ProcessGroup`] shares it with every other run in that group, and a
+/// container's counters cannot be split back into per-run shares. Copying them
+/// here would put a number that means "this run's tree" for one call and
+/// "somebody else's processes too" for the next under a single per-run name.
+/// When the whole-tree question is the one you have, start the run into a
+/// `ProcessGroup` you created for it alone and read
+/// [`ProcessGroup::stats`] — which is the same group, named as what it is.
+///
+/// [`io_write_bytes`]: ProcessGroupStats::io_write_bytes
+/// [`peak_process_count`]: ProcessGroupStats::peak_process_count
 ///
 /// Non-exhaustive: a read-only summary the crate produces — new metrics can
 /// be added without a breaking change.

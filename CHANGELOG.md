@@ -64,6 +64,48 @@ to a dated version section.
   (`ErrorKind::InvalidInput`): either would point the group's own teardown at the
   caller.
 
+- `ProcessGroupStats` (`stats`) gains three optional whole-tree measurements:
+  `io_read_bytes`, `io_write_bytes` and `peak_process_count`. Additive — the type
+  is `#[non_exhaustive]`, and `active_process_count` / `total_cpu_time` /
+  `peak_memory_bytes` are untouched, as is `RunProfile`.
+
+  They come from a different kind of source than the CPU and memory already
+  there, and the field docs say which on every backend. The byte counters are a
+  counter the *container* keeps, so they are cumulative — a member that already
+  exited is still in the number: on Windows the job's `IO_COUNTERS`
+  (`ReadTransferCount`/`WriteTransferCount`, read from the same accounting query
+  as the CPU time, via its basic+io info class), on Linux cgroup v2 the sum of
+  `io.stat`'s `rbytes`/`wbytes` over the devices it lists. That is not the same
+  traffic on the two platforms and the docs do not pretend otherwise: a Job Object
+  counts bytes moved against any target (file, pipe, device), a cgroup counts what
+  reached the block layer, so a page-cache hit or pipe traffic never appears and a
+  write may be counted after the member that dirtied it exited. `peak_process_count`
+  is Linux-only, from `pids.peak`, and is a peak of what the pids controller
+  counts — *tasks*, so each thread of a multi-threaded member counts towards it.
+
+  Where a mechanism does not account for something, the field is `None`, never a
+  fabricated `0` — and that is the common case, not an edge: the POSIX
+  process-group backends (macOS/BSD, the Linux cgroup-less fallback) and the
+  FreeBSD process reaper report the member count and nothing else; a Windows Job
+  Object has no peak-concurrency counter at all (`ActiveProcesses` is *now*,
+  `TotalProcesses` is *ever*, neither is a peak) and this crate declines to
+  substitute a maximum over its own `stats()` calls, which would describe when the
+  caller sampled rather than what the tree did; and a cgroup reports these only
+  where the matching controller is enabled for the group's cgroup, which for `io`
+  means the host enabled it (processkit enables exactly the controllers a
+  requested resource cap needs — `memory`, `pids`, `cpu`).
+
+  `RunProfile` deliberately does **not** gain them. Its telemetry is sampled from
+  the run's own child *process*, and a run has no whole-tree scope of its own to
+  report a container's counters under — one started into a shared `ProcessGroup`
+  shares that container with every other run in it, and a container's counters
+  cannot be split into per-run shares. For a run's tree, start it into a group of
+  its own and read `ProcessGroup::stats`.
+
+  Under `report-serde` the three arrive as the keys `io_read_bytes`,
+  `io_write_bytes` and `peak_process_count`, `null` where unavailable — a new key
+  in a report line, which rule 4 of that schema already covers.
+
 ### Changed
 
 - **Documentation:** `ProcessGroup::adopt`'s pid-reuse guidance now matches what

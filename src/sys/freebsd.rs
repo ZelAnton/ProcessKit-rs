@@ -1329,8 +1329,17 @@ impl Job {
 
     /// The count is the **whole tree**, not one entry per contained child: with the
     /// reaper active this is the exact process count a cgroup or Job Object would
-    /// report, not the process-group backend's live-group tally. CPU and memory stay
-    /// absent — a reaper accounts for neither.
+    /// report, not the process-group backend's live-group tally.
+    ///
+    /// Every *measurement* stays absent, and the reaper changes nothing about that:
+    /// it is a containment relationship — the kernel remembers which process
+    /// inherits the tree's orphans, so `PROC_REAP_GETPIDS` can enumerate it — and
+    /// carries no accounting whatsoever. There is no CPU or memory accumulator to
+    /// read, no I/O byte counter, and no record of how many processes the tree held
+    /// at its peak; `procctl` offers none of them. So this reports the one thing the
+    /// reaper genuinely knows — who is in the tree, right now — and leaves the rest
+    /// `None` rather than filling it with zeroes or with a walk that would be a
+    /// different measurement wearing the same name.
     #[cfg(feature = "stats")]
     pub(crate) fn stats(&self) -> io::Result<ProcessGroupStats> {
         if !self.reaper.active {
@@ -1348,6 +1357,9 @@ impl Job {
             active_process_count,
             total_cpu_time: None,
             peak_memory_bytes: None,
+            io_read_bytes: None,
+            io_write_bytes: None,
+            peak_process_count: None,
         })
     }
 

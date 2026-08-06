@@ -269,10 +269,24 @@ platform. Gated on the **`process-control`** feature, like `signal`.
 | `members()` | ✅ whole tree | ✅ whole tree | 🟡 leaders only | ✅ whole tree | 🟡 leaders only |
 | `members_info()` ppid / image / start time | ✅ | ✅ | ✅ (`/proc`) | ❌ all `None` | 🟡 macOS ✅, other BSDs all `None` |
 | Group CPU / peak memory | ✅ | ✅ | ❌ count only | ❌ count only | ❌ count only |
+| Group `io_read_bytes` / `io_write_bytes` | ✅ job `IO_COUNTERS` | 🟡 `io.stat`, if the `io` controller is enabled | ❌ `None` | ❌ `None` | ❌ `None` |
+| Group `peak_process_count` | ❌ `None` (no such counter) | 🟡 `pids.peak`, if the `pids` controller is enabled | ❌ `None` | ❌ `None` | ❌ `None` |
 | Per-run `cpu_time` / `peak_memory_bytes` / `profile` | ✅ | ✅ | ✅ (`/proc`) | ❌ `None` | ❌ `None` |
 
-`members()` is gated on the **`process-control`** feature; the CPU / memory /
-`profile` rows are gated on the **`stats`** feature.
+`members()` is gated on the **`process-control`** feature; the CPU / memory / I/O
+/ `profile` rows are gated on the **`stats`** feature.
+
+The two whole-tree counter rows read a counter the container keeps, so they are
+cumulative — a member that already exited is still in the number — where the group
+CPU / peak-memory row is a per-live-member sum on the Linux cgroup backend. They
+are also not directly comparable across platforms: a Job Object counts bytes moved
+against any target (file, pipe, device), a cgroup's `io.stat` only what reached the
+block layer. The `🟡` cells are honest `None` on a host that has not enabled the
+controller for the group's cgroup — processkit enables only the controllers a
+requested resource cap needs (`memory`/`pids`/`cpu`), never `io`. The per-run
+`profile` row deliberately does **not** gain these: they are group-level facts, and
+`RunProfile` says so rather than reporting a shared group's tree under a per-run
+name.
 
 **Resource limits** (`limits` feature)
 

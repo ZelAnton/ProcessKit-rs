@@ -462,9 +462,11 @@ async fn main() -> processkit::Result<()> {
 ```
 
 The series inherits `stats()`'s platform matrix (full CPU/memory on Windows and
-Linux cgroup; counts only on the POSIX process-group backends); `profile`
-samples the started child process itself and applies the run's normal
-timeout/output handling.
+Linux cgroup, plus whole-tree I/O bytes and — on a cgroup — a terminal peak
+process count where the mechanism keeps those counters; counts only on the POSIX
+process-group backends, with every other field an honest `None`); `profile`
+samples the started child process itself, so it carries no whole-tree counters,
+and applies the run's normal timeout/output handling.
 
 *Deeper: [Process groups → stats](docs/process-groups.md) ·
 [Streaming → profiling a run](docs/streaming.md).*

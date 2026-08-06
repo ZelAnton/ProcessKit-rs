@@ -20,6 +20,55 @@ async fn group_stats_report_active_processes() {
     );
 }
 
+/// The whole-tree counters, against the live mechanism that answered — each arm
+/// asserting exactly what that mechanism guarantees and nothing more.
+///
+/// A Job Object always has the I/O counters and never a peak-process one. A cgroup
+/// has each only where the matching controller is enabled for it (this crate
+/// enables `io` never and `pids` only for a process cap), so the honest assertion
+/// there is the *invariant*, not the presence: a peak, once reported, cannot be
+/// below a count taken before it. The mechanisms with no accounting at all report
+/// nothing, and that is the case worth pinning against a future fabricated zero.
+#[tokio::test]
+#[ignore = "creates an OS job/cgroup and reads whole-tree accounting"]
+async fn group_stats_follow_the_mechanism_for_the_whole_tree_counters() {
+    use processkit::Mechanism;
+
+    let group = ProcessGroup::new().expect("create group");
+    let _process = group.start(&sleeper()).await.expect("spawn sleeper");
+    let stats = group.stats().expect("stats");
+
+    match group.mechanism() {
+        Mechanism::JobObject => {
+            assert!(
+                stats.io_read_bytes.is_some() && stats.io_write_bytes.is_some(),
+                "a Job Object's IO_COUNTERS are always readable: {stats:?}"
+            );
+            assert_eq!(
+                stats.peak_process_count, None,
+                "a Job Object keeps no peak-concurrency counter: {stats:?}"
+            );
+        }
+        Mechanism::CgroupV2 => {
+            if let Some(peak) = stats.peak_process_count {
+                assert!(
+                    peak >= stats.active_process_count,
+                    "pids.peak is a high-water mark read after the member count, so it \
+                     cannot be below it: {stats:?}"
+                );
+            }
+        }
+        // No kernel accounting exists for these at all — see `ProcessGroupStats`.
+        _ => {
+            assert_eq!(stats.io_read_bytes, None, "{stats:?}");
+            assert_eq!(stats.io_write_bytes, None, "{stats:?}");
+            assert_eq!(stats.peak_process_count, None, "{stats:?}");
+            assert_eq!(stats.total_cpu_time, None, "{stats:?}");
+            assert_eq!(stats.peak_memory_bytes, None, "{stats:?}");
+        }
+    }
+}
+
 #[tokio::test]
 #[ignore = "spawns a real subprocess and reads per-process metrics"]
 async fn process_diagnostics_are_available() {

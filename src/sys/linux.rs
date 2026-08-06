@@ -1859,11 +1859,75 @@ impl Cgroup {
         &self,
         read: impl Fn(&Path) -> io::Result<String>,
     ) -> io::Result<ProcessGroupStats> {
-        self.stats_with_seams(
-            read,
+        let mut stats = self.stats_with_seams(
+            &read,
             |p| process_identity(p as u32),
             |p, id| process_metrics(p as u32, Some(id)),
-        )
+        )?;
+        // The counters the cgroup keeps itself, layered onto the per-member fold.
+        // Deliberately after it: they are best-effort `Option`s (see
+        // `container_counters_with`), so an absent controller file must not turn a
+        // successful snapshot into an error, and the membership read — where an
+        // unreadable answer *is* an error — has already had its say.
+        let counters = self.container_counters_with(&read);
+        stats.io_read_bytes = counters.io_read_bytes;
+        stats.io_write_bytes = counters.io_write_bytes;
+        stats.peak_process_count = counters.peak_process_count;
+        Ok(stats)
+    }
+
+    /// The whole-tree counters the **cgroup itself** keeps, as opposed to the
+    /// per-member `/proc` sums [`stats_with_seams`](Self::stats_with_seams) folds:
+    /// `io.stat`'s read/write bytes and `pids.peak`'s high-water task count. Read
+    /// through the same injectable reader as everything else here, so a test can
+    /// drive every present/absent/unparsable combination without a real cgroup v2
+    /// mount — the shape `limit_evidence_with` already uses for the events files.
+    ///
+    /// **Each field is a best-effort `Option`, never an error.** A controller file
+    /// this backend never asked for is normally *absent*: the interface files of a
+    /// controller appear in this cgroup only once that controller is enabled in the
+    /// parent's `cgroup.subtree_control`, and this backend enables exactly the
+    /// controllers a requested `ResourceLimits` needs (`memory`/`pids`/`cpu`, via
+    /// `enable_controllers`) — never `io`, and never `pids` for a group that asked
+    /// for no process cap. (Both are `limits`-gated, hence bare spans from this
+    /// `stats`-gated doc.) Reporting `None` for what the host does not account is
+    /// the whole contract; failing the snapshot over it would deny the caller the
+    /// counts and sums that *did* read.
+    ///
+    /// Both files are read from this job's **own** cgroup directory and not from its
+    /// per-spawn leaves ([`Leaves`]), which is what makes them whole-job numbers: no
+    /// controller is enabled inside a leaf, so a leaf holds no counters of its own
+    /// and its members' charges land here — the same reasoning `limit_evidence`
+    /// records for the events files. For `pids.peak` the kernel is explicit about
+    /// the scope on top of that: the pids controller counts this cgroup *and its
+    /// descendants*.
+    #[cfg(feature = "stats")]
+    fn container_counters_with(
+        &self,
+        read: impl Fn(&Path) -> io::Result<String>,
+    ) -> ContainerCounters {
+        // `io.stat` is nested-keyed: one line per device, `<major:minor>` followed by
+        // `key=value` pairs. A tree that has touched several block devices has a line
+        // for each, so the tree's bytes are the sum down the column.
+        let io = read(&self.path.join("io.stat")).ok();
+        let (io_read_bytes, io_write_bytes) = io.as_deref().map_or((None, None), |text| {
+            (
+                nested_keyed_sum(text, "rbytes"),
+                nested_keyed_sum(text, "wbytes"),
+            )
+        });
+        // `pids.peak` is a single number (the pids controller's high-water mark).
+        // Not `pids.current`, which is *now* — the same distinction
+        // `active_process_count` already covers.
+        let peak_process_count = read(&self.path.join("pids.peak"))
+            .ok()
+            .and_then(|text| text.trim().parse::<u64>().ok())
+            .and_then(|peak| usize::try_from(peak).ok());
+        ContainerCounters {
+            io_read_bytes,
+            io_write_bytes,
+            peak_process_count,
+        }
     }
 
     /// The batched identity-safe stats fold, factored over *all* its seams (the
@@ -1886,6 +1950,14 @@ impl Cgroup {
     /// member that later turns out gone/recycled still counted as live at snapshot
     /// time. An unreadable membership — the initial read (via `?`) or the single
     /// reconfirm read — surfaces as `Err` rather than a silently-short sum.
+    ///
+    /// This is the **per-member fold only**: the fields fed by the cgroup's own
+    /// counters (I/O bytes, peak process count) come back `None` from here and are
+    /// layered on by [`stats_with`](Self::stats_with) from
+    /// [`container_counters_with`](Self::container_counters_with), which is where
+    /// their tests live. Keeping them out of this function is what leaves its read
+    /// count — the O(1)-passes-per-tree property asserted below — about `cgroup.procs`
+    /// alone.
     #[cfg(feature = "stats")]
     fn stats_with_seams(
         &self,
@@ -1955,6 +2027,11 @@ impl Cgroup {
             active_process_count: active,
             total_cpu_time: have_cpu.then_some(cpu),
             peak_memory_bytes: have_mem.then_some(mem),
+            // The cgroup's own counters are not part of this per-member fold;
+            // `stats_with` layers them on (see `container_counters_with`).
+            io_read_bytes: None,
+            io_write_bytes: None,
+            peak_process_count: None,
         })
     }
 
@@ -2554,6 +2631,73 @@ fn cpu_max_value(cores: f64) -> String {
     format!("{quota} {PERIOD}")
 }
 
+/// The whole-tree counters a cgroup keeps for itself, as read by
+/// [`Cgroup::container_counters_with`] and layered onto the per-member fold — the
+/// three [`ProcessGroupStats`] fields whose source is the container rather than a
+/// sum over `/proc`. Each is `None` where this host does not account it; see the
+/// reader for why that is normal rather than a failure.
+#[cfg(feature = "stats")]
+struct ContainerCounters {
+    io_read_bytes: Option<u64>,
+    io_write_bytes: Option<u64>,
+    peak_process_count: Option<usize>,
+}
+
+/// Sum one nested key down a cgroup v2 **nested-keyed** file — `io.stat`'s
+/// `"<major:minor> rbytes=… wbytes=… rios=… wios=…"`, one line per device — over
+/// every device listed.
+///
+/// The three answers are deliberately distinct, in the same spirit as
+/// [`flat_keyed_value`]'s "absent key is not a zero":
+///
+/// - **no lines at all** — `Some(0)`. The file exists, so the controller is
+///   accounting; it lists a device only once that device has been touched, so
+///   nothing listed means nothing transferred. That is a measured zero.
+/// - **lines, none carrying `key`** — `None`. This kernel's `io.stat` does not
+///   account that key, and a sum over nothing would fabricate the same `0` the
+///   honest measurement above earns.
+/// - **lines carrying `key`** — `Some(sum)`, saturating (a tree's lifetime byte
+///   count across devices could in principle overflow, and clamping beats
+///   wrapping into a small plausible number).
+///
+/// A value that does not parse is skipped rather than failing the whole read: one
+/// malformed device line must not erase the bytes the others reported. The device
+/// token itself is never inspected — every device the tree touched counts, and this
+/// makes no claim about which.
+#[cfg(feature = "stats")]
+fn nested_keyed_sum(text: &str, key: &str) -> Option<u64> {
+    let mut saw_line = false;
+    let mut saw_key = false;
+    let mut sum = 0u64;
+    for line in text.lines() {
+        // The first token is the `<major:minor>` device the line is keyed by; the
+        // `key=value` pairs follow it.
+        let mut fields = line.split_whitespace();
+        if fields.next().is_none() {
+            continue;
+        }
+        saw_line = true;
+        for field in fields {
+            let Some((name, value)) = field.split_once('=') else {
+                continue;
+            };
+            if name == key
+                && let Ok(value) = value.parse::<u64>()
+            {
+                saw_key = true;
+                sum = sum.saturating_add(value);
+            }
+        }
+    }
+    match (saw_line, saw_key) {
+        // No device has been touched: an accounted zero, not a missing measurement.
+        (false, _) => Some(0),
+        (true, true) => Some(sum),
+        // The file accounts something, but not this key.
+        (true, false) => None,
+    }
+}
+
 /// Read one counter out of a cgroup v2 **flat-keyed** file — the
 /// `"<key> <value>"`-per-line format shared by `memory.events`, `pids.events` and
 /// `cpu.stat` (`"oom 1"`, `"max 3"`, `"nr_throttled 21"`).
@@ -3090,6 +3234,210 @@ mod cgroup_read_seam_tests {
             .expect("an empty member list is a legitimate zero-active-process stats snapshot");
 
         assert_eq!(stats.active_process_count, 0);
+    }
+
+    /// The counters the cgroup keeps itself (`io.stat`, `pids.peak`), driven over
+    /// the same injectable reader as the member list: present, absent, empty and
+    /// unparsable, plus the end-to-end `stats_with` composition that layers them
+    /// onto the per-member fold.
+    #[cfg(feature = "stats")]
+    mod container_counters {
+        use std::cell::Cell;
+        use std::io;
+        use std::path::Path;
+
+        // `super` is the seam-test module; the backend itself is one further up
+        // (the module is path-remapped to `sys::imp`, so no absolute path to it).
+        use super::super::nested_keyed_sum;
+        use super::cgroup;
+
+        /// A reader over a fixture table keyed by file name: an entry missing from
+        /// the table reads as `NotFound`, exactly as a controller file that is not
+        /// there does on a host where that controller was never enabled.
+        fn files(entries: &[(&'static str, &'static str)]) -> impl Fn(&Path) -> io::Result<String> {
+            let entries: Vec<(String, String)> = entries
+                .iter()
+                .map(|(name, body)| ((*name).to_owned(), (*body).to_owned()))
+                .collect();
+            move |path: &Path| {
+                let name = path
+                    .file_name()
+                    .and_then(|n| n.to_str())
+                    .expect("a cgroup interface file has a name");
+                entries
+                    .iter()
+                    .find(|(entry, _)| entry == name)
+                    .map(|(_, body)| body.clone())
+                    .ok_or_else(|| io::Error::from(io::ErrorKind::NotFound))
+            }
+        }
+
+        /// Real `io.stat` shape: one line per device, nested `key=value` pairs. The
+        /// tree's bytes are the sum down the column — a tree that wrote to two disks
+        /// wrote the total of both, and the device tokens are not inspected.
+        #[test]
+        fn io_bytes_are_summed_over_every_device() {
+            let counters = cgroup().container_counters_with(files(&[(
+                "io.stat",
+                "259:0 rbytes=1024 wbytes=2048 rios=4 wios=8 dbytes=0 dios=0\n\
+                 8:16 rbytes=512 wbytes=64 rios=1 wios=1 dbytes=0 dios=0\n",
+            )]));
+
+            assert_eq!(counters.io_read_bytes, Some(1536));
+            assert_eq!(counters.io_write_bytes, Some(2112));
+        }
+
+        /// `pids.peak` is the high-water mark; the reader must take it verbatim and
+        /// must not confuse it with `pids.current` (which is *now*, and is not what
+        /// this field reports).
+        #[test]
+        fn peak_process_count_reads_pids_peak_not_pids_current() {
+            let read = Cell::new(Vec::new());
+            let counters = cgroup().container_counters_with(|path: &Path| {
+                let mut seen = read.take();
+                seen.push(path.to_owned());
+                read.set(seen);
+                match path.file_name().and_then(|n| n.to_str()) {
+                    Some("pids.peak") => Ok("7\n".to_owned()),
+                    Some("pids.current") => panic!("the peak must not be read from pids.current"),
+                    _ => Err(io::Error::from(io::ErrorKind::NotFound)),
+                }
+            });
+
+            assert_eq!(counters.peak_process_count, Some(7));
+            assert!(
+                read.take()
+                    .iter()
+                    .all(|p| p.starts_with("/mock/processkit")),
+                "the counters are the job's own cgroup's, not a leaf's or an ancestor's"
+            );
+        }
+
+        /// A host that does not account these at all — no `io` controller, a kernel
+        /// without `pids.peak` — must report `None`, not a fabricated zero, and must
+        /// not fail the snapshot.
+        #[test]
+        fn absent_controller_files_are_none_never_zero() {
+            let counters = cgroup().container_counters_with(files(&[]));
+
+            assert_eq!(counters.io_read_bytes, None);
+            assert_eq!(counters.io_write_bytes, None);
+            assert_eq!(counters.peak_process_count, None);
+        }
+
+        /// An unreadable (rather than absent) counter file is the same honest gap:
+        /// a permission denial says nothing about how many bytes moved.
+        #[test]
+        fn unreadable_counter_files_are_none() {
+            let counters = cgroup().container_counters_with(|_: &Path| {
+                Err(io::Error::from(io::ErrorKind::PermissionDenied))
+            });
+
+            assert_eq!(counters.io_read_bytes, None);
+            assert_eq!(counters.io_write_bytes, None);
+            assert_eq!(counters.peak_process_count, None);
+        }
+
+        /// The short-run case: `io.stat` exists (the controller *is* accounting) but
+        /// lists no device, because nothing has reached the block layer yet. That is
+        /// a measured zero — distinct from the absent-file `None` above.
+        #[test]
+        fn an_accounting_cgroup_that_moved_nothing_reports_zero_not_none() {
+            let counters = cgroup().container_counters_with(files(&[("io.stat", "")]));
+
+            assert_eq!(counters.io_read_bytes, Some(0));
+            assert_eq!(counters.io_write_bytes, Some(0));
+        }
+
+        /// A `pids.peak` that does not parse (a kernel spelling this reader does not
+        /// know) is `None` rather than a guess.
+        #[test]
+        fn unparsable_pids_peak_is_none() {
+            let counters = cgroup().container_counters_with(files(&[("pids.peak", "max\n")]));
+
+            assert_eq!(counters.peak_process_count, None);
+        }
+
+        /// A device line whose value is malformed must not erase what the other
+        /// devices reported — one bad line costs its own contribution, nothing more.
+        #[test]
+        fn a_malformed_device_line_does_not_erase_the_others() {
+            assert_eq!(
+                nested_keyed_sum(
+                    "259:0 rbytes=oops wbytes=1\n8:16 rbytes=10 wbytes=2\n",
+                    "rbytes"
+                ),
+                Some(10)
+            );
+        }
+
+        /// A file that accounts *something* but not this key is `None`: summing over
+        /// no matching key would fabricate the same `0` a real "nothing moved"
+        /// earns, and the two must stay distinguishable.
+        #[test]
+        fn a_key_this_kernel_does_not_account_is_none() {
+            assert_eq!(nested_keyed_sum("259:0 rios=4 wios=8\n", "rbytes"), None);
+            assert_eq!(nested_keyed_sum("", "rbytes"), Some(0));
+        }
+
+        /// End to end through `stats_with`: the per-member fold and the cgroup's own
+        /// counters land in one snapshot, each from its own file, and a membership
+        /// change between the two `cgroup.procs` reads (pid 1002 recycled out) skips
+        /// only that member's `/proc` share — the container counters are the
+        /// kernel's and are unaffected by it.
+        #[test]
+        fn stats_with_layers_the_container_counters_onto_the_member_fold() {
+            let procs_reads = Cell::new(0usize);
+            let stats = cgroup()
+                .stats_with(
+                    |path: &Path| match path.file_name().and_then(|n| n.to_str()) {
+                        Some("cgroup.procs") => {
+                            procs_reads.set(procs_reads.get() + 1);
+                            Ok(if procs_reads.get() == 1 {
+                                "1001\n1002\n".to_owned()
+                            } else {
+                                "1001\n".to_owned()
+                            })
+                        }
+                        Some("io.stat") => Ok("259:0 rbytes=4096 wbytes=8192\n".to_owned()),
+                        Some("pids.peak") => Ok("5\n".to_owned()),
+                        other => panic!("unexpected read of {other:?}"),
+                    },
+                )
+                .expect("a snapshot with both sources present");
+
+            assert_eq!(
+                stats.active_process_count, 2,
+                "the count still reflects the initial member list"
+            );
+            assert_eq!(stats.io_read_bytes, Some(4096));
+            assert_eq!(stats.io_write_bytes, Some(8192));
+            assert_eq!(
+                stats.peak_process_count,
+                Some(5),
+                "the terminal peak is the cgroup's own, higher than the count now"
+            );
+        }
+
+        /// The composition must not go the other way either: an absent `io.stat` /
+        /// `pids.peak` leaves those fields `None` while the member fold's own
+        /// numbers still come back.
+        #[test]
+        fn a_host_without_the_controllers_still_reports_the_member_fold() {
+            let stats = cgroup()
+                .stats_with(
+                    |path: &Path| match path.file_name().and_then(|n| n.to_str()) {
+                        Some("cgroup.procs") => Ok("1001\n".to_owned()),
+                        _ => Err(io::Error::from(io::ErrorKind::NotFound)),
+                    },
+                )
+                .expect("missing controller files are not a snapshot failure");
+
+            assert_eq!(stats.active_process_count, 1);
+            assert_eq!(stats.io_read_bytes, None);
+            assert_eq!(stats.io_write_bytes, None);
+            assert_eq!(stats.peak_process_count, None);
+        }
     }
 
     // ---- identity-safe per-member delivery (`deliver_identity_safe`) ----

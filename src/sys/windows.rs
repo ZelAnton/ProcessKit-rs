@@ -44,6 +44,13 @@ use windows_sys::Win32::System::JobObjects::{
 use windows_sys::Win32::System::JobObjects::{
     JOBOBJECT_BASIC_ACCOUNTING_INFORMATION, JobObjectBasicAccountingInformation,
 };
+// The accounting block *plus* the job's `IO_COUNTERS`, in one query — the whole-tree
+// I/O byte counters `stats` reports. The un-gated drain check below keeps the plain
+// `Basic` class: it needs the active-process count only.
+#[cfg(feature = "stats")]
+use windows_sys::Win32::System::JobObjects::{
+    JOBOBJECT_BASIC_AND_IO_ACCOUNTING_INFORMATION, JobObjectBasicAndIoAccountingInformation,
+};
 #[cfg(feature = "process-control")]
 use windows_sys::Win32::System::JobObjects::{
     JOBOBJECT_BASIC_PROCESS_ID_LIST, JobObjectBasicProcessIdList,
@@ -1008,22 +1015,49 @@ impl Job {
         )
     }
 
+    /// The job's own accounting, read back as a [`ProcessGroupStats`] — two
+    /// `QueryInformationJobObject` calls, no `SetInformationJobObject` and no
+    /// teardown effect, so it is safe to call at any cadence.
+    ///
+    /// Every number here is the job's, hence whole-tree and cumulative over the
+    /// job's life: CPU time and the I/O byte counters include processes that have
+    /// already exited (the active count, of course, does not).
+    ///
+    /// **`peak_process_count` is `None` on this mechanism, and stays that way.** A
+    /// Job Object keeps no peak-concurrency counter to read: the accounting block's
+    /// `ActiveProcesses` is how many are in the job *now*, `TotalProcesses` how many
+    /// have *ever* been assigned to it, and a maximum-at-any-one-time is neither —
+    /// the same shape of gap `limit_evidence` (just above, `limits`-gated, hence a
+    /// bare span here) reports as `Unknown` rather than guessing at. The
+    /// alternative — this backend keeping a running maximum of the
+    /// `ActiveProcesses` values its *own* `stats()` calls
+    /// happened to see — is deliberately not taken: that number would describe when
+    /// the caller sampled, not what the tree did (a burst between two ticks leaves
+    /// no trace in it), and presenting it beside kernel counters would make a
+    /// sampling artefact look like an OS measurement. A caller who wants exactly
+    /// that maximum can take it over a `sample_stats` series, where it is visibly
+    /// their own.
     #[cfg(feature = "stats")]
     pub(crate) fn stats(&self) -> io::Result<ProcessGroupStats> {
-        let mut acct: JOBOBJECT_BASIC_ACCOUNTING_INFORMATION = unsafe { std::mem::zeroed() };
-        // SAFETY: out param matches the accounting info class and its size.
+        // The `BasicAndIo` class returns the basic accounting structure verbatim as
+        // its first member, so this is the `Basic` query's data plus the job's
+        // `IO_COUNTERS` — one trip into the kernel, not two.
+        let mut acct: JOBOBJECT_BASIC_AND_IO_ACCOUNTING_INFORMATION = unsafe { std::mem::zeroed() };
+        // SAFETY: out param matches the basic+io accounting info class and its size.
         let ok = unsafe {
             QueryInformationJobObject(
                 self.handle,
-                JobObjectBasicAccountingInformation,
+                JobObjectBasicAndIoAccountingInformation,
                 std::ptr::from_mut(&mut acct).cast(),
-                std::mem::size_of::<JOBOBJECT_BASIC_ACCOUNTING_INFORMATION>() as u32,
+                std::mem::size_of::<JOBOBJECT_BASIC_AND_IO_ACCOUNTING_INFORMATION>() as u32,
                 std::ptr::null_mut(),
             )
         };
         if ok == 0 {
             return Err(io::Error::last_os_error());
         }
+        let io_counters = acct.IoInfo;
+        let acct = acct.BasicInfo;
 
         let mut ext: JOBOBJECT_EXTENDED_LIMIT_INFORMATION = unsafe { std::mem::zeroed() };
         // SAFETY: out param matches the extended-limit info class and its size.
@@ -1046,6 +1080,13 @@ impl Job {
             active_process_count: acct.ActiveProcesses as usize,
             total_cpu_time: Some(Duration::from_nanos(cpu_100ns.saturating_mul(100))),
             peak_memory_bytes: Some(ext.PeakJobMemoryUsed as u64),
+            // Bytes moved by the job's read/write operations against any target —
+            // file, pipe or device — not storage traffic alone.
+            io_read_bytes: Some(io_counters.ReadTransferCount),
+            io_write_bytes: Some(io_counters.WriteTransferCount),
+            // No Job Object counter answers this — see the doc above for what was
+            // examined and why a sampled stand-in is refused.
+            peak_process_count: None,
         })
     }
 
@@ -2466,6 +2507,37 @@ mod rearm_race_tests {
             "a child assigned to the job mid-shutdown must keep its kill-on-close \
              backstop — the stale request must not re-spare it"
         );
+    }
+
+    /// The Job Object accounting readout, against a real (empty) job — no
+    /// subprocess, so this is deterministic: a job nothing has ever been assigned
+    /// to has moved no bytes and used no CPU, and every counter the mechanism keeps
+    /// reads as an accounted **zero**, while the one it does *not* keep reads
+    /// `None`.
+    ///
+    /// That split is the point of the test. `io_read_bytes`/`io_write_bytes` come
+    /// from the job's own `IO_COUNTERS`, so `Some(0)` here is a measurement;
+    /// `peak_process_count` is `None` because no Job Object counter answers it, and
+    /// pinning that keeps a later "helpful" substitution — `ActiveProcesses` (now)
+    /// or `TotalProcesses` (ever), neither of which is a peak — from silently
+    /// becoming a fabricated answer.
+    #[cfg(feature = "stats")]
+    #[test]
+    fn job_stats_report_the_io_counters_and_no_peak_process_count() {
+        let job = new_job();
+        let stats = job.stats().expect("an empty job reports its accounting");
+
+        assert_eq!(stats.active_process_count, 0);
+        assert_eq!(stats.io_read_bytes, Some(0));
+        assert_eq!(stats.io_write_bytes, Some(0));
+        assert_eq!(
+            stats.peak_process_count, None,
+            "a Job Object keeps no peak-concurrency counter; None is the honest answer"
+        );
+        // The counters that were already here are untouched by the switch to the
+        // basic+io accounting class — the same fields, from the same block.
+        assert_eq!(stats.total_cpu_time, Some(Duration::ZERO));
+        assert!(stats.peak_memory_bytes.is_some());
     }
 }
 

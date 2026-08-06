@@ -1381,7 +1381,10 @@ impl core::panic::unwind_safe::RefUnwindSafe for processkit::ProcessGroupOptions
 impl core::panic::unwind_safe::UnwindSafe for processkit::ProcessGroupOptions
 #[non_exhaustive] pub struct processkit::ProcessGroupStats
 pub processkit::ProcessGroupStats::active_process_count: usize
+pub processkit::ProcessGroupStats::io_read_bytes: core::option::Option<u64>
+pub processkit::ProcessGroupStats::io_write_bytes: core::option::Option<u64>
 pub processkit::ProcessGroupStats::peak_memory_bytes: core::option::Option<u64>
+pub processkit::ProcessGroupStats::peak_process_count: core::option::Option<usize>
 pub processkit::ProcessGroupStats::total_cpu_time: core::option::Option<core::time::Duration>
 impl core::clone::Clone for processkit::ProcessGroupStats
 pub fn processkit::ProcessGroupStats::clone(&self) -> processkit::ProcessGroupStats

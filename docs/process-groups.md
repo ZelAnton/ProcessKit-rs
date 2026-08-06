@@ -883,6 +883,10 @@ async fn main() -> processkit::Result<()> {
         "procs={} cpu={:?} peak_rss={:?}",
         snap.active_process_count, snap.total_cpu_time, snap.peak_memory_bytes,
     );
+    println!(
+        "io_read={:?} io_write={:?} peak_procs={:?}",
+        snap.io_read_bytes, snap.io_write_bytes, snap.peak_process_count,
+    );
 
     // …or a series: first sample immediate, then every 250ms; missed ticks are
     // skipped; the stream ends when the group can no longer report.
@@ -900,6 +904,44 @@ member **count** only — the `Option` fields stay `None`. The sampler borrows
 the group, so it can neither outlive it nor keep it (and the kill-on-drop
 guarantee) alive. For a *single run's* end-to-end summary, see
 [`profile`](streaming.md#per-run-telemetry).
+
+### What each measurement is, and where it comes from
+
+`None` never means zero anywhere in this snapshot: it means *this mechanism does
+not account for that*. Which fields carry a number depends on the mechanism, and
+on **two different kinds of source** — a counter the container itself keeps
+(whole-tree and cumulative, exited members included), or a sum over the members
+that are live right now (a member that exits takes its share out of the next
+snapshot):
+
+| Field | Windows Job Object | Linux cgroup v2 | Process group / FreeBSD reaper |
+|---|---|---|---|
+| `active_process_count` | job's `ActiveProcesses` | live `cgroup.procs` members | tracked entries (reaper: whole tree) |
+| `total_cpu_time` | job counter, cumulative | sum over live members (`/proc`) | `None` |
+| `peak_memory_bytes` | job counter (commit charge) | sum of live members' `VmHWM` | `None` |
+| `io_read_bytes` / `io_write_bytes` | job `IO_COUNTERS`, cumulative | `io.stat` `rbytes`/`wbytes`, cumulative — needs the `io` controller | `None` |
+| `peak_process_count` | `None` — no such counter | `pids.peak` — needs the `pids` controller | `None` |
+
+Three caveats are worth reading before comparing numbers across hosts:
+
+- **The I/O counters measure different traffic per platform.** Windows counts the
+  bytes the job's read/write operations moved against *any* target — file, pipe,
+  device. A cgroup's `io.stat` counts what reached the **block layer**, so a read
+  served from the page cache or traffic over a pipe or socket is not in it, and a
+  write is counted when the kernel writes the page back — possibly after the
+  member that dirtied it exited, and not yet at all in a snapshot taken before
+  that. A short write-and-exit run can therefore report fewer bytes than it handed
+  to `write(2)`.
+- **A cgroup reports these only where the controller is enabled** for the group's
+  cgroup (in its parent's `cgroup.subtree_control`). processkit enables exactly
+  the controllers a requested resource cap needs — `memory`, `pids`, `cpu` — and
+  never `io`, so on a host that has not enabled `io` itself the byte counters are
+  honestly `None` rather than a zero.
+- **`peak_process_count` is a peak of what the pids controller counts**, which is
+  *tasks*: every thread of a multi-threaded member counts towards it, so it equals
+  a process count only while the members are single-threaded. Windows reports
+  `None` here rather than a substitute — a job's `ActiveProcesses` is how many are
+  in it now and `TotalProcesses` how many ever were, and neither is a peak.
 
 ### An owning, `'static` sampler
 
