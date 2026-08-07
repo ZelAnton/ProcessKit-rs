@@ -12,6 +12,17 @@ to a dated version section.
 ## [Unreleased]
 
 ### Added
+-
+
+### Changed
+-
+
+### Fixed
+-
+
+## [3.3.0] - 2026-08-07
+
+### Added
 
 - `ProcessGroup::adopt_external(pid)` (`process-control`): bring an
   already-running process under a group's containment when all you have is its
@@ -3390,7 +3401,8 @@ _No functional changes — republished to recover a failed crates.io upload._
 - Output capture is line-oriented (pumped): captured text is normalized to
   `\n` line endings. `output_bytes` still returns exact raw stdout.
 
-[Unreleased]: https://github.com/ZelAnton/ProcessKit-rs/compare/v3.2.0...HEAD
+[Unreleased]: https://github.com/ZelAnton/ProcessKit-rs/compare/v3.3.0...HEAD
+[3.3.0]: https://github.com/ZelAnton/ProcessKit-rs/compare/v3.2.0...v3.3.0
 [3.2.0]: https://github.com/ZelAnton/ProcessKit-rs/compare/v3.1.0...v3.2.0
 [3.1.0]: https://github.com/ZelAnton/ProcessKit-rs/compare/v3.0.2...v3.1.0
 [3.0.2]: https://github.com/ZelAnton/ProcessKit-rs/compare/v3.0.1...v3.0.2
