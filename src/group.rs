@@ -622,7 +622,7 @@ impl ProcessGroup {
     }
 
     /// Immediately hard-kill every process currently in the group. Idempotent;
-    /// the group remains usable for further spawns afterwards.
+    /// on success the group remains usable for further spawns afterwards.
     ///
     /// This is an unconditional **hard** kill (`SIGKILL` / `cgroup.kill` /
     /// `TerminateJobObject`), not a graceful `SIGTERM` — for a `SIGTERM` → grace →
@@ -634,7 +634,16 @@ impl ProcessGroup {
     /// pre-5.14), a tree that won't drain within the bounded sweep — a fork bomb
     /// still out-spawning, or un-reapable `D`-state zombies — surfaces as an `Err`
     /// rather than a false success; the atomic backends (`cgroup.kill`, Windows
-    /// Job Object) don't need to.
+    /// Job Object) don't need to. That fallback also freezes the subtree while it
+    /// sweeps, so a fork bomb cannot out-spawn it, and clears the freeze
+    /// afterwards; if clearing it is refused and a retry does not get through, the
+    /// tree is dead but the cgroup is left frozen — which is not the usable group
+    /// promised above, since cgroup v2 freezes a task that joins a frozen cgroup —
+    /// and that surfaces as an `Err` too instead of as a clean kill. Whether the
+    /// group is frozen is read back from it rather than assumed from what this call
+    /// wrote, so calling `kill_all` again over a group left frozen reports it again
+    /// rather than answering cleanly, and a freeze an earlier `suspend` left
+    /// standing is covered the same way.
     ///
     /// **Process-group mechanism (macOS/the other BSDs, Linux process-group
     /// fallback), and the FreeBSD process reaper.** A
@@ -657,9 +666,12 @@ impl ProcessGroup {
     ///
     /// # Errors
     ///
-    /// [`crate::ErrorReason::Io`] on the non-atomic Unix backends only, in three cases: the
+    /// [`crate::ErrorReason::Io`] on the non-atomic Unix backends only, in four cases: the
     /// legacy per-pid kill fallback (a pre-5.14 Linux kernel without `cgroup.kill`)
-    /// when the tree won't drain within the bounded sweep; the process-group
+    /// when the tree won't drain within the bounded sweep; that same fallback when the
+    /// freeze protecting the sweep cannot be cleared afterwards (a refused
+    /// `cgroup.freeze` write, retried once, over a group that reads frozen), which
+    /// leaves it unusable for further spawns even though the tree drained; the process-group
     /// mechanism (macOS/the other BSDs, and the Linux fallback) when a live,
     /// non-zombie member rejects `SIGKILL` with `EPERM` (a uid-changed child — see
     /// above); and the FreeBSD process reaper, both for that same live-`EPERM` (which

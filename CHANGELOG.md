@@ -19,6 +19,34 @@ to a dated version section.
 
 ### Fixed
 
+- **Linux, legacy/restricted cgroup teardown:** `ProcessGroup::kill_all` (and the
+  hard-kill escalation behind `shutdown`) no longer reports a clean kill over a
+  group it leaves frozen. On a kernel without `cgroup.kill` (pre-5.14), teardown
+  freezes the subtree so a fork bomb cannot out-spawn its per-pid `SIGKILL` sweep,
+  then thaws it — but the thaw's result was discarded, so a *refused* thaw still
+  returned `Ok(())` on the strength of an empty `cgroup.procs` while leaving the
+  group frozen. Since cgroup v2 freezes a task that joins a frozen cgroup, the next
+  spawn into that supposedly-reusable group would stop before `exec` instead of
+  running. The thaw is now retried once and, if it is still refused, the freezer is
+  read back from `cgroup.freeze`: a group that reads frozen is reported as such,
+  carrying the refusal's own `ErrorKind` (so an `EACCES` classifies as
+  `ErrorKind::PermissionDenied`, as a refused `suspend` already did) and its errno
+  in the message. Reading the state rather than assuming it from what this call
+  wrote keeps the answer honest for a repeat `kill_all` over a group already left
+  frozen — the idempotent verb reports it again instead of answering cleanly — and
+  covers a freeze an earlier `suspend` left standing. Unchanged where nothing is
+  frozen: on a host that refuses every cgroup write, the per-pid sweep needs none
+  and stays the complete teardown it already was there.
+
+- **Windows ConPTY:** `PtyChild::wait` and `try_wait` no longer mask a failed
+  `WaitForSingleObject` as a live or exit-code-less process. `try_wait` now
+  returns `Err(io::Error::last_os_error())` for `WAIT_FAILED`/other unexpected
+  results instead of `Ok(None)` (still distinct from the normal `WAIT_TIMEOUT`
+  not-yet-exited case), and `wait` checks its blocking
+  `WaitForSingleObject(..., INFINITE)` before trusting `GetExitCodeProcess`
+  instead of folding a failed wait into `Ok(PtyExitStatus::from_code(None))`.
+  Both error arms still perform the usual PTY cleanup.
+
 - `Pipeline`: a non-final stage configured with `stdout(StdioMode::Null)`,
   `stdout(StdioMode::Inherit)`, or a `stdout_file(..)` / `stdout_file_append(..)`
   redirect no longer breaks the chain. Such a stage had no pipe to hand downstream,

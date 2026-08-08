@@ -2269,7 +2269,16 @@ impl Cgroup {
         // like `Job::drop`'s. Revisit (route through `spawn_blocking`) if a
         // legacy/restricted-cgroup deployment reports worker-thread starvation
         // under load.
-        let _ = cgroup_write(&self.path.join("cgroup.freeze"), b"1");
+        //
+        // Whether the guard actually went in is remembered rather than discarded:
+        // it is the thaw's *last-resort* answer to "is this cgroup frozen" — used
+        // only on a host that will not let it read the freezer state back, since
+        // reading `cgroup.freeze` answers that question for any freeze, not just
+        // one this call put there (see `thaw_after_kill_sweep`). The freeze itself
+        // stays best-effort for the sweep's own purposes — an absent file
+        // (kernel < 5.2) or a refused write only means the fork-bomb guard is
+        // unavailable, and the bounded sweep runs either way.
+        let froze = cgroup_write(&self.path.join("cgroup.freeze"), b"1").is_ok();
         let mut last_delivery_error = None;
         for _ in 0..50 {
             if let Err(err) = self.signal_with_seams(libc::SIGKILL, &read, &open, &send) {
@@ -2287,19 +2296,34 @@ impl Cgroup {
             // bounded fallback in case the read failure is transient.
             std::thread::sleep(Duration::from_millis(2));
         }
-        // Thaw (best-effort): the freeze only halted forking DURING the sweep.
-        // Restore the cgroup unfrozen so it stays reusable for further spawns
-        // (`kill_all` keeps the group usable; a child spawned into a frozen
-        // cgroup would itself start frozen and the spawn could block) — and so a
-        // SIGKILL'd-but-frozen straggler can run its pending fatal signal and exit.
+        // Thaw: the freeze only halted forking DURING the sweep. Restore the cgroup
+        // unfrozen so it stays reusable for further spawns (`kill_all` keeps the
+        // group usable; a child spawned into a frozen cgroup would itself start
+        // frozen and the spawn could block) — and so a SIGKILL'd-but-frozen
+        // straggler can run its pending fatal signal and exit.
         // (This unconditionally clears any freeze a prior `suspend()` set; a kill
         // verb resurrecting-then-killing a deliberately-suspended group is benign.)
-        let _ = cgroup_write(&self.path.join("cgroup.freeze"), b"0");
+        //
+        // Best-effort in *timing* exactly as before — one bounded retry (a further
+        // ~2ms on this thread, plus a read of `cgroup.freeze`, and only on the
+        // refused-thaw path), never a wait loop — but no longer best-effort in
+        // *reporting*: a cgroup left frozen travels to the drain check below
+        // instead of being dropped on the floor.
+        let left_frozen = self.thaw_after_kill_sweep(froze);
         // Report a real drain failure instead of a false success, so the caller
         // knows the tree may still be alive — a fork bomb still out-spawning, or
         // un-reapable zombies (a D-state task ignores SIGKILL until it unblocks).
         match self.members_with(&read) {
-            Ok(members) if members.is_empty() => Ok(()),
+            // Drained. Still not a success if the cgroup is left frozen: that is
+            // not the reusable group `kill_all` promises, and an empty
+            // `cgroup.procs` says nothing about the freezer. The report is confined
+            // to this arm on purpose — with members still alive, the delivery/drain
+            // failure below is both the more severe and the more actionable answer,
+            // so the two pre-existing arms keep deciding exactly what they did.
+            Ok(members) if members.is_empty() => match left_frozen {
+                Some(err) => Err(err),
+                None => Ok(()),
+            },
             // The two "still populated" cases share one arm: an `if let` guard
             // would read more directly, but `if_let_guard` is unstable on this
             // crate's MSRV (`rust-version = "1.88"`), and the floor is verified
@@ -2312,6 +2336,122 @@ impl Cgroup {
             })),
             Err(e) => Err(e),
         }
+    }
+
+    /// Clear the freeze [`kill_with_seams`](Self::kill_with_seams) put on the
+    /// subtree to protect its SIGKILL sweep, and report back the one outcome that
+    /// must not be dressed up as a clean kill: a cgroup left **frozen**.
+    ///
+    /// What separates a refusal that matters from one that does not is whether the
+    /// freezer is actually on when the clear is refused — which this asks the
+    /// kernel, by reading `cgroup.freeze` back ([`frozen_now`]), rather than infers
+    /// from `froze` (whether this call's own `cgroup.freeze` → 1 write landed):
+    ///
+    /// - **Refused over a cgroup that reads frozen.** The group stays frozen, and
+    ///   that is not a group the caller can spawn into: cgroup v2 freezes a task
+    ///   that joins a frozen cgroup, and this backend joins in a `pre_exec` hook, so
+    ///   the next child would stop before it can `exec` rather than run. Reported —
+    ///   whoever set that freeze. A freeze this call put in force is the common
+    ///   case, but the same answer is owed for one an earlier
+    ///   [`suspend`](Self::freeze) left standing, and for one this call reported
+    ///   already: `ProcessGroup::kill_all` is documented idempotent, so a repeat
+    ///   call over a still-frozen group — where this call's own freeze write is
+    ///   refused too, exactly as the thaw is — has to reach the same verdict rather
+    ///   than answer `Ok(())` over the state its predecessor refused to call clean.
+    /// - **Refused over a cgroup that reads unfrozen** (a write-restricted
+    ///   delegated cgroup refusing every control write — the very host whose refused
+    ///   `cgroup.kill` selects this fallback — where the paired freeze never landed
+    ///   either). Nothing is frozen, so a clear the same host refuses for the same
+    ///   reason leaves the group exactly as this call found it. Not reported: the
+    ///   per-pid sweep needs no cgroup write at all, so it is a complete teardown
+    ///   there, and failing it would make `kill_all` permanently `Err` on those
+    ///   hosts over a state that is not there.
+    ///
+    /// Only when that read gives no usable answer at all (the state is unreadable,
+    /// or holds something neither `0` nor `1`) does `froze` decide, on the
+    /// assumption that a freeze this call landed and could not clear is still in
+    /// force. That fallback is the one place a verdict here rests on an inference
+    /// rather than on the kernel's own word, and it keeps the pre-existing
+    /// behaviour: an unreadable freezer is no reason to start reporting less than
+    /// before.
+    ///
+    /// A `NotFound` from the *write* is excused ahead of any of that: either there
+    /// is no `cgroup.freeze` file (kernel < 5.2, where the paired freeze was the
+    /// same no-op) or the cgroup directory is already gone — neither leaves a freeze
+    /// in force, and a state read would fail with the same `NotFound` and fall
+    /// through to `froze`, which for a vanished cgroup would be exactly the wrong
+    /// answer. This is the same absent-versus-refused discrimination
+    /// [`freeze`](Self::freeze) makes, for the same reason.
+    ///
+    /// One retry, then report. What refuses this write does not heal by being
+    /// waited on (a revoked delegation stays revoked), and the caller's thread is
+    /// blocked throughout — `Job::drop` reaches here too — so the second attempt is
+    /// a single extra write on the sweep's own 2ms cadence rather than a loop.
+    fn thaw_after_kill_sweep(&self, froze: bool) -> Option<io::Error> {
+        let path = self.path.join("cgroup.freeze");
+        // The refusals that leave a freeze standing, told apart from those that
+        // leave nothing behind to tell the caller about. The state is re-read per
+        // refusal rather than once up front: each read is the freshest answer
+        // available to the write it judges, and there are at most two of them, both
+        // on a path that has already failed.
+        let unrecovered = |written: io::Result<()>| match written {
+            Ok(()) => None,
+            Err(e) if e.kind() == io::ErrorKind::NotFound => None,
+            Err(e) => frozen_now(std::fs::read_to_string(&path), froze).then_some(e),
+        };
+        // Note the inversion the `?`s carry: `None` is the *good* answer here — no
+        // freeze left in force, whether because it cleared, because there is no
+        // such file, or because the freezer reads off — and it is both nothing to
+        // report and nothing a retry could improve, so it short-circuits out of
+        // this function before the sleep and the second write ever happen.
+        unrecovered(cgroup_write(&path, b"0"))?;
+        // Only a freeze still standing reaches here, and gets the one extra try.
+        std::thread::sleep(Duration::from_millis(2));
+        let err = unrecovered(cgroup_write(&path, b"0"))?;
+        // Keep the refusal's own `ErrorKind` so the crate classifies a permission
+        // problem as one (`ErrorReason::Io` → `ErrorKind::PermissionDenied`),
+        // matching what a refused `suspend` publishes for the identical write, and
+        // carry its `Display` — which spells out `os error <n>` — inside the
+        // explanation of what the caller is now holding.
+        Some(io::Error::new(
+            err.kind(),
+            format!(
+                "the process tree was killed and the cgroup drained, but the freezer — set to keep \
+                 the sweep ahead of new forks — could not be cleared ({err}); the cgroup at {} is \
+                 left FROZEN and is not usable for further spawns — cgroup v2 \
+                 freezes a task that joins a frozen cgroup, and this backend joins one before \
+                 `exec`, so the next child would stop instead of running. Clear `cgroup.freeze` \
+                 (the write `ProcessGroup::resume` makes, where that feature is enabled) before \
+                 spawning into this group again",
+                self.path.display()
+            ),
+        ))
+    }
+}
+
+/// Is the freezer on? `state` is a read of this cgroup's own `cgroup.freeze`, and
+/// `froze` the caller's fallback belief for when that read does not answer.
+///
+/// Used by [`thaw_after_kill_sweep`](Cgroup::thaw_after_kill_sweep) on the one path
+/// where the answer changes what the caller is told, so the cost — a single extra
+/// `read` — is paid only after a write has already been refused.
+///
+/// `cgroup.freeze` is this cgroup's **own** freezer setting, which is exactly the
+/// state a refused thaw fails to change and the one the error's remedy names. It is
+/// deliberately not `cgroup.events`' `frozen` field: that reports the *effective*
+/// state, which an ancestor's freeze also turns on — a condition no teardown here
+/// set, none can clear, and which the atomic `cgroup.kill` path does not report
+/// either. Reading it would make this fallback answer for a different, wider
+/// question than the one it can act on.
+///
+/// A value that is neither `0` nor `1` is treated exactly like an unreadable one:
+/// this is a two-valued kernel file, so anything else means the answer did not come
+/// from the file this code thinks it is reading.
+fn frozen_now(state: io::Result<String>, froze: bool) -> bool {
+    match state.as_deref().map(str::trim) {
+        Ok("1") => true,
+        Ok("0") => false,
+        _ => froze,
     }
 }
 
@@ -2847,13 +2987,19 @@ fn write_self_pid(path: &CStr) -> io::Result<()> {
 /// for the two paths whose signature can't take an injected reader
 /// (`GracefulTarget::is_drained`, `Job::drop`'s drain wait), which are instead
 /// exercised against a real temporary directory.
+///
+/// [`frozen_now`] is tested here too, for the same reason and in the same shape: it
+/// is a decision made on a read (`cgroup.freeze`, on the kill fallback's
+/// refused-thaw path), and taking that read's result as its argument is what lets
+/// every branch — including the unreadable one no fault-injection site covers — be
+/// driven directly.
 #[cfg(test)]
 mod cgroup_read_seam_tests {
     use std::cell::Cell;
     use std::io;
     use std::path::{Path, PathBuf};
 
-    use super::{Cgroup, Delivery, deliver_identity_safe};
+    use super::{Cgroup, Delivery, deliver_identity_safe, frozen_now};
 
     fn cgroup() -> Cgroup {
         Cgroup::at(PathBuf::from("/mock/processkit"))
@@ -3142,6 +3288,62 @@ mod cgroup_read_seam_tests {
         cgroup()
             .kill_with(|_| Ok(String::new()))
             .expect("an already-empty cgroup is reported as drained by the fallback sweep");
+    }
+
+    /// The freezer question the kill fallback answers after a refused thaw: the
+    /// kernel's own reading of `cgroup.freeze` decides wherever it gives one, and
+    /// what this call happens to know about *its own* freeze write does not.
+    #[test]
+    fn frozen_now_takes_the_files_answer_over_the_callers_own_freeze_write() {
+        // A freeze this call never put in force still counts — one an earlier
+        // `suspend` left standing, or one a previous teardown already reported and
+        // could not clear. What decides whether the group can be spawned into is
+        // its state, not who set it.
+        assert!(
+            frozen_now(Ok("1\n".to_owned()), false),
+            "a group the kernel calls frozen is frozen whoever froze it"
+        );
+        // And the converse: a group the kernel calls unfrozen is not made frozen by
+        // this call having written the freeze — something cleared it in between.
+        assert!(
+            !frozen_now(Ok("0\n".to_owned()), true),
+            "a landed freeze that is no longer in force is nothing to report"
+        );
+    }
+
+    /// The one place an inference survives: the file gives no usable answer, so the
+    /// caller's own freeze write decides after all. This is the pre-existing
+    /// behaviour kept unchanged — an unreadable freezer is no reason to start
+    /// reporting less than before, nor more.
+    #[test]
+    fn frozen_now_falls_back_when_the_file_gives_no_usable_answer() {
+        // A *read* that fails, including with `NotFound` — the write's own
+        // `NotFound` is a separate, earlier decision in `thaw_after_kill_sweep`
+        // (a vanished cgroup holds nobody frozen) and never reaches here — and two
+        // readings of a two-valued file that are not values of it.
+        let no_answer = || {
+            [
+                Err(io::Error::from(io::ErrorKind::PermissionDenied)),
+                Err(io::Error::from(io::ErrorKind::NotFound)),
+                Ok("frozen\n".to_owned()),
+                Ok(String::new()),
+            ]
+        };
+
+        for (n, state) in no_answer().into_iter().enumerate() {
+            assert!(
+                frozen_now(state, true),
+                "case {n}: a freeze this call landed and could not clear stands until \
+                 the file says otherwise"
+            );
+        }
+        for (n, state) in no_answer().into_iter().enumerate() {
+            assert!(
+                !frozen_now(state, false),
+                "case {n}: with no freeze of this call's own and no answer from the \
+                 file, there is nothing to report"
+            );
+        }
     }
 
     #[test]
@@ -3695,10 +3897,14 @@ mod cgroup_read_seam_tests {
 /// `cgroup.freeze` refused on a kernel that *has* the file — otherwise need a
 /// delegated, restricted or ancient cgroup host, which is why none of them had a
 /// regression test before.
-// Gated on the union of the features its cases need, so the module (and its
-// helpers) vanishes rather than sitting unused in a build that has neither.
-#[cfg(all(test, any(feature = "limits", feature = "process-control")))]
+// Ungated: the kill fallback's freeze/thaw cases below exercise `Cgroup::kill`,
+// which every build has (kill-on-drop is unconditional), so nothing here sits
+// unused in a feature-less build. The individual cases that do need a feature
+// carry their own gate, as does the `read` helper only they use.
+#[cfg(test)]
 mod cgroup_write_seam_tests {
+    use std::io;
+
     use super::Cgroup;
     use crate::sys::fault_injection::{Faults, Site};
 
@@ -3945,6 +4151,187 @@ mod cgroup_write_seam_tests {
             faults.fired(SITE),
             1,
             "the freeze write was attempted first"
+        );
+    }
+
+    /// The pre-5.14 kill fallback freezes the subtree so a fork bomb cannot
+    /// out-spawn its SIGKILL sweep, then thaws it — and a refused **thaw** is the
+    /// one failure an empty `cgroup.procs` cannot speak for. The tree really is
+    /// dead, but the cgroup this call froze stays frozen, which is not the group
+    /// `kill_all` promises to leave behind: cgroup v2 freezes a task that joins a
+    /// frozen cgroup, and this backend joins one in a `pre_exec` hook, so the next
+    /// spawn's child would stop before `exec` instead of running. Answering `Ok(())`
+    /// off the drained member list alone hides exactly that.
+    #[test]
+    fn a_refused_thaw_after_the_sweep_is_not_reported_as_a_clean_kill() {
+        let (_dir, cgroup) = temp_cgroup();
+        // `cgroup.kill` refused selects the sweep (the only path that freezes at
+        // all — a kernel ≥ 5.14 returns from the atomic write and never gets here).
+        // Of the sweep's two `cgroup.freeze` writes the first — the freeze — lands
+        // for real, and the second — the thaw — is refused from there on, the way a
+        // delegation revoked mid-teardown refuses it.
+        let faults = Faults::new()
+            .fail_every(SITE, Some("cgroup.kill"), libc::EACCES)
+            .fail_from_nth(SITE, Some("cgroup.freeze"), 2, libc::EACCES)
+            .arm();
+
+        let err = cgroup
+            .kill()
+            .expect_err("a cgroup left frozen is not a kill the caller can build on");
+
+        // The state assertion the report exists for: the freeze write really
+        // reached the file (so this is not a test of a write that never happened),
+        // and nothing cleared it — the group is left frozen, for real, on disk.
+        assert_eq!(
+            std::fs::read_to_string(cgroup.path.join("cgroup.freeze"))
+                .expect("the freeze the sweep wrote"),
+            "1",
+            "the sweep's freeze landed and no thaw cleared it"
+        );
+        // 1 × `cgroup.kill` + 2 × `cgroup.freeze`: the thaw and its one retry. The
+        // retry is the bounded "try to actually restore the group" step; a third
+        // freeze write would mean it had grown into a wait loop on the caller's
+        // thread, and a first would mean the sweep never froze anything.
+        assert_eq!(faults.fired(SITE), 3, "the thaw was retried exactly once");
+
+        assert_eq!(
+            err.kind(),
+            io::ErrorKind::PermissionDenied,
+            "the refusal keeps its own kind, as a refused suspend does"
+        );
+        let text = err.to_string();
+        assert!(
+            text.contains("FROZEN") && text.contains(&format!("os error {}", libc::EACCES)),
+            "the caller must be told the group is frozen, and why: {text}"
+        );
+        // And what `ProcessGroup::kill_all` publishes for it — the mapping that
+        // public verb applies to its backend's `io::Error`.
+        assert_eq!(
+            crate::Error::io(err).kind(),
+            crate::ErrorKind::PermissionDenied,
+            "a refused thaw reaches the caller as a permission problem, not a silent success"
+        );
+    }
+
+    /// That report has to survive being asked twice. `ProcessGroup::kill_all` is
+    /// documented **idempotent**, and the error above tells the caller the tree is
+    /// dead but the group is frozen — so the most natural next move, calling it
+    /// again, must not answer `Ok(())` over the very group its predecessor refused
+    /// to call cleanly killed. Nothing the answer depends on changed in between:
+    /// the group is still frozen, and the host still refuses to clear it.
+    ///
+    /// It is precisely the second call that catches an answer inferred from *this
+    /// call's* freeze write instead of read from the freezer: on the repeat, the
+    /// revoked delegation refuses that write too, so no freeze of this call's own
+    /// went in — and the drained member list says nothing about a freeze that was
+    /// already there. Only the file itself can tell it the group is unusable.
+    #[test]
+    fn a_second_kill_over_a_group_left_frozen_reports_it_frozen_again() {
+        let (_dir, cgroup) = temp_cgroup();
+        // Call one, exactly as above: the freeze lands, the thaw is refused, the
+        // group is left frozen and reported.
+        let first = Faults::new()
+            .fail_every(SITE, Some("cgroup.kill"), libc::EACCES)
+            .fail_from_nth(SITE, Some("cgroup.freeze"), 2, libc::EACCES)
+            .arm();
+        cgroup
+            .kill()
+            .expect_err("the first call leaves the group frozen and says so");
+        drop(first);
+
+        // Call two, under what refused the thaw: a cgroup whose control writes are
+        // all refused now, including this call's own freeze.
+        let faults = Faults::new().fail_every(SITE, None, libc::EACCES).arm();
+
+        let err = cgroup
+            .kill()
+            .expect_err("a group that is still frozen is still not one the caller can spawn into");
+
+        assert_eq!(
+            std::fs::read_to_string(cgroup.path.join("cgroup.freeze"))
+                .expect("the freeze the first call left behind"),
+            "1",
+            "the group really is still frozen — nothing thawed it between the two calls"
+        );
+        // 1 × `cgroup.kill` + 3 × `cgroup.freeze`: this call's own (refused) freeze,
+        // then the thaw and its one retry. Four, not three: unlike the first call,
+        // no write here reaches the file at all.
+        assert_eq!(
+            faults.fired(SITE),
+            4,
+            "the repeat's own freeze was refused, and its thaw still retried exactly once"
+        );
+        assert_eq!(
+            err.kind(),
+            io::ErrorKind::PermissionDenied,
+            "the repeat reports the refusal in its own right, not as a copy of the first"
+        );
+        assert!(
+            err.to_string().contains("FROZEN"),
+            "the second answer must name the same state as the first: {err}"
+        );
+    }
+
+    /// The mirror case, and the reason the report above is conditional on the group
+    /// being frozen rather than on the thaw being refused. A write-restricted
+    /// delegated cgroup refuses *every* control write — which is what selected this
+    /// fallback in the first place — so no freeze went in and the thaw's refusal
+    /// changes nothing: the group is left exactly as this call found it, unfrozen.
+    /// The per-pid sweep needs no cgroup write at all, so it is a complete teardown
+    /// there, and reporting it as a failure would make `kill_all` permanently `Err`
+    /// on those hosts over a state that is not there.
+    ///
+    /// Both ways of asking agree here, which is what keeps this a clean kill on a
+    /// host that grants no cgroup access whatsoever: the state read finds no
+    /// `cgroup.freeze` to read, and the fallback it then defers to — no freeze of
+    /// this call's own landed — says the same.
+    #[test]
+    fn a_refused_thaw_that_never_froze_anything_still_reports_a_clean_kill() {
+        let (_dir, cgroup) = temp_cgroup();
+        let faults = Faults::new().fail_every(SITE, None, libc::EACCES).arm();
+
+        cgroup
+            .kill()
+            .expect("a sweep that drained the tree without ever freezing it is a kill");
+
+        // `cgroup.kill`, the freeze, the thaw — and no fourth write: with nothing
+        // frozen there is nothing for a retry to restore, so it is skipped along
+        // with its sleep rather than spending the caller's thread on it.
+        assert_eq!(faults.fired(SITE), 3, "the refused thaw was not retried");
+        assert!(
+            !cgroup.path.join("cgroup.freeze").exists(),
+            "no freeze was ever put in force"
+        );
+    }
+
+    /// The third way the thaw can fail, and the one that is never the caller's
+    /// problem: `ENOENT`. Here the freeze landed, so this is not the pre-5.2 kernel
+    /// whose freeze was a no-op — the cgroup directory itself went away under the
+    /// teardown. A removed cgroup holds nobody frozen, so the kill stands, exactly
+    /// as [`Cgroup::freeze`] treats an absent file as its own case rather than a
+    /// refusal.
+    ///
+    /// This is also what pins the order in which the two are asked. The freeze
+    /// really landed, so the file on this stand-in still reads `1` and this call's
+    /// own `froze` is `true` — both the state read and its fallback would call the
+    /// group frozen. `ENOENT` from the write outranks them because it says the file
+    /// they would speak for is gone.
+    #[test]
+    fn a_thaw_onto_a_cgroup_that_vanished_still_reports_a_clean_kill() {
+        let (_dir, cgroup) = temp_cgroup();
+        let faults = Faults::new()
+            .fail_every(SITE, Some("cgroup.kill"), libc::EACCES)
+            .fail_from_nth(SITE, Some("cgroup.freeze"), 2, libc::ENOENT)
+            .arm();
+
+        cgroup
+            .kill()
+            .expect("a cgroup that no longer exists is holding nothing frozen");
+
+        assert_eq!(
+            faults.fired(SITE),
+            2,
+            "`cgroup.kill` and the thaw; an absent file is not retried either"
         );
     }
 }
