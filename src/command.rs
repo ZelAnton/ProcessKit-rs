@@ -988,6 +988,12 @@ impl Command {
     /// drive the whole thing with
     /// [`Pipeline::output_string`](crate::Pipeline::output_string) /
     /// [`Pipeline::run`](crate::Pipeline::run).
+    ///
+    /// As a **non-final** stage this command's stdout belongs to the pipe: a
+    /// [`stdout`](Self::stdout) mode or [`stdout_file`](Self::stdout_file) redirect
+    /// configured here goes inert for that run rather than diverting the bytes the
+    /// next stage is owed. See [`Pipeline::pipe`](crate::Pipeline::pipe) for the full
+    /// policy.
     pub fn pipe(self, next: Command) -> crate::Pipeline {
         crate::Pipeline::new(self, next)
     }
@@ -2116,10 +2122,44 @@ impl Command {
     /// configuration is left untouched because it remains the supervisor's
     /// diagnostic stream.
     pub(crate) fn pipe_stdout_for_discard(mut self) -> Self {
+        self.force_internal_stdout_pipe();
+        self
+    }
+
+    /// Pipe stdout so a **non-final** [`Pipeline`](crate::Pipeline) stage can hand
+    /// it to the next stage's stdin.
+    ///
+    /// Only `Pipeline::launch` calls this, on its own per-run clone, and only for a
+    /// non-final stage whose configured stdout is not already a pipe. A chain's
+    /// contract is that each stage's stdout feeds the next stage's stdin; an
+    /// `Inherit`/`Null`/file-redirected stdout leaves no pipe to hand over, so the
+    /// internal pipe takes precedence over the stage's own stdout destination —
+    /// the same precedence [`set_pipe_stdin`](Self::set_pipe_stdin) already gives
+    /// it over a configured stdin on the receiving side of that relay.
+    ///
+    /// Shares its core with [`pipe_stdout_for_discard`](Self::pipe_stdout_for_discard):
+    /// the file redirect is dropped rather than opened, and the observers the
+    /// overridden configuration had already rendered inert stay inert.
+    pub(crate) fn pipe_stdout_for_downstream(&mut self) {
+        self.force_internal_stdout_pipe();
+    }
+
+    /// The shared core of the two internal stdout-pipe overrides: pipe stdout,
+    /// drop any file redirect, and keep the user-visible stdout observers
+    /// suppressed.
+    ///
+    /// Both callers override a stdout the caller had configured as `Inherit`,
+    /// `Null`, or a file redirect. Dropping the redirect (rather than leaving it
+    /// for [`build_tokio`](Self::build_tokio) to open) is what keeps the override
+    /// from creating or truncating a file this run then never writes to — the same
+    /// care the `pipeline_stderr_merged` branch of `build_tokio` takes. Suppressing
+    /// the observers keeps the internal pipe from making handlers, tees, and
+    /// capture policies fire where the overridden configuration documents them as
+    /// inert. Stderr is untouched by either.
+    fn force_internal_stdout_pipe(&mut self) {
         self.stdout_mode = StdioMode::Piped;
         self.stdout_file = None;
         self.suppress_stdout_observers = true;
-        self
     }
 
     /// The stderr stream's pump config — see [`stdout_config`](Self::stdout_config).
@@ -4324,6 +4364,99 @@ mod tests {
         assert!(
             stderr.buffer_policy.is_some(),
             "the whole-command capture policy still protects stderr"
+        );
+    }
+
+    /// T-287: every stdout configuration that leaves a non-final pipeline stage
+    /// with no pipe to hand downstream is overridden into one, and the override
+    /// leaves stderr — the stage's pipefail diagnostics — alone.
+    #[test]
+    fn downstream_pipe_override_pipes_every_non_piped_stdout_configuration() {
+        for configure in [
+            (|c: Command| c.stdout(crate::StdioMode::Null)) as fn(Command) -> Command,
+            |c: Command| c.stdout(crate::StdioMode::Inherit),
+            |c: Command| c.stdout_file("unused.log"),
+            |c: Command| c.stdout_file_append("unused.log"),
+        ] {
+            let mut command = configure(Command::new("tool").stderr_file("stderr.log"));
+            assert!(
+                !command.stdout_is_piped(),
+                "the case under test must start out without a stdout pipe"
+            );
+
+            command.pipe_stdout_for_downstream();
+
+            assert!(
+                command.stdout_is_piped(),
+                "a non-final stage must always have a pipe to hand the next stage"
+            );
+            assert!(
+                !command.stderr_is_piped(),
+                "the override is stdout-only: a configured stderr redirect survives it"
+            );
+        }
+    }
+
+    /// T-287, mirroring `activated_stderr_merge_does_not_open_overridden_redirect_files`:
+    /// the override drops the redirect rather than opening it, so the file the stage
+    /// will never write to is neither created nor truncated.
+    #[test]
+    fn downstream_pipe_override_does_not_open_the_overridden_redirect_file() {
+        let dir = tempfile::tempdir().expect("temp dir");
+        let existing = dir.path().join("stage.log");
+        let absent = dir.path().join("never-created.log");
+        std::fs::write(&existing, "sentinel").expect("seed the stage's log");
+
+        for path in [&existing, &absent] {
+            let mut command = Command::new("tool").stdout_file(path);
+            command.pipe_stdout_for_downstream();
+            command
+                .build_tokio()
+                .expect("the overridden launch builds without opening the redirect");
+        }
+
+        assert_eq!(
+            std::fs::read_to_string(&existing).expect("read the sentinel"),
+            "sentinel",
+            "an earlier run's log must not be truncated by a stage that no longer writes to it"
+        );
+        assert!(
+            !absent.exists(),
+            "the override must not create the file it dropped"
+        );
+    }
+
+    /// T-287: the two internal stdout-pipe overrides share one core, so the
+    /// observer-suppression guarantee proven for the discard pipe holds for the
+    /// pipeline's downstream pipe too.
+    #[test]
+    fn downstream_pipe_override_suppresses_stdout_observers_like_the_discard_pipe() {
+        let build = || {
+            Command::new("tool")
+                .stdout(crate::StdioMode::Null)
+                .on_stdout_line(|_| {})
+                .stdout_tee(tokio::io::sink())
+                .stdout_raw_tee(tokio::io::sink())
+                .on_stderr_line(|_| {})
+                .capture_policy(NamedPolicy("redact"))
+        };
+
+        let mut downstream = build();
+        downstream.pipe_stdout_for_downstream();
+        let discard = build().pipe_stdout_for_discard();
+
+        for (label, stdout) in [
+            ("downstream", downstream.stdout_config()),
+            ("discard", discard.stdout_config()),
+        ] {
+            assert!(stdout.handler.is_none(), "{label}: handler");
+            assert!(stdout.tee.is_none(), "{label}: tee");
+            assert!(stdout.raw_tee.is_none(), "{label}: raw tee");
+            assert!(stdout.buffer_policy.is_none(), "{label}: buffer policy");
+        }
+        assert!(
+            downstream.stderr_config().handler.is_some(),
+            "stderr diagnostics stay observable"
         );
     }
 

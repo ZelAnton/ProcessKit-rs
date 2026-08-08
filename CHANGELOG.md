@@ -18,7 +18,29 @@ to a dated version section.
 -
 
 ### Fixed
--
+
+- `Pipeline`: a non-final stage configured with `stdout(StdioMode::Null)`,
+  `stdout(StdioMode::Inherit)`, or a `stdout_file(..)` / `stdout_file_append(..)`
+  redirect no longer breaks the chain. Such a stage had no pipe to hand downstream,
+  so its output went to `/dev/null`, to the parent's terminal, or to the file while
+  the next stage started on an immediate EOF (or on whatever stdin it had been
+  configured with) — and the chain reported success over the missing data.
+
+  The launch boundary now gives every non-final stage the internal downstream pipe,
+  so the documented contract — each stage's stdout feeds the next stage's stdin —
+  holds unconditionally, and the stage's own stdout destination goes inert for that
+  run. A configured redirect file is neither created nor truncated, the stage's
+  stdout observers (`on_stdout_line`, `stdout_tee`, `stdout_raw_tee`) stay inert as
+  they already were on every other non-final stage, and stderr keeps its own
+  configuration for pipefail diagnostics. This is the precedence inner-stage *stdin*
+  has always had, applied to the other end of the same relay; the **final** stage's
+  stdout is the chain's output and is still honored exactly as configured. A
+  non-final `use_pty()` stage remains a pre-spawn `ErrorReason::Unsupported`, since a
+  merged terminal stream cannot feed a later stage at all.
+
+  Both consumption paths share that launch boundary, so the fix lands on the
+  buffering verbs (`output_string`/`output_bytes`/`run`/`checked`) and on the
+  streaming `Pipeline::start` session alike.
 
 ## [3.3.0] - 2026-08-07
 

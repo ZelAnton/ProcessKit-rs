@@ -138,6 +138,10 @@ The ends of the chain behave like a single `Command`:
   source is honored — feed the whole pipeline from a string, file, or stream.
 - **Inner** stages read from the pipe, full stop: any `stdin` source or
   `keep_stdin_open` configured on them is overridden.
+- **Inner** stages likewise *write* to the pipe, full stop — see below.
+- The **last** stage's stdout is the chain's own output and is honored exactly as
+  configured (`stdout(Null)`, `stdout_file(..)` and friends all behave as they do on
+  a standalone command).
 - Inner stages' **stderr** is captured per-stage for pipefail diagnostics;
   only the last stage's stdout reaches you. A stage explicitly marked with
   `merge_stderr_in_pipe()` is the exception described below.
@@ -157,6 +161,35 @@ async fn main() -> processkit::Result<()> {
     Ok(())
 }
 ```
+
+### A non-final stage's stdout belongs to the pipe
+
+Because the link between two stages is unconditional, the chain — not the stage —
+owns a non-final stage's stdout. If such a stage carries `stdout(StdioMode::Null)`,
+`stdout(StdioMode::Inherit)`, or a
+[file redirect](commands.md#redirecting-output-directly-to-a-file),
+**the pipe wins and that configuration goes inert for the run**:
+
+- the stage's bytes go to the next stage and nowhere else — not to `/dev/null`,
+  not to the parent's terminal, not to the file;
+- a configured redirect file is **neither created nor truncated**, so a log a
+  previous run left there is left intact;
+- the stage's stdout observers (`on_stdout_line`, `stdout_tee`, `stdout_raw_tee`)
+  do not fire — as they do not on *any* non-final stage, whose stdout goes to the
+  next stage rather than through a pump that could run them;
+- **stderr is untouched**: it keeps its own configuration and stays available for
+  pipefail diagnostics.
+
+This is the same precedence inner-stage *stdin* has had all along, applied to the
+other end of the same relay, and it is what keeps a `Command` that carries a
+redirect for standalone use reusable as a pipeline stage. The alternative — treating
+the combination as a configuration error — would reject such a stage before spawn;
+what neither does is quietly drop the producer's output and start the next stage on
+an empty stdin.
+
+The one non-final stdout configuration that *is* rejected rather than overridden is
+`use_pty()`: a PTY master carries a merged terminal stream that cannot feed a later
+stage at all, so the chain fails before spawn with `ErrorReason::Unsupported`.
 
 ## Merging a stage's stderr into the pipe
 

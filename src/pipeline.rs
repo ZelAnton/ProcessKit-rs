@@ -74,8 +74,15 @@ const LAST_STAGE_PROBE_MAX: Duration = Duration::from_millis(500);
 ///   are unchecked reports success.
 /// - **Stdin/stdout at the ends** — the *first* stage's configured
 ///   [`stdin`](Command::stdin) is honored; inner stages' stdin is the pipe
-///   (any configured source is overridden). Inner stages' stderr is captured
-///   per-stage for pipefail diagnostics unless that stage opts into
+///   (any configured source is overridden). Stdout is the mirror image: the
+///   *last* stage's is the chain's output and is honored exactly as
+///   configured, while an inner stage's belongs to the pipe — a
+///   [`stdout`](Command::stdout) mode or [`stdout_file`](Command::stdout_file)
+///   redirect set on a non-final stage goes inert for that run (the file is
+///   neither created nor truncated, and no stdout observer fires — as none
+///   does on any non-final stage); see [`pipe`](Self::pipe) for the full
+///   policy. Inner stages' stderr is captured per-stage for pipefail
+///   diagnostics unless that stage opts into
 ///   [`merge_stderr_in_pipe`](Command::merge_stderr_in_pipe), which sends it
 ///   through the downstream pipe and gives up the separate capture.
 /// - **PTY only at the end** — `Command::use_pty` is supported on the final
@@ -264,6 +271,23 @@ impl Pipeline {
 
     /// Append another stage: the current last stage's stdout becomes `next`'s
     /// stdin.
+    ///
+    /// That link is unconditional, and it is the chain — not the stage — that owns a
+    /// **non-final** stage's stdout. A stage configured with
+    /// [`stdout(StdioMode::Null)`](Command::stdout),
+    /// [`stdout(StdioMode::Inherit)`](Command::stdout), or a
+    /// [`stdout_file`](Command::stdout_file) redirect still feeds the next stage once
+    /// it stops being the last one: the pipe wins, that configuration goes inert for
+    /// the run (a redirect file is neither created nor truncated), and the stage's
+    /// stdout observers — `on_stdout_line`, `stdout_tee`, `stdout_raw_tee` — do not
+    /// fire, as they do not on any non-final stage. Stderr keeps its own
+    /// configuration, and the **final** stage's stdout, being the chain's output, is
+    /// honoured exactly as configured.
+    ///
+    /// The one non-final stdout configuration that is rejected instead of overridden
+    /// is `use_pty` (the `pty` feature): a PTY master's merged terminal stream cannot
+    /// feed a later stage at all, so the chain fails before spawn with
+    /// [`ErrorReason::Unsupported`](crate::ErrorReason::Unsupported).
     pub fn pipe(mut self, next: Command) -> Self {
         self.stages.push(next);
         self
@@ -339,6 +363,42 @@ impl Pipeline {
     /// pipeline [`cancel_on`](Self::cancel_on) token gap-fills onto every stage that
     /// carries no token of its own.
     ///
+    /// # A non-final stage's stdout belongs to the pipe
+    ///
+    /// The relay this builds is what makes each stage's stdout the next stage's
+    /// stdin, so on a **non-final** stage the internal downstream pipe **wins over
+    /// that stage's own stdout destination**. A non-final
+    /// [`stdout(StdioMode::Null)`](Command::stdout),
+    /// [`stdout(StdioMode::Inherit)`](Command::stdout), or
+    /// [`stdout_file`](Command::stdout_file)/[`stdout_file_append`](Command::stdout_file_append)
+    /// is therefore **inert for that run**: the stage's bytes go downstream and
+    /// nowhere else — not to `/dev/null`, not to the parent's terminal, not to the
+    /// file. A configured stdout file is **not created and not truncated**, since the
+    /// override drops the redirect instead of opening it (the same care the
+    /// [`merge_stderr_in_pipe`](Command::merge_stderr_in_pipe) override takes with the
+    /// file it displaces). The stage's stdout observers — `on_stdout_line`,
+    /// `stdout_tee`, `stdout_raw_tee` — do not fire either, matching both the
+    /// configuration being overridden (which documents them as inert) and every other
+    /// non-final stage, whose stdout goes to the next stage rather than through a pump
+    /// that could run them. **Stderr is untouched** by all of this: a non-final stage's
+    /// stderr keeps its own configuration and stays available for pipefail
+    /// attribution, unless the stage opted into `merge_stderr_in_pipe`.
+    ///
+    /// The alternative — rejecting such a stage before spawn — was not taken: the
+    /// chain's documented contract is unconditional, the mirror-image
+    /// [`set_pipe_stdin`](Command::set_pipe_stdin) already overrides a *downstream*
+    /// stage's configured stdin the same way, and honouring the pipe keeps a `Command`
+    /// that carries a redirect for its standalone use reusable as a stage. What it is
+    /// **not** is silent data loss: before this, such a stage's output vanished (or
+    /// landed in a file) while the next stage started on an immediate EOF and the
+    /// chain reported success. The **final** stage is unaffected — its stdout is the
+    /// chain's output and is honoured exactly as configured.
+    ///
+    /// [`use_pty`](Command::use_pty) on a non-final stage stays a pre-spawn
+    /// [`ErrorReason::Unsupported`](crate::ErrorReason::Unsupported) rather than an
+    /// override: a PTY master carries a merged terminal stream that cannot be handed
+    /// to a later stage at all, so there is no pipe to prefer.
+    ///
     /// On a mid-chain spawn failure the `?` early-return drops the partially-built
     /// vectors, so kill-on-drop reaps every already-started stage — a partial chain
     /// never leaks (the "partially poured" teardown invariant).
@@ -360,8 +420,21 @@ impl Pipeline {
         let mut upstream = None;
         for (index, stage) in self.stages.iter().enumerate() {
             let mut command = stage.clone();
-            if index + 1 < self.stages.len() && stage.wants_stderr_merged_in_pipe() {
+            let non_final = index + 1 < self.stages.len();
+            if non_final && stage.wants_stderr_merged_in_pipe() {
                 command.activate_stderr_merge_in_pipe();
+            }
+            // A non-final stage owes its stdout to the next stage's stdin, so the
+            // internal pipe wins over a configured `stdout(Null)`/`stdout(Inherit)`/
+            // `stdout_file(..)` — see this method's rustdoc for the policy and what
+            // it means for the overridden destination. Without this the stage would
+            // have no pipe to hand over, `take_stdout_pipe` below would come back
+            // empty, and the next stage would start on a silent EOF (or, worse, on
+            // whatever stdin it was configured with) while the producer's bytes went
+            // to the terminal, to `/dev/null`, or to a file. Stages whose stdout is
+            // already a pipe (the default) are left exactly as configured.
+            if non_final && !stage.stdout_is_piped() {
+                command.pipe_stdout_for_downstream();
             }
             // Gap-fill: apply the pipeline cancel token only where a stage has no token of its own.
             if let Some(token) = &self.cancel_token
@@ -381,7 +454,7 @@ impl Pipeline {
             if let Some(handle) = process.own_group_handle() {
                 stage_groups.push(handle);
             }
-            if index + 1 < self.stages.len() {
+            if non_final {
                 upstream = process.take_stdout_pipe();
             }
             // Bundle the unchecked flag with the handle; the last stage is split off by the caller.
@@ -438,6 +511,11 @@ impl Pipeline {
     /// - whole-chain teardown — [`start_kill`](PipelineSession::start_kill) and
     ///   kill-on-drop — plus the chain-wide [`timeout`](Self::timeout) /
     ///   [`cancel_on`](Self::cancel_on) still bounding the live session.
+    ///
+    /// The chain comes up through the same launch core as the buffering verbs, so the
+    /// stage-to-stage relay behaves identically here: a non-final stage's own stdout
+    /// destination is overridden by the pipe it owes the next stage (see
+    /// [`Pipeline::pipe`](Self::pipe)).
     ///
     /// # Errors
     ///
@@ -619,6 +697,12 @@ impl Pipeline {
     /// outcome. `capture_last` decides how the last stage's stdout is captured; it
     /// is handed the [`LastExitObserver`] it must arm on that capture, so the last
     /// stage's disposition is latched at its exit like every other stage's.
+    ///
+    /// Only the **last** stage's stdout is captured here. Every earlier stage's goes
+    /// to the next stage through [`launch`](Self::launch)'s relay — including a stage
+    /// that configured `stdout(Null)`/`stdout(Inherit)`/`stdout_file(..)`, whose
+    /// destination the relay overrides — so this path and the streaming
+    /// [`start`](Self::start) see the same bytes arrive at the same place.
     async fn capture<T, C, F>(&self, capture_last: C) -> Result<ProcessResult<T>>
     where
         T: PipelineCapture,

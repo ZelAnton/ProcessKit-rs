@@ -2084,3 +2084,230 @@ fn hold_the_merge_pipe(marker: &std::ffi::OsStr) {
     std::fs::write(marker, b"held").expect("record that the grandchild holds the merge pipe");
     std::thread::sleep(HOLD);
 }
+
+// ---------------------------------------------------------------------------
+// T-287: a non-final stage's stdout belongs to the pipe.
+//
+// A non-final stage configured `stdout(Null)`/`stdout(Inherit)`/`stdout_file(..)`
+// used to leave `take_stdout_pipe` empty, so the next stage started on a silent
+// EOF while the producer's bytes went elsewhere — and the chain reported success.
+// The launch boundary now gives every non-final stage the internal downstream
+// pipe. `Pipeline::launch` is shared by the buffering verbs and the streaming
+// session (K-051), but that is exactly the shape a past fix here got wrong on one
+// of the two paths (K-116), so every configuration below is asserted through
+// *both*: `relayed_through_capture` and `relayed_through_session`.
+// ---------------------------------------------------------------------------
+
+/// The payload the non-final stage under test produces. Already in sorted order,
+/// so `sort_stage` is a faithful passthrough of it on both platforms.
+const RELAY_PAYLOAD: [&str; 3] = ["alpha", "bravo", "charlie"];
+
+/// A producer that writes [`RELAY_PAYLOAD`] to stdout, one line each.
+fn relay_producer() -> Command {
+    if cfg!(windows) {
+        Command::new("cmd").args(["/d", "/c", "echo alpha& echo bravo& echo charlie"])
+    } else {
+        Command::new("sh").args(["-c", "printf 'alpha\\nbravo\\ncharlie\\n'"])
+    }
+}
+
+/// The payload lines carried by a final stage's stdout, normalized for the
+/// platform's line ending and for the blank line a Windows shell stage may add.
+/// These assertions are about *content and order*; that the relay is faithful at
+/// the byte level is asserted separately by
+/// [`non_final_null_stdout_relays_bytes_verbatim`].
+fn relayed_lines<'a>(lines: impl Iterator<Item = &'a str>) -> Vec<String> {
+    lines
+        .map(|line| line.trim_end().to_owned())
+        .filter(|line| !line.is_empty())
+        .collect()
+}
+
+/// Run `producer | sort` through the **buffering** capture path and return what
+/// the final stage received. `producer` is the non-final stage under test.
+async fn relayed_through_capture(producer: Command) -> Vec<String> {
+    let result = producer
+        .pipe(sort_stage())
+        .output_string()
+        .await
+        .expect("run the chain");
+    assert!(result.is_success(), "pipeline result: {result:?}");
+    relayed_lines(result.stdout().lines())
+}
+
+/// Run the same chain through the **streaming** session path and return what the
+/// caller streamed off the final stage. The second half of the K-116 pair: this
+/// path reaches the same `launch`, and must show the same relay.
+async fn relayed_through_session(producer: Command) -> Vec<String> {
+    use processkit::{Finished, Outcome};
+    use tokio_stream::StreamExt;
+
+    let mut session = producer
+        .pipe(sort_stage())
+        .start()
+        .await
+        .expect("start the live chain");
+    let mut lines = session
+        .stdout_lines()
+        .expect("stream the last stage's stdout");
+    let mut collected = Vec::new();
+    while let Some(line) = completes_within(
+        Duration::from_secs(15),
+        "streaming a line from the live chain",
+        lines.next(),
+    )
+    .await
+    {
+        collected.push(line);
+    }
+    drop(lines);
+
+    let Finished { outcome, .. } = session.finish().await.expect("finish the chain");
+    assert_eq!(
+        outcome,
+        Outcome::Exited(0),
+        "a clean chain folds to Exited(0)"
+    );
+    relayed_lines(collected.iter().map(String::as_str))
+}
+
+#[tokio::test]
+#[ignore = "spawns a real two-stage pipeline whose producer suppresses its own stdout"]
+async fn non_final_null_stdout_still_feeds_the_next_stage() {
+    let relayed =
+        relayed_through_capture(relay_producer().stdout(processkit::StdioMode::Null)).await;
+    assert_eq!(
+        relayed, RELAY_PAYLOAD,
+        "a non-final stage's `stdout(Null)` must not swallow the bytes the next stage is owed"
+    );
+}
+
+#[tokio::test]
+#[ignore = "spawns a real two-stage streaming chain whose producer suppresses its own stdout"]
+async fn non_final_null_stdout_still_feeds_the_streaming_session() {
+    let relayed =
+        relayed_through_session(relay_producer().stdout(processkit::StdioMode::Null)).await;
+    assert_eq!(
+        relayed, RELAY_PAYLOAD,
+        "the streaming path shares `launch`, so it must relay exactly as the buffering path does"
+    );
+}
+
+#[tokio::test]
+#[ignore = "spawns a real two-stage pipeline whose producer inherits the parent's stdout"]
+async fn non_final_inherit_stdout_still_feeds_the_next_stage() {
+    let relayed =
+        relayed_through_capture(relay_producer().stdout(processkit::StdioMode::Inherit)).await;
+    assert_eq!(
+        relayed, RELAY_PAYLOAD,
+        "a non-final stage's `stdout(Inherit)` must not divert the bytes to the parent's terminal"
+    );
+}
+
+#[tokio::test]
+#[ignore = "spawns a real two-stage streaming chain whose producer inherits the parent's stdout"]
+async fn non_final_inherit_stdout_still_feeds_the_streaming_session() {
+    let relayed =
+        relayed_through_session(relay_producer().stdout(processkit::StdioMode::Inherit)).await;
+    assert_eq!(
+        relayed, RELAY_PAYLOAD,
+        "the streaming path shares `launch`, so it must relay exactly as the buffering path does"
+    );
+}
+
+#[tokio::test]
+#[ignore = "spawns real two-stage pipelines whose producer carries a stdout file redirect"]
+async fn non_final_stdout_file_feeds_the_next_stage_and_leaves_the_file_alone() {
+    let dir = tempfile::tempdir().expect("temp dir");
+    let seeded = dir.path().join("stage.log");
+    let absent = dir.path().join("never-created.log");
+    std::fs::write(&seeded, "previous run\n").expect("seed the stage's log");
+
+    let relayed = relayed_through_capture(relay_producer().stdout_file(&seeded)).await;
+    assert_eq!(
+        relayed, RELAY_PAYLOAD,
+        "a non-final stage's `stdout_file` must not divert the bytes to the file"
+    );
+    assert_eq!(
+        std::fs::read_to_string(&seeded).expect("read the seeded log"),
+        "previous run\n",
+        "the displaced redirect must be left unopened, so an earlier run's log survives"
+    );
+
+    let relayed = relayed_through_capture(relay_producer().stdout_file(&absent)).await;
+    assert_eq!(
+        relayed, RELAY_PAYLOAD,
+        "same for a redirect to a fresh path"
+    );
+    assert!(
+        !absent.exists(),
+        "the displaced redirect must not be created either"
+    );
+}
+
+#[tokio::test]
+#[ignore = "spawns a real two-stage streaming chain whose producer carries a stdout file redirect"]
+async fn non_final_stdout_file_feeds_the_streaming_session_and_leaves_the_file_alone() {
+    let dir = tempfile::tempdir().expect("temp dir");
+    let seeded = dir.path().join("stage.log");
+    std::fs::write(&seeded, "previous run\n").expect("seed the stage's log");
+
+    let relayed = relayed_through_session(relay_producer().stdout_file(&seeded)).await;
+    assert_eq!(
+        relayed, RELAY_PAYLOAD,
+        "the streaming path shares `launch`, so it must relay exactly as the buffering path does"
+    );
+    assert_eq!(
+        std::fs::read_to_string(&seeded).expect("read the seeded log"),
+        "previous run\n",
+        "the displaced redirect must be left unopened on this path too"
+    );
+}
+
+// `cat` is byte-faithful, so the chain's captured bytes are exactly what the
+// producer wrote. Windows has no equally faithful stage in `PATH` (`more` is a
+// pager and rewrites line endings), which is why the cross-platform tests above
+// assert on lines and this one is Unix-only.
+#[cfg(unix)]
+#[tokio::test]
+#[ignore = "spawns a real two-stage pipeline and compares the relayed bytes exactly"]
+async fn non_final_null_stdout_relays_bytes_verbatim() {
+    // A bare CR mid-stream and a final line with no terminator: both survive a
+    // faithful relay and both would be lost or invented by a line-oriented one.
+    let payload = b"alpha\rbravo\ncharlie-without-a-newline".to_vec();
+    let result = Command::new("sh")
+        .args(["-c", "printf 'alpha\\rbravo\\ncharlie-without-a-newline'"])
+        .stdout(processkit::StdioMode::Null)
+        .pipe(Command::new("cat"))
+        .output_bytes()
+        .await
+        .expect("run the chain");
+
+    assert!(result.is_success(), "pipeline result: {result:?}");
+    assert_eq!(
+        result.stdout(),
+        &payload,
+        "the next stage must receive the producer's bytes verbatim"
+    );
+}
+
+#[tokio::test]
+#[ignore = "spawns a real two-stage pipeline whose final stage suppresses its stdout"]
+async fn final_stage_stdout_configuration_is_left_alone() {
+    // The override is scoped to non-final stages: the last stage's stdout is the
+    // chain's own output, so a capture verb must still refuse a non-piped one
+    // loudly instead of being handed a silently-forced pipe.
+    let err = relay_producer()
+        .pipe(sort_stage().stdout(processkit::StdioMode::Null))
+        .output_string()
+        .await
+        .expect_err("capturing a chain whose last stage discards its stdout must be a loud error");
+    assert!(
+        matches!(err.reason(), processkit::ErrorReason::Io(_)),
+        "expected ErrorReason::Io, got {err:?}"
+    );
+    assert!(
+        err.to_string().contains("stdout is not piped"),
+        "the error must still name the non-piped stdout: {err}"
+    );
+}

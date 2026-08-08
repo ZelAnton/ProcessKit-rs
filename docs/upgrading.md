@@ -13,6 +13,110 @@ the full record; this page is the "I depend on it, what do I do" view.
 > below. (The `mock` feature's `mockall`-generated `expect_*` surface stays
 > semver-exempt — it tracks the `mockall` version.)
 
+## Unreleased (from 3.3.x)
+
+> Not released yet: this section covers the behavior change recorded under
+> `[Unreleased]` in the [CHANGELOG](../CHANGELOG.md) and takes that release's
+> version number when it is cut.
+
+### A non-final `Pipeline` stage's own stdout destination is now overridden by the pipe (not compiler-caught)
+
+This change is **not compiler-caught**: every builder keeps its signature and
+existing code compiles unchanged. What moved is where a *non-final* stage's bytes
+go.
+
+**Who it affects:** anyone that configured `stdout(StdioMode::Null)`,
+`stdout(StdioMode::Inherit)`, `stdout_file(..)`, or `stdout_file_append(..)` on
+any stage of a chain **other than the last** — through the buffering verbs
+(`output_string` / `output_bytes` / `run` / `checked`) or the streaming
+`Pipeline::start` session alike. A standalone `Command` is untouched, and so is
+the **last** stage of a chain: its stdout is the chain's own output and is still
+honored exactly as configured.
+
+**What changes.** Such a stage's stdout now goes to the next stage and nowhere
+else:
+
+- the next stage receives the producer's bytes — before, it started on an
+  immediate EOF (or on whatever stdin it had been configured with);
+- a configured redirect file is **neither created nor truncated**: a log left by
+  a previous run stays intact, and a file that did not exist is not created;
+- `stdout(StdioMode::Inherit)` no longer prints that stage's output to the
+  parent's terminal, and `stdout(StdioMode::Null)` no longer discards it;
+- that stage's stdout observers (`on_stdout_line`, `stdout_tee`,
+  `stdout_raw_tee`) do not fire — as they already did not on any other non-final
+  stage;
+- **stderr is untouched**: it keeps its own configuration and stays available for
+  pipefail diagnostics.
+
+**The old behavior was not something to depend on.** It was silent data loss, not
+a supported redirect: the producer's output left the chain, the next stage read an
+immediate EOF, and the chain reported **success** over the missing data.
+
+```rust,no_run
+# use processkit::Command;
+# async fn count() -> processkit::Result<()> {
+// Before: `commits.log` was written, `wc` counted an empty stream, and the chain
+// still reported success. Now: `wc` receives the log, and `commits.log` is
+// neither created nor truncated.
+let lines = Command::new("git")
+    .args(["log", "--oneline"])
+    .stdout_file("commits.log")
+    .pipe(Command::new("wc").arg("-l"))
+    .run()
+    .await?;
+# let _ = lines;
+# Ok(())
+# }
+```
+
+Pick the behavior you actually wanted:
+
+**You wanted the chain.** Drop the redirect from the non-final stage — there is
+nothing else to change, the chain now does what it always claimed to do.
+
+**You wanted the file *and* the chain.** Make the copy an explicit stage, so the
+split is visible in the chain itself:
+
+```rust,no_run
+# use processkit::Command;
+# async fn count() -> processkit::Result<()> {
+let lines = Command::new("git")
+    .args(["log", "--oneline"])
+    .pipe(Command::new("tee").arg("commits.log"))
+    .pipe(Command::new("wc").arg("-l"))
+    .run()
+    .await?;
+# let _ = lines;
+# Ok(())
+# }
+```
+
+**You wanted the file, not the chain.** Run that stage as its own `Command`,
+where every stdout setting is honored, and start a separate run from the file it
+wrote:
+
+```rust,no_run
+# use processkit::Command;
+# async fn count() -> processkit::Result<()> {
+Command::new("git")
+    .args(["log", "--oneline"])
+    .stdout_file("commits.log")
+    .run_unit()
+    .await?;
+let lines = Command::new("wc").args(["-l", "commits.log"]).run().await?;
+# let _ = lines;
+# Ok(())
+# }
+```
+
+**The redirect was meant for the chain's output.** Move it to the **last** stage,
+where it is honored exactly as configured.
+
+The one non-final stdout configuration still *rejected* rather than overridden is
+`use_pty()` (the `pty` feature): a PTY master carries a merged terminal stream
+that cannot feed a later stage at all, so the chain fails before spawn with
+`ErrorReason::Unsupported` — unchanged.
+
 ## 3.2.0 (from 3.1.x)
 
 ### `ProcessGroup::suspend` / `resume` report POSIX delivery failures (not compiler-caught)
