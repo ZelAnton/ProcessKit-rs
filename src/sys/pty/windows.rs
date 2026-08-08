@@ -25,7 +25,7 @@ use tokio::io::{AsyncRead, AsyncWrite, ReadBuf};
 use tokio::process::Command;
 use tokio::sync::Notify;
 
-use windows_sys::Win32::Foundation::{CloseHandle, HANDLE, WAIT_OBJECT_0};
+use windows_sys::Win32::Foundation::{CloseHandle, HANDLE, WAIT_OBJECT_0, WAIT_TIMEOUT};
 use windows_sys::Win32::Security::SECURITY_ATTRIBUTES;
 use windows_sys::Win32::System::Console::{
     COORD, ClosePseudoConsole, CreatePseudoConsole, GetConsoleWindow, GetStdHandle, HPCON,
@@ -70,6 +70,17 @@ fn classify_terminate_failure(
         Ok(())
     } else {
         Err(terminate_error)
+    }
+}
+
+/// Turn every non-signalled, non-timeout Win32 wait result into the error
+/// captured on the thread that performed the wait. Callers handle a permitted
+/// `WAIT_TIMEOUT` before reaching this helper.
+fn classify_wait_failure(waited: u32) -> io::Result<()> {
+    if waited == WAIT_OBJECT_0 {
+        Ok(())
+    } else {
+        Err(io::Error::last_os_error())
     }
 }
 
@@ -209,28 +220,35 @@ impl PtyChild {
     /// pump-teardown grace.
     pub(crate) async fn wait(&mut self) -> io::Result<PtyExitStatus> {
         let process = Arc::clone(&self.process);
-        let code = tokio::task::spawn_blocking(move || {
+        let code = match tokio::task::spawn_blocking(move || {
             // SAFETY: `process.0` is a valid process handle held alive by the
             // cloned `Arc` for the whole wait; `INFINITE` blocks until exit.
-            unsafe { WaitForSingleObject(process.0, INFINITE) };
+            let waited = unsafe { WaitForSingleObject(process.0, INFINITE) };
+            classify_wait_failure(waited)?;
             let mut code: u32 = 0;
             // SAFETY: `process.0` is still valid; `code` is an owned out-param.
             let ok = unsafe { GetExitCodeProcess(process.0, &mut code) };
-            (ok != 0).then_some(code)
+            if ok == 0 {
+                return Err(io::Error::last_os_error());
+            }
+            Ok(code)
         })
         .await
-        .map_err(io::Error::other)?;
+        {
+            Ok(result) => result,
+            Err(error) => Err(io::Error::other(error)),
+        };
         // The input pipe is a ConPTY session-lifetime resource. Only release our
-        // keepalive once the client process is already gone; releasing it while
-        // conhost is starting can turn the broken pipe into CTRL_CLOSE_EVENT.
+        // keepalive after the wait attempt; on a wait failure the session can no
+        // longer be managed safely, so it must take the same teardown path.
         self.input_keepalive.take();
-        // The child has exited, but conhost can still have its final rendered
-        // frame in flight. Let the bridge drain to quiescence before requesting
-        // EOF; the reader stays live throughout, as ConPTY requires for teardown.
+        // Conhost can still have a rendered frame in flight after either exit or
+        // a wait failure. Let the bridge drain before requesting EOF; the reader
+        // stays live throughout, as ConPTY requires for teardown.
         self.output_activity.wait_for_quiescence().await;
         // Now close the pseudoconsole so `output_read` drains to EOF (see above).
         self.close_pty();
-        Ok(PtyExitStatus::from_code(code.map(|c| c as i32)))
+        code.map(|code| PtyExitStatus::from_code(Some(code as i32)))
     }
 
     /// Close the pseudoconsole exactly once (idempotent). Flushes conhost's
@@ -272,8 +290,14 @@ impl PtyChild {
     pub(crate) fn try_wait(&mut self) -> io::Result<Option<PtyExitStatus>> {
         // SAFETY: a valid process handle; a 0 timeout polls without blocking.
         let waited = unsafe { WaitForSingleObject(self.process.0, 0) };
-        if waited != WAIT_OBJECT_0 {
-            return Ok(None);
+        match waited {
+            WAIT_OBJECT_0 => {}
+            WAIT_TIMEOUT => return Ok(None),
+            failure => {
+                let error = classify_wait_failure(failure)
+                    .expect_err("a non-signalled wait result must be an error");
+                return Err(error);
+            }
         }
         let mut code: u32 = 0;
         // SAFETY: valid handle; owned out-param.
@@ -976,6 +1000,50 @@ impl Drop for ChannelWriter {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use windows_sys::Win32::Foundation::{ERROR_INVALID_HANDLE, WAIT_FAILED};
+
+    fn test_job() -> crate::sys::Job {
+        #[cfg(feature = "limits")]
+        {
+            crate::sys::Job::new(&crate::ResourceLimits::default()).expect("create test job")
+        }
+        #[cfg(not(feature = "limits"))]
+        {
+            crate::sys::Job::new().expect("create test job")
+        }
+    }
+
+    fn live_pty_spawn() -> (super::super::PtySpawn, crate::sys::Job) {
+        let job = test_job();
+        let mut command = Command::new("cmd");
+        command.args(["/d", "/c", "ping -n 30 127.0.0.1 >nul"]);
+        let options = SpawnOptions {
+            use_pty: true,
+            ..SpawnOptions::default()
+        };
+        let spawn = job
+            .spawn_pty(&mut command, &options, None)
+            .expect("spawn real ConPTY child");
+        (spawn, job)
+    }
+
+    /// Close the production-owned process handle and replace its stored value
+    /// with null so the next Win32 wait deterministically returns `WAIT_FAILED`
+    /// without risking handle-value reuse or a double close during teardown.
+    fn invalidate_process_handle(child: &mut PtyChild) {
+        let process = Arc::get_mut(&mut child.process)
+            .expect("the child is the only process-handle owner before wait");
+        assert!(!process.0.is_null());
+        // SAFETY: the test has exclusive access to the sole owned handle. It
+        // immediately clears the stored value so `OwnedProcess::drop` cannot
+        // close it a second time.
+        assert_ne!(unsafe { CloseHandle(process.0) }, 0);
+        process.0 = std::ptr::null_mut();
+
+        // SAFETY: a null handle is intentionally supplied to exercise the real
+        // Win32 invalid-handle failure, not a mocked return value.
+        assert_eq!(unsafe { WaitForSingleObject(process.0, 0) }, WAIT_FAILED);
+    }
 
     #[test]
     fn conpty_startup_info_severs_std_handles_only_when_requested() {
@@ -1036,6 +1104,64 @@ mod tests {
         let live = classify_terminate_failure(io::Error::from_raw_os_error(5), false)
             .expect_err("a live process preserves the termination failure");
         assert_eq!(live.raw_os_error(), Some(5));
+    }
+
+    #[tokio::test]
+    #[ignore = "spawns a real Windows ConPTY child and invalidates its process handle"]
+    async fn try_wait_distinguishes_timeout_from_wait_failed_without_closing_pty() {
+        let (mut spawn, job) = live_pty_spawn();
+        assert!(
+            spawn
+                .child
+                .try_wait()
+                .expect("poll live ConPTY child")
+                .is_none(),
+            "WAIT_TIMEOUT must remain a normal still-running result"
+        );
+
+        invalidate_process_handle(&mut spawn.child);
+        let error = spawn
+            .child
+            .try_wait()
+            .expect_err("an invalid process handle must surface WAIT_FAILED");
+        assert_eq!(error.raw_os_error(), Some(ERROR_INVALID_HANDLE as i32));
+        assert!(
+            !spawn.child.hpc_closed,
+            "a failed poll must leave PTY teardown to wait or Drop"
+        );
+        assert!(
+            spawn.child.input_keepalive.is_some(),
+            "a failed poll must preserve the live PTY session"
+        );
+        spawn
+            .child
+            .resize(100, 30)
+            .expect("the PTY handle must remain valid after a failed poll");
+
+        drop(spawn);
+        drop(job);
+    }
+
+    #[tokio::test]
+    #[ignore = "spawns a real Windows ConPTY child and invalidates its process handle"]
+    async fn wait_surfaces_wait_failed_after_full_pty_cleanup() {
+        let (mut spawn, job) = live_pty_spawn();
+        invalidate_process_handle(&mut spawn.child);
+
+        let error = spawn
+            .child
+            .wait()
+            .await
+            .expect_err("an invalid process handle must surface WAIT_FAILED");
+        assert_eq!(error.raw_os_error(), Some(ERROR_INVALID_HANDLE as i32));
+        assert!(spawn.child.hpc_closed, "the PTY must close on wait failure");
+        assert!(
+            spawn.child.input_keepalive.is_none(),
+            "the input keepalive must be released on wait failure"
+        );
+
+        drop(spawn);
+        drop(job);
     }
 
     #[tokio::test]
