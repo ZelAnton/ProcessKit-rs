@@ -1043,10 +1043,12 @@ impl ProcessGroup {
     ///
     /// When `escalate_to_kill` is set, the final hard kill can surface the same
     /// errors as [`kill_all`](Self::kill_all): the undrained-tree `Err` on the
-    /// legacy pre-5.14 per-pid fallback, and — on the process-group mechanism — a
-    /// live, non-zombie member that rejects `SIGKILL` with `EPERM` (a uid-changed
-    /// child). A harmless zombie-only group is not reported (see
-    /// [`kill_all`](Self::kill_all)).
+    /// legacy pre-5.14 per-pid fallback; on that same fallback, a tree that *did*
+    /// drain over a cgroup whose sweep-guarding freeze could not be cleared, which
+    /// leaves the group frozen and unusable for further spawns; and — on the
+    /// process-group mechanism — a live, non-zombie member that rejects `SIGKILL`
+    /// with `EPERM` (a uid-changed child). A harmless zombie-only group is not
+    /// reported (see [`kill_all`](Self::kill_all)).
     ///
     /// Holding the group behind a shared handle (an `Arc`, a long-lived
     /// supervisor) that can't be moved out by value? Use the borrowing twin
@@ -1057,8 +1059,9 @@ impl ProcessGroup {
     /// [`crate::ErrorReason::Io`] if the graceful teardown fails — including, when
     /// `escalate_to_kill` performs the final hard kill, the same failures as
     /// [`kill_all`](Self::kill_all): the undrained-tree failure on the legacy
-    /// pre-5.14 per-pid fallback, and a process-group member that rejects `SIGKILL`
-    /// with `EPERM` while still alive.
+    /// pre-5.14 per-pid fallback, that same fallback's refused thaw over a cgroup
+    /// left frozen, and a process-group member that rejects `SIGKILL` with `EPERM`
+    /// while still alive.
     pub async fn shutdown(self) -> Result<()> {
         self.shutdown_ref().await
     }
@@ -1072,9 +1075,9 @@ impl ProcessGroup {
     /// tree, wait up to the configured
     /// [`shutdown_timeout`](ProcessGroupOptions::shutdown_timeout), then `SIGKILL`
     /// survivors when [`escalate_to_kill`](ProcessGroupOptions::escalate_to_kill)
-    /// is set; on Windows the kill is atomic and the timeout is ignored. The group
-    /// stays usable afterwards (a re-`shutdown_ref` on an already-drained tree is a
-    /// near no-op). Spawning or adopting a new child **re-arms** `Drop`'s kill
+    /// is set; on Windows the kill is atomic and the timeout is ignored. On success
+    /// the group stays usable afterwards (a re-`shutdown_ref` on an already-drained
+    /// tree is a near no-op). Spawning or adopting a new child **re-arms** `Drop`'s kill
     /// backstop for the whole group, so a straggler started after — or
     /// *concurrently with* — this shutdown is still torn down on `Drop`: a
     /// non-escalating shutdown that is still in flight when the child joins cannot
@@ -1091,8 +1094,8 @@ impl ProcessGroup {
     ///
     /// [`crate::ErrorReason::Io`] if the graceful teardown fails (see
     /// [`shutdown`](Self::shutdown) — the same undrained-tree failure on the legacy
-    /// per-pid fallback and the process-group live-`EPERM` on the final hard kill
-    /// apply).
+    /// per-pid fallback, its refused thaw over a cgroup left frozen, and the
+    /// process-group live-`EPERM` on the final hard kill apply).
     pub async fn shutdown_ref(&self) -> Result<()> {
         #[cfg(feature = "tracing")]
         tracing::debug!(
@@ -1119,8 +1122,8 @@ impl ProcessGroup {
     /// [`shutdown_ref`](Self::shutdown_ref).
     ///
     /// Like [`shutdown_ref`](Self::shutdown_ref) it borrows the group (`&self`, so
-    /// it works behind an `Arc` / a supervisor and the group stays usable
-    /// afterwards) and drives the same teardown: send the graceful signal
+    /// it works behind an `Arc` / a supervisor and, on success, the group stays
+    /// usable afterwards) and drives the same teardown: send the graceful signal
     /// (`SIGTERM`; a `CTRL_BREAK`/`WM_CLOSE` trigger on the Windows soft tier), wait
     /// up to `grace` for the tree to drain, then `SIGKILL` (/ `cgroup.kill` /
     /// `TerminateJobObject`) survivors when `escalate` is set, or spare them when it
@@ -1172,8 +1175,9 @@ impl ProcessGroup {
     ///
     /// [`crate::ErrorReason::Io`] if the teardown fails — the same surface as
     /// [`shutdown`](Self::shutdown): when `escalate` performs the final hard kill,
-    /// the undrained-tree failure on the legacy pre-5.14 per-pid fallback and a
-    /// process-group member that rejects `SIGKILL` with `EPERM` while still alive. A
+    /// the undrained-tree failure on the legacy pre-5.14 per-pid fallback, that
+    /// fallback's refused thaw over a cgroup left frozen, and a process-group
+    /// member that rejects `SIGKILL` with `EPERM` while still alive. A
     /// best-effort **soft**-signal failure is **not** an error — it is reported as
     /// [`SoftSignal::Failed`](crate::SoftSignal::Failed) in the returned report and
     /// the teardown proceeds.

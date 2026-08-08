@@ -45,7 +45,12 @@ to a dated version section.
   not-yet-exited case), and `wait` checks its blocking
   `WaitForSingleObject(..., INFINITE)` before trusting `GetExitCodeProcess`
   instead of folding a failed wait into `Ok(PtyExitStatus::from_code(None))`.
-  Both error arms still perform the usual PTY cleanup.
+  The two verbs keep their own teardown roles across the new arm: `wait` owns the
+  end of the PTY session, so a failed wait releases the input keepalive, lets
+  conhost drain, and closes the pseudoconsole exactly as a normal exit does, while
+  `try_wait` is a poll and tears nothing down on any outcome — a failed poll leaves
+  the session live for `wait`/`Drop` to close, so it cannot pull the pseudoconsole
+  out from under the `resize_pty` that follows an inconclusive poll.
 
 - `Pipeline`: a non-final stage configured with `stdout(StdioMode::Null)`,
   `stdout(StdioMode::Inherit)`, or a `stdout_file(..)` / `stdout_file_append(..)`

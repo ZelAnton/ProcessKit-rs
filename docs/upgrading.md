@@ -15,9 +15,13 @@ the full record; this page is the "I depend on it, what do I do" view.
 
 ## Unreleased (from 3.3.x)
 
-> Not released yet: this section covers the behavior change recorded under
+> Not released yet: this section covers the behavior changes recorded under
 > `[Unreleased]` in the [CHANGELOG](../CHANGELOG.md) and takes that release's
-> version number when it is cut.
+> version number when it is cut. Each subsection below is a change a consumer has
+> to make a decision about; an `[Unreleased]` fix that only *reports* a failure
+> previously swallowed — the Windows ConPTY wait that no longer masks a failed
+> `WaitForSingleObject` as a live or exit-code-less process — leaves nothing to
+> migrate and has no subsection here.
 
 ### A non-final `Pipeline` stage's own stdout destination is now overridden by the pipe (not compiler-caught)
 
@@ -116,6 +120,79 @@ The one non-final stdout configuration still *rejected* rather than overridden i
 `use_pty()` (the `pty` feature): a PTY master carries a merged terminal stream
 that cannot feed a later stage at all, so the chain fails before spawn with
 `ErrorReason::Unsupported` — unchanged.
+
+### `ProcessGroup::kill_all` reports a group its own teardown left frozen (not compiler-caught)
+
+This change is **not compiler-caught**: `kill_all` keeps its signature and existing
+code compiles unchanged. What moved is one outcome that used to be `Ok(())` and is
+now an `ErrorReason::Io` — carrying the refused write's own `ErrorKind`, so an
+`EACCES` classifies as `PermissionDenied` exactly as a refused `suspend` already
+did.
+
+**Who it affects:** Linux, and only where teardown runs the legacy per-pid
+`SIGKILL` fallback instead of the atomic `cgroup.kill` — a kernel without the
+`cgroup.kill` file (pre-5.14), or a host that refuses the `cgroup.kill` write (a
+write-restricted delegated cgroup). Windows Job Objects, the FreeBSD reaper, the
+POSIX process-group mechanism and any Linux where `cgroup.kill` works never reach
+that path. Besides `kill_all` itself, the new error can come out of `shutdown` /
+`shutdown_ref` / `stop`, which run that same hard kill when the grace elapses with
+survivors and `escalate_to_kill` (`escalate`) is set.
+
+**What changes.** That fallback freezes the subtree while it sweeps — so a fork
+bomb cannot out-spawn its `SIGKILL`s — and thaws it afterwards. The thaw's result
+used to be discarded: when the thaw was *refused*, the call still answered `Ok(())`
+on the strength of an empty `cgroup.procs`, leaving the group **frozen**. That is
+not a group you can spawn into: cgroup v2 freezes a task that joins a frozen
+cgroup, and this backend joins the cgroup before `exec`, so the next child would
+stop there instead of running (a `start()` into it may never return until the
+freeze is cleared).
+
+Now the thaw is retried once, and if it is still refused the freezer is read back
+from `cgroup.freeze`: a group that reads frozen is reported as such, with the
+refusal's errno and the remedy in the message. A refusal over a group that reads
+*unfrozen* is **not** reported — the write-restricted host that refuses the thaw is
+the one whose paired freeze never landed either, so nothing was left behind and the
+per-pid sweep was the complete teardown it already was there. The verb stays
+idempotent in the same direction: a repeat `kill_all` over a group still frozen
+reports it again instead of answering cleanly, and a freeze an earlier `suspend`
+left standing is covered the same way.
+
+**The error is about the group, not the tree.** It is produced only after the tree
+drained, so the processes are dead; what is unusable is the cgroup they ran in.
+
+Before, a failed thaw was invisible and the next spawn paid for it:
+
+```rust,no_run
+# use processkit::{Command, ProcessGroup};
+# async fn teardown(group: &ProcessGroup) -> processkit::Result<()> {
+group.kill_all()?; // Used to be Ok(()) even over a group left frozen.
+// On the legacy fallback this could then stop before `exec` and never return.
+let _next = group.start(&Command::new("worker")).await?;
+# Ok(())
+# }
+```
+
+After, handle it as "torn down, do not reuse": clear the freeze before spawning
+into the group again, or drop it and start a fresh one.
+
+```rust,no_run
+# use processkit::ProcessGroup;
+# fn teardown(group: &ProcessGroup) -> processkit::Result<()> {
+if let Err(err) = group.kill_all() {
+    // The tree is dead; what this reports is the group. Clearing the freeze is
+    // the `cgroup.freeze` write `resume` makes (`process-control`, on by
+    // default) — and if the host refuses that write too, drop the group rather
+    // than spawning into it.
+    group.resume()?;
+    return Err(err);
+}
+# Ok(())
+# }
+```
+
+A caller that already treats `kill_all` as fallible and never reuses a group after
+tearing it down needs **no** change: it drops the group, and the tree is dead in
+either case.
 
 ## 3.2.0 (from 3.1.x)
 
