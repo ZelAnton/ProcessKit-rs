@@ -20,6 +20,13 @@ to a dated version section.
 ### Fixed
 -
 
+## [3.3.2] - 2026-08-14
+
+### Changed
+
+- ci(deps): bump crate-ci/typos from 1.48.0 to 1.49.0
+- ci: exclude bot-blocked Coveralls dashboard link
+
 ## [3.3.1] - 2026-08-08
 
 ### Added
@@ -3467,7 +3474,8 @@ _No functional changes — republished to recover a failed crates.io upload._
 - Output capture is line-oriented (pumped): captured text is normalized to
   `\n` line endings. `output_bytes` still returns exact raw stdout.
 
-[Unreleased]: https://github.com/ZelAnton/ProcessKit-rs/compare/v3.3.1...HEAD
+[Unreleased]: https://github.com/ZelAnton/ProcessKit-rs/compare/v3.3.2...HEAD
+[3.3.2]: https://github.com/ZelAnton/ProcessKit-rs/compare/v3.3.1...v3.3.2
 [3.3.1]: https://github.com/ZelAnton/ProcessKit-rs/compare/v3.3.0...v3.3.1
 [3.3.0]: https://github.com/ZelAnton/ProcessKit-rs/compare/v3.2.0...v3.3.0
 [3.2.0]: https://github.com/ZelAnton/ProcessKit-rs/compare/v3.1.0...v3.2.0
