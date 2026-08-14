@@ -17,6 +17,9 @@
 exclude = [
   "/ideas($|/)",
   "/decisions($|/)",
+  # Coveralls blocks automated requests to the dashboard with 403; the badge
+  # image remains checked, so exclude only its human-facing link target.
+  "^https://coveralls\\.io/github/ZelAnton/ProcessKit-rs\\?branch=main$",
   # Forward-reference to unreleased CapturePolicy (T-186); remove after the next
   # ProcessKit release makes the trait available on docs.rs.
   "docs\\.rs/processkit/latest/processkit/trait\\.CapturePolicy\\.html",
