@@ -13,15 +13,12 @@ the full record; this page is the "I depend on it, what do I do" view.
 > below. (The `mock` feature's `mockall`-generated `expect_*` surface stays
 > semver-exempt — it tracks the `mockall` version.)
 
-## Unreleased (from 3.3.x)
+## 3.3.1 (from 3.3.0)
 
-> Not released yet: this section covers the behavior changes recorded under
-> `[Unreleased]` in the [CHANGELOG](../CHANGELOG.md) and takes that release's
-> version number when it is cut. Each subsection below is a change a consumer has
-> to make a decision about; an `[Unreleased]` fix that only *reports* a failure
-> previously swallowed — the Windows ConPTY wait that no longer masks a failed
-> `WaitForSingleObject` as a live or exit-code-less process — leaves nothing to
-> migrate and has no subsection here.
+Each subsection below is a change a consumer has to make a decision about; a 3.3.1
+fix that only *reports* a failure previously swallowed — the Windows ConPTY wait
+that no longer masks a failed `WaitForSingleObject` as a live or exit-code-less
+process — leaves nothing to migrate and has no subsection here.
 
 ### A non-final `Pipeline` stage's own stdout destination is now overridden by the pipe (not compiler-caught)
 
@@ -189,6 +186,19 @@ if let Err(err) = group.kill_all() {
 # Ok(())
 # }
 ```
+
+**If you discard the result** (`let _ = group.kill_all()`), two plausible backstops
+do not cover this outcome:
+
+- **Drop is not a backstop for it.** Kill-on-drop tears the group down through this
+  same call, and it has nothing to report with: `Drop` returns no result, and this
+  backend discards the one the call hands it. What it backstops is the *tree* —
+  which this error already reports as dead.
+- **A member count does not detect it.** This error is produced only after the tree
+  drained, so the group reads as empty either way, and `ProcessGroup::members`
+  reads `cgroup.procs` on this backend — which carries nothing about the freezer.
+  A teardown status derived from a member count therefore calls the group clean
+  exactly where `kill_all` refused to.
 
 A caller that already treats `kill_all` as fallible and never reuses a group after
 tearing it down needs **no** change: it drops the group, and the tree is dead in
