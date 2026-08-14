@@ -112,6 +112,66 @@ GitHub Release. The release commit is pushed to `main` with a dedicated **GitHub
 token, so it works under branch protection without a personal token (the App is in the
 ruleset's bypass list).
 
+Beyond dispatching that workflow, each release needs two things done by hand, and both
+are required. The next two subsections cover them: promoting
+[docs/upgrading.md](docs/upgrading.md) alongside the changelog — the workflow stops the
+release while that page still carries an `## Unreleased` heading — and writing the
+release notification, which nothing checks mechanically.
+
+### Promote `docs/upgrading.md` with the changelog
+
+The workflow promotes `CHANGELOG.md` itself. It does **not** promote the other
+consumer-facing page of a release, [docs/upgrading.md](docs/upgrading.md): that page
+carries a `## Unreleased (from <line>)` section whenever the pending release has
+something to migrate, and that section is part of the release, not a follow-up.
+
+Do it in the commit you release, before dispatching the workflow:
+
+1. Rename the `## Unreleased (from <line>)` heading to `## <version> (from <line>)`,
+   keeping the `(from …)` part as written. `<version>` is the number the workflow will
+   compute: the current `Cargo.toml` version with the bump you are about to pick applied
+   (`patch` → `x.y.(z+1)`, `minor` → `x.(y+1).0`, `major` → `(x+1).0.0`; on a first
+   release, with no `v*` tag yet, it ships the current version as-is).
+2. Remove the wording inside that section that tells the reader the changes are not
+   released yet, including any cross-reference sending them to `[Unreleased]` in the
+   changelog instead of to this version's own entry.
+3. Commit it to `main`.
+
+The section is done when a reader who arrives at the released version's heading finds
+nothing inside it still describing the changes as pending. A release with nothing to
+migrate has no `## Unreleased` section on that page and needs none of this.
+
+Forgetting step 1 stops the release. Immediately after promoting the changelog — and
+before the publish, the tag and the push — the workflow runs *Verify docs/upgrading.md
+was promoted too*, which fails the run while an `## Unreleased` heading is still in the
+file and prints the version number to rename it to. A run that stops there has published
+nothing, tagged nothing and pushed nothing, so fix the page on `main` and dispatch again.
+Know what that guard does and does not cover: it reads that one heading line and nothing
+else, so step 2 has no mechanical check behind it. `v3.3.1` shipped a promoted changelog
+next to an unpromoted migration section — the exact state the guard now rejects.
+
+### Release notification
+
+Each release also gets a short note at `.work/release_notifications/v<version>.md`.
+Delivering it belongs to the orchestration runtime; its content belongs to this
+repository. Keep it short — the few things a consumer has to act on, not an inventory of
+the diff and not a second copy of the changelog.
+
+Being short is why it has to point at the artifacts that carry the detail. When the
+released version has a section in [docs/upgrading.md](docs/upgrading.md), the note names
+that section, in the shape `processkit-3.0.0.md` used:
+
+```text
+Migration guide: `docs/upgrading.md`, section "3.0.0 (from 2.x)".
+```
+
+with the heading text of the version being released. Leave that line out only when the
+version genuinely has no section on that page. `v3.3.1` went out without it and
+consumers reported they could not tell from the notes alone whether a change reached
+their own call sites — while that release's changelog entry and migration section both
+spelled out the reachability (`kill_all`, `shutdown` / `shutdown_ref` / `stop`; Linux
+only; only the legacy per-pid teardown fallback).
+
 ### Publishing to crates.io (Trusted Publishing)
 
 The workflow publishes with **crates.io Trusted Publishing**: it mints a

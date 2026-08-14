@@ -19,12 +19,14 @@ name: Release
 # release (no `v*` tag yet) ships the current `Cargo.toml` version as-is.
 #
 # Single-crate release: bump the version, auto-fill an empty `[Unreleased]` from
-# git history via git-cliff, promote the curated changelog, verify the crate
-# publishes (dry run), attest build provenance for the packaged `.crate` and its
-# checksums, publish to crates.io, then tag `v<version>` and publish a GitHub
-# Release (with the `.crate` + checksums attached). Publishing comes BEFORE the
-# tag, so a failed publish strands nothing (just re-run). See AGENTS.md
-# "Releasing and the changelog".
+# git history via git-cliff, promote the curated changelog, refuse to go on if
+# `docs/upgrading.md` still carries an unpromoted `## Unreleased` section (that
+# page is promoted by hand in the released commit — see CONTRIBUTING.md
+# "Releasing"), verify the crate publishes (dry run), attest build provenance
+# for the packaged `.crate` and its checksums, publish to crates.io, then tag
+# `v<version>` and publish a GitHub Release (with the `.crate` + checksums
+# attached). Publishing comes BEFORE the tag, so a failed publish strands
+# nothing (just re-run). See AGENTS.md "Releasing and the changelog".
 
 on:
   workflow_dispatch:
@@ -367,6 +369,68 @@ jobs:
           path.write_text(text)
           print(f"Promoted [Unreleased] -> [{version}] - {date}")
           PY
+
+      # `docs/upgrading.md` is the release's second consumer-facing page, and the
+      # one the promotion above does NOT cover: it carries its own
+      # `## Unreleased (from <line>)` section whenever the release has something
+      # to migrate, and that heading has to become the released version's.
+      #
+      # This step deliberately only CHECKS; it does not promote the page. The
+      # heading rename would be as mechanical as the changelog's, but the rest of
+      # the section is prose written for consumers — a "not released yet" note,
+      # cross-references pointing at `[Unreleased]` — that a line-level rewrite
+      # rule cannot be trusted to reword, and a wrong edit would ship silently
+      # in an irreversible release. So the maintainer promotes that page by hand
+      # in the commit being released (steps in CONTRIBUTING.md "Releasing") and
+      # this step refuses the release when it was forgotten — which is what
+      # happened for 3.3.1, whose tag carries a promoted CHANGELOG next to an
+      # `## Unreleased` migration section documenting changes that release
+      # shipped. Because only the heading is machine-checked, the CONTRIBUTING.md
+      # steps say so rather than implying the guard covers the whole section.
+      #
+      # Placed here for the same fail-fast reason as the OIDC preflight and
+      # `Require dispatch from main` above: it runs before the dry run, the
+      # publish, the tag and the push, and everything before it (checkout, the
+      # bump, the changelog edits) lives only in this runner's tree. A run that
+      # stops here therefore leaves crates.io, the tags and `main` untouched —
+      # fix the page on `main` and dispatch again.
+      #
+      # The match is one anchored heading line, deliberately not a Markdown
+      # parse: any line beginning `## Unreleased` fails the release, including
+      # one inside a fenced block. That is the safe direction — a false positive
+      # costs a re-dispatch after rewording one line, a miss ships the 3.3.1
+      # defect again.
+      - name: Verify docs/upgrading.md was promoted too
+        env:
+          VERSION: ${{ steps.version.outputs.version }}
+        run: |
+          set -euo pipefail
+          PAGE=docs/upgrading.md
+          # Fail closed if the page is gone: `grep` on a missing file exits
+          # non-zero, and reading "grep found nothing" as "nothing to promote"
+          # would retire this guard without anyone noticing.
+          if [ ! -f "$PAGE" ]; then
+            echo "::error::${PAGE} is missing, so the release cannot check it for an unpromoted '## Unreleased' migration section. If that page was renamed or removed deliberately, update this step in .github/workflows/release.yml."
+            exit 1
+          fi
+          # Same reason, one level down: only grep's exit 1 means "clean page".
+          # Exit >=2 is grep failing to read the file at all, which must stop the
+          # release rather than pass it.
+          status=0
+          hits=$(grep -nE '^##[[:space:]]+Unreleased' "$PAGE") || status=$?
+          case "$status" in
+            0)
+              printf '%s\n' "$hits"
+              echo "::error::${PAGE} still has an '## Unreleased' migration section, but CHANGELOG.md has just been promoted to ${VERSION}. Both consumer-facing pages are promoted together: rename that heading to '## ${VERSION} (from <line>)', remove the wording that marks the section as not yet released, commit that to main, then re-run this workflow. This run published, tagged and pushed nothing. See CONTRIBUTING.md 'Releasing'."
+              exit 1
+              ;;
+            1) ;;
+            *)
+              echo "::error::Could not read ${PAGE} (grep exited ${status}), so this run cannot tell whether an unpromoted '## Unreleased' migration section is still there. Refusing to release."
+              exit 1
+              ;;
+          esac
+          echo "${PAGE} has no '## Unreleased' section left to promote for ${VERSION}."
 
       # Commit the bump + changelog locally (NOT pushed yet) so the next step can
       # verify against a clean tree, and the tag — once created — points at it.
