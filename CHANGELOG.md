@@ -20,6 +20,19 @@ to a dated version section.
 ### Fixed
 -
 
+## [3.3.3] - 2026-08-14
+
+### Changed
+
+- Start integration branch for batch B-20260814T102250Z (re-anchored on origin/main after v3.3.2 release)
+- Mark the 3.3.1 upgrade-guide section as released and cover discarded-result callers
+- Require docs/upgrading.md promotion and a migration-guide pointer in release notes
+
+
+### Fixed
+
+- Fix release-procedure heading rule and guard message to match convention
+
 ## [3.3.2] - 2026-08-14
 
 ### Changed
@@ -3474,7 +3487,8 @@ _No functional changes — republished to recover a failed crates.io upload._
 - Output capture is line-oriented (pumped): captured text is normalized to
   `\n` line endings. `output_bytes` still returns exact raw stdout.
 
-[Unreleased]: https://github.com/ZelAnton/ProcessKit-rs/compare/v3.3.2...HEAD
+[Unreleased]: https://github.com/ZelAnton/ProcessKit-rs/compare/v3.3.3...HEAD
+[3.3.3]: https://github.com/ZelAnton/ProcessKit-rs/compare/v3.3.2...v3.3.3
 [3.3.2]: https://github.com/ZelAnton/ProcessKit-rs/compare/v3.3.1...v3.3.2
 [3.3.1]: https://github.com/ZelAnton/ProcessKit-rs/compare/v3.3.0...v3.3.1
 [3.3.0]: https://github.com/ZelAnton/ProcessKit-rs/compare/v3.2.0...v3.3.0
