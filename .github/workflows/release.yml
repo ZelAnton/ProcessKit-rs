@@ -400,6 +400,13 @@ jobs:
       # one inside a fenced block. That is the safe direction — a false positive
       # costs a re-dispatch after rewording one line, a miss ships the 3.3.1
       # defect again.
+      #
+      # The failure message below names this release's version, which the run
+      # knows, and the constraint that rules out a wrong `(from ...)` value —
+      # but no form to substitute for it: the right value depends on the bump,
+      # and this step never reads it. CONTRIBUTING.md "Releasing" step 1 spells
+      # out the per-bump choice; restating a substitutable form here too is how
+      # the two drift apart.
       - name: Verify docs/upgrading.md was promoted too
         env:
           VERSION: ${{ steps.version.outputs.version }}
@@ -421,7 +428,7 @@ jobs:
           case "$status" in
             0)
               printf '%s\n' "$hits"
-              echo "::error::${PAGE} still has an '## Unreleased' migration section, but CHANGELOG.md has just been promoted to ${VERSION}. Both consumer-facing pages are promoted together: rename that heading to '## ${VERSION} (from <line>)', remove the wording that marks the section as not yet released, commit that to main, then re-run this workflow. This run published, tagged and pushed nothing. See CONTRIBUTING.md 'Releasing'."
+              echo "::error::${PAGE} still has an '## Unreleased' migration section, but CHANGELOG.md has just been promoted to ${VERSION}. Both consumer-facing pages are promoted together: rename that heading to '## ${VERSION} (from <previous>)', where <previous> is what the reader is upgrading from and so must not cover ${VERSION} itself; remove the wording that marks the section as not yet released, commit that to main, then re-run this workflow. This run published, tagged and pushed nothing. See CONTRIBUTING.md 'Releasing', which picks <previous> for the bump being released."
               exit 1
               ;;
             1) ;;

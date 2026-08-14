@@ -127,11 +127,17 @@ something to migrate, and that section is part of the release, not a follow-up.
 
 Do it in the commit you release, before dispatching the workflow:
 
-1. Rename the `## Unreleased (from <line>)` heading to `## <version> (from <line>)`,
-   keeping the `(from …)` part as written. `<version>` is the number the workflow will
+1. Rename the `## Unreleased (from <line>)` heading to
+   `## <version> (from <previous>)`. `<version>` is the number the workflow will
    compute: the current `Cargo.toml` version with the bump you are about to pick applied
    (`patch` → `x.y.(z+1)`, `minor` → `x.(y+1).0`, `major` → `(x+1).0.0`; on a first
-   release, with no `v*` tag yet, it ships the current version as-is).
+   release, with no `v*` tag yet, it ships the current version as-is). `<previous>` is
+   what the reader is upgrading *from*, so it must not cover `<version>` itself: a
+   `minor` or `major` bump leaves the current line, so the line already in the heading
+   still works (`## 3.2.0 (from 3.1.x)`, `## 3.0.0 (from 2.x)`); a `patch` bump stays
+   inside that line, so name the exact version you are following instead — which is why
+   `## Unreleased (from 3.3.x)` became `## 3.3.1 (from 3.3.0)`, not
+   `## 3.3.1 (from 3.3.x)`.
 2. Remove the wording inside that section that tells the reader the changes are not
    released yet, including any cross-reference sending them to `[Unreleased]` in the
    changelog instead of to this version's own entry.
@@ -146,9 +152,12 @@ before the publish, the tag and the push — the workflow runs *Verify docs/upgr
 was promoted too*, which fails the run while an `## Unreleased` heading is still in the
 file and prints the version number to rename it to. A run that stops there has published
 nothing, tagged nothing and pushed nothing, so fix the page on `main` and dispatch again.
-Know what that guard does and does not cover: it reads that one heading line and nothing
-else, so step 2 has no mechanical check behind it. `v3.3.1` shipped a promoted changelog
-next to an unpromoted migration section — the exact state the guard now rejects.
+Know what that guard does and does not cover: it looks for a heading line beginning
+`## Unreleased` and reads nothing else — neither the rest of that line nor the rest
+of the section. So it catches step 1 being skipped, but not the `<previous>` you
+choose in it, and step 2 has no mechanical check behind it at all. `v3.3.1` shipped a
+promoted changelog next to an unpromoted migration section — the exact state the guard
+now rejects.
 
 ### Release notification
 
