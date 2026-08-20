@@ -624,6 +624,44 @@ async fn shutdown_reports_timed_out_when_the_deadline_already_elapsed() {
     );
 }
 
+// An explicit shutdown owns the complete TERM -> grace -> KILL ladder. The
+// configured output-inactivity watchdog must not be re-armed by shutdown's
+// concurrent exit wait and shorten that caller-selected grace window.
+#[tokio::test]
+#[ignore = "spawns a real subprocess; shutdown disarms the inactivity watchdog"]
+async fn shutdown_does_not_rearm_inactivity_during_its_grace_window() {
+    let mut run = Command::new("sh")
+        .args(["-c", "trap '' TERM; echo ready; while :; do :; done"])
+        .inactivity_timeout(Duration::from_millis(100))
+        .start()
+        .await
+        .expect("start");
+    run.wait_for_line(|l| l == "ready", Duration::from_secs(10))
+        .await
+        .expect("trap installed");
+
+    let started = Instant::now();
+    // If this outer bound fires, dropping the consuming shutdown future drops
+    // its owned process group, retaining the test's kill-on-drop cleanup.
+    let outcome = tokio::time::timeout(
+        Duration::from_secs(10),
+        run.shutdown(Duration::from_millis(800)),
+    )
+    .await
+    .expect("shutdown remains bounded")
+    .expect("shutdown ok");
+    let elapsed = started.elapsed();
+
+    assert!(
+        matches!(outcome, Outcome::Signalled(_)),
+        "the explicit shutdown owns the teardown; inactivity must not replace its outcome: {outcome:?}"
+    );
+    assert!(
+        elapsed >= Duration::from_millis(600),
+        "the TERM-ignoring child must receive the full shutdown grace before SIGKILL ({elapsed:?})"
+    );
+}
+
 // D4: a shared-group handle (ProcessGroup::start) does not own its group, so
 // `shutdown` refuses with ErrorReason::Unsupported — the caller tears the group down
 // via ProcessGroup::shutdown instead.

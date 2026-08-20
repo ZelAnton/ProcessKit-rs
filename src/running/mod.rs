@@ -1464,9 +1464,10 @@ impl RunningProcess {
             }
             .into());
         };
-        // Disable the concurrent `wait()`'s deadline arm to avoid two overlapping
-        // graceful teardowns. A timeout that already elapsed still classifies
-        // as `TimedOut` — claim the arbiter before nulling `self.timeout`.
+        // Disable the concurrent `wait()`'s deadline and inactivity arms to avoid
+        // overlapping teardowns. A timeout that already elapsed still classifies
+        // as `TimedOut` — claim the arbiter before nulling `self.timeout`. An
+        // inactivity timeout that already won remains recorded in `timeout_state`.
         // Measured off `deadline_anchor` (tokio's clock), not `started`, so this
         // "already elapsed?" check agrees with `wait_deadline_and_claim` under a
         // paused runtime instead of reading the real clock the deadline never slept on.
@@ -1476,6 +1477,7 @@ impl RunningProcess {
             let _ = deadline::claim_timed_out(&self.timeout_state);
         }
         self.timeout = None;
+        self.inactivity_timeout = None;
         if let Some(task) = self.deadline_task.take() {
             task.abort();
         }
@@ -3734,6 +3736,20 @@ mod tests {
             Outcome::TimedOut,
             "a run whose deadline fired must report TimedOut, not the in-grace exit"
         );
+    }
+
+    /// Disarming the inactivity arm for an explicit shutdown must not erase an
+    /// inactivity timeout that already won the shared terminal-state arbiter.
+    #[tokio::test]
+    async fn preclaimed_inactivity_survives_disarming_the_wait_arm() {
+        let mut run = scripted_handle(&[0]).await; // Reply::ok -> Exited(0)
+        run.inactivity_timeout = Some(Duration::from_secs(1));
+        run.timeout_state
+            .store(TS_INACTIVITY_TIMED_OUT, Ordering::Release);
+        run.inactivity_timeout = None; // mirrors `shutdown` taking sole teardown ownership
+
+        let outcome = run.wait().await.expect("wait");
+        assert_eq!(outcome, Outcome::InactivityTimedOut);
     }
 
     /// Cancellation is checked after `classify_timed_out` and always wins.
