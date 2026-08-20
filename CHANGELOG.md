@@ -18,7 +18,14 @@ to a dated version section.
 -
 
 ### Fixed
--
+
+- Prevent explicit process shutdown from re-arming the inactivity watchdog after
+  teardown has begun while preserving a timeout outcome that already won.
+- Propagate Windows ToolHelp thread-enumeration cursor failures instead of
+  treating them as the normal end of a snapshot.
+- Make Windows ConPTY startup transactional across fallible bridge-thread
+  creation, rolling back the suspended child and bridge resources before Job
+  publication.
 
 ## [3.3.3] - 2026-08-14
 

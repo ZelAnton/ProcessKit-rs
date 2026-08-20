@@ -569,9 +569,10 @@ type BridgeTask = Box<dyn FnOnce() + Send + 'static>;
 ///
 /// Each pipe handle moves first into this guard, then into exactly one bridge
 /// closure. A successfully-created bridge remains pending here until every
-/// fallible bridge creation has completed. That lets rollback close the channel
-/// endpoints, tear down ConPTY, and join any already-started sibling instead of
-/// leaving a blocked detached thread behind.
+/// fallible bridge creation has completed and the suspended child is published
+/// to its Job. That lets rollback close the channel endpoints, tear down ConPTY,
+/// and join any already-started sibling instead of leaving a blocked detached
+/// thread behind.
 struct SpawnRollback {
     process: Option<OwnedProcess>,
     primary_thread: Option<SendHandle>,
@@ -692,7 +693,7 @@ impl Drop for SpawnRollback {
         if let Some(process) = process {
             // `TerminateProcess` is asynchronous. Waiting through the still-owned
             // handle completes rollback before the caller can observe the error or
-            // mistake the child for a live member of the shared Job.
+            // mistake the suspended child for a successful launch.
             // SAFETY: `process` remains owned by `self.process` through this call.
             unsafe { WaitForSingleObject(process, INFINITE) };
         }
@@ -902,19 +903,12 @@ where
     }
 
     // From here through both bridge spawns, every resource has one RAII owner.
-    // The guard kills and waits for the child on any early return; pipe ownership
-    // moves out of it only into a closure whose failed thread spawn drops it.
+    // The child remains suspended and outside the shared Job while either bridge
+    // creation can fail, so rollback cannot mutate survivor-sparing or CTRL leader
+    // state. Pipe ownership moves out only into a closure whose failed thread spawn
+    // drops it.
     let mut rollback = SpawnRollback::new(pi.hProcess, pi.hThread, hpc, input_write, output_read);
 
-    // Contain before resuming. The Job owns the complete assign → affinity →
-    // resume discipline (including suspend-walk exclusion and CTRL leader
-    // registration); `rollback` retains resource ownership until commit.
-    job.contain_pty_child(
-        rollback.process_handle(),
-        rollback.primary_thread_handle(),
-        pi.dwProcessId,
-        opts,
-    )?;
     let pid = pi.dwProcessId;
     // `output_read` (merged stdout+stderr) and `input_write` (stdin) are
     // *synchronous* anonymous pipes; tokio has no async adapter for them, so each
@@ -936,6 +930,18 @@ where
         .take()
         .expect("spawn rollback must own the input pipe");
     rollback.writer = Some(bridge_writer(input_write, spawn_thread)?);
+
+    // Both fallible bridge starts have committed, so the Job may now publish and
+    // resume the child. The backend holds its suspend lock across the complete
+    // assign → affinity → resume sequence, then re-arms survivor teardown and
+    // records any CTRL leader. `rollback` still owns every resource if containment
+    // itself fails.
+    job.contain_pty_child(
+        rollback.process_handle(),
+        rollback.primary_thread_handle(),
+        pid,
+        opts,
+    )?;
 
     let reader: PtyReader = Box::new(
         rollback
@@ -1258,32 +1264,36 @@ mod tests {
     }
 
     #[cfg(feature = "process-control")]
-    fn assert_bridge_spawn_failure_rolls_back(fail_on: usize) {
+    fn assert_bridge_spawn_failure_rolls_back(
+        job: &crate::sys::Job,
+        fail_on: usize,
+        windows_new_process_group: bool,
+        expected_members: &[u32],
+    ) {
         use std::sync::atomic::AtomicBool;
 
-        let job = test_job();
         let mut command = Command::new("cmd");
-        // Interactive `cmd` waits on the ConPTY input without spawning a helper,
-        // so the fresh Job has exactly the direct child whose rollback we inspect.
+        // Interactive `cmd` waits on the ConPTY input without spawning a helper.
         command.args(["/d", "/q"]);
         let options = SpawnOptions {
             use_pty: true,
+            windows_new_process_group,
             ..SpawnOptions::default()
         };
-        let observed_pid = Arc::new(std::sync::Mutex::new(None));
         let names = Arc::new(std::sync::Mutex::new(Vec::new()));
         let successful_bridge_finished = Arc::new(AtomicBool::new(false));
         let mut ordinal = 0usize;
         let mut spawn_thread = |name: &'static str, task: BridgeTask| {
             ordinal += 1;
             names.lock().expect("bridge-name mutex poisoned").push(name);
-            let members = job.members().expect("read test Job membership");
+            let mut members = job.members().expect("read test Job membership");
+            let mut expected = expected_members.to_vec();
+            members.sort_unstable();
+            expected.sort_unstable();
             assert_eq!(
-                members.len(),
-                1,
-                "the bridge seam must run after the direct child is contained"
+                members, expected,
+                "a fallible bridge start must run before the suspended child is published"
             );
-            *observed_pid.lock().expect("observed-pid mutex poisoned") = Some(members[0]);
 
             if ordinal == fail_on {
                 return Err(io::Error::other(format!(
@@ -1320,15 +1330,13 @@ mod tests {
                 .contains(&format!("creation failure #{fail_on}")),
             "the injected thread-creation error must reach the caller: {error}"
         );
-        let pid = observed_pid
-            .lock()
-            .expect("observed-pid mutex poisoned")
-            .expect("the contained child pid must be observed before failure");
-        assert!(
-            !job.members()
-                .expect("read rolled-back Job membership")
-                .contains(&pid),
-            "spawn_pty must not return while the failed child remains in the Job"
+        let mut members = job.members().expect("read rolled-back Job membership");
+        let mut expected = expected_members.to_vec();
+        members.sort_unstable();
+        expected.sort_unstable();
+        assert_eq!(
+            members, expected,
+            "failed bridge creation must leave existing Job membership unchanged"
         );
         assert_eq!(
             successful_bridge_finished.load(Ordering::Acquire),
@@ -1349,15 +1357,61 @@ mod tests {
     #[cfg(feature = "process-control")]
     #[test]
     #[ignore = "spawns a real Windows ConPTY child with an injected reader-thread failure"]
-    fn reader_bridge_creation_failure_rolls_back_the_contained_child() {
-        assert_bridge_spawn_failure_rolls_back(1);
+    fn reader_bridge_creation_failure_rolls_back_the_suspended_child() {
+        let job = test_job();
+        assert_bridge_spawn_failure_rolls_back(&job, 1, false, &[]);
     }
 
     #[cfg(feature = "process-control")]
-    #[test]
-    #[ignore = "spawns a real Windows ConPTY child with an injected writer-thread failure"]
-    fn writer_bridge_creation_failure_joins_reader_and_rolls_back_the_child() {
-        assert_bridge_spawn_failure_rolls_back(2);
+    #[tokio::test]
+    #[ignore = "spawns real Windows children with an injected writer-thread failure"]
+    async fn writer_bridge_failure_preserves_spared_survivors_and_joins_reader() {
+        let job = test_job();
+        let mut survivor_command = Command::new("cmd");
+        // A piped interactive shell stays live without spawning a helper, so its
+        // Job membership is stable while the failing ConPTY launch runs.
+        survivor_command
+            .args(["/d", "/q"])
+            .stdin(std::process::Stdio::piped())
+            .stdout(std::process::Stdio::null())
+            .stderr(std::process::Stdio::null());
+        let mut survivor = job
+            .spawn(&mut survivor_command, &SpawnOptions::default())
+            .expect("spawn survivor");
+        let survivor_pid = survivor.id().expect("survivor pid");
+
+        job.graceful_shutdown(crate::sys::SIGTERM_RAW, Duration::ZERO, false)
+            .await
+            .expect("spare existing survivor");
+        let expected_members = job.members().expect("read spared Job membership");
+        assert!(
+            expected_members.contains(&survivor_pid),
+            "the regression needs a live survivor before the failed PTY launch"
+        );
+        let soft_scope_before = job.soft_stop_scope();
+
+        // The failed child asks to become a CTRL_BREAK leader, making the test
+        // cover the leader-registration boundary as well as the survivor latch.
+        assert_bridge_spawn_failure_rolls_back(&job, 2, true, &expected_members);
+        assert_eq!(
+            job.soft_stop_scope(),
+            soft_scope_before,
+            "the failed would-be leader must not change the group's soft-stop reach"
+        );
+
+        // The failed launch must not clear the spare latch: dropping the Job keeps
+        // the pre-existing child alive. A premature contain_pty_child call clears
+        // it and makes the process exit through KILL_ON_JOB_CLOSE. Poll rather than
+        // awaiting `Child::wait`, which deliberately closes piped stdin first and
+        // would itself make the interactive shell exit.
+        drop(job);
+        tokio::time::sleep(Duration::from_millis(500)).await;
+        assert_eq!(
+            survivor.try_wait().expect("poll spared survivor"),
+            None,
+            "failed bridge creation must not re-arm Drop against spared survivors"
+        );
+        survivor.kill().await.expect("clean up spared survivor");
     }
 
     /// Close the production-owned process handle and replace its stored value
