@@ -13,7 +13,9 @@ use tokio::process::{Child, Command};
 use windows_sys::Win32::Foundation::FILETIME;
 use windows_sys::Win32::Foundation::{CloseHandle, HANDLE, HWND, INVALID_HANDLE_VALUE, LPARAM};
 #[cfg(feature = "process-control")]
-use windows_sys::Win32::Foundation::{ERROR_INVALID_PARAMETER, ERROR_MORE_DATA};
+use windows_sys::Win32::Foundation::{
+    ERROR_INVALID_PARAMETER, ERROR_MORE_DATA, ERROR_NO_MORE_FILES, GetLastError,
+};
 use windows_sys::Win32::System::Console::{CTRL_BREAK_EVENT, GenerateConsoleCtrlEvent};
 use windows_sys::Win32::System::Diagnostics::ToolHelp::{
     CreateToolhelp32Snapshot, TH32CS_SNAPTHREAD, THREADENTRY32, Thread32First, Thread32Next,
@@ -159,6 +161,150 @@ const EXTENDED_LIMIT_AXIS: &str = "extended-limit";
 /// info class carrying the CPU hard cap.
 #[cfg(feature = "limits")]
 const CPU_RATE_AXIS: &str = "cpu-rate";
+
+#[cfg(feature = "process-control")]
+#[derive(Debug, Clone, Copy)]
+struct ThreadSnapshotEntry {
+    thread_id: u32,
+    owner_process_id: u32,
+}
+
+#[cfg(feature = "process-control")]
+trait ThreadSnapshotCursor {
+    fn next_entry(&mut self) -> io::Result<Option<ThreadSnapshotEntry>>;
+}
+
+#[cfg(feature = "process-control")]
+fn classify_thread_snapshot_false(error: u32) -> io::Result<Option<ThreadSnapshotEntry>> {
+    if error == ERROR_NO_MORE_FILES {
+        Ok(None)
+    } else {
+        Err(io::Error::from_raw_os_error(error as i32))
+    }
+}
+
+/// An owned ToolHelp snapshot cursor. Keeping the handle in this RAII wrapper
+/// makes every first/next error path close it at the same single ownership point.
+#[cfg(feature = "process-control")]
+struct ToolhelpThreadSnapshot {
+    handle: HANDLE,
+    first: bool,
+}
+
+#[cfg(feature = "process-control")]
+impl ToolhelpThreadSnapshot {
+    fn open() -> io::Result<Self> {
+        // SAFETY: TH32CS_SNAPTHREAD always snapshots all threads system-wide;
+        // returns INVALID_HANDLE_VALUE on failure.
+        let handle = unsafe { CreateToolhelp32Snapshot(TH32CS_SNAPTHREAD, 0) };
+        if handle == INVALID_HANDLE_VALUE {
+            Err(io::Error::last_os_error())
+        } else {
+            Ok(Self {
+                handle,
+                first: true,
+            })
+        }
+    }
+}
+
+#[cfg(feature = "process-control")]
+impl ThreadSnapshotCursor for ToolhelpThreadSnapshot {
+    fn next_entry(&mut self) -> io::Result<Option<ThreadSnapshotEntry>> {
+        let mut entry: THREADENTRY32 = unsafe { std::mem::zeroed() };
+        entry.dwSize = std::mem::size_of::<THREADENTRY32>() as u32;
+
+        // SAFETY: `handle` is a live ToolHelp snapshot and `entry` advertises
+        // the exact buffer size expected by Thread32First/Thread32Next.
+        let ok = unsafe {
+            if self.first {
+                self.first = false;
+                Thread32First(self.handle, &mut entry)
+            } else {
+                Thread32Next(self.handle, &mut entry)
+            }
+        };
+        if ok != 0 {
+            return Ok(Some(ThreadSnapshotEntry {
+                thread_id: entry.th32ThreadID,
+                owner_process_id: entry.th32OwnerProcessID,
+            }));
+        }
+
+        // GetLastError must be the first Win32 call after the FALSE result: even
+        // CloseHandle can overwrite the thread-local error slot. NO_MORE_FILES
+        // is the documented normal terminator; every other value is a failed
+        // first/next operation and must reach the public suspend/resume caller.
+        // SAFETY: GetLastError has no preconditions and reads the calling thread.
+        let error = unsafe { GetLastError() };
+        classify_thread_snapshot_false(error)
+    }
+}
+
+#[cfg(feature = "process-control")]
+impl Drop for ToolhelpThreadSnapshot {
+    fn drop(&mut self) {
+        // SAFETY: `handle` was returned by CreateToolhelp32Snapshot and this
+        // wrapper is its sole owner, so Drop closes it exactly once.
+        unsafe { CloseHandle(self.handle) };
+    }
+}
+
+/// Apply `operation` to every snapshot entry owned by `members`.
+///
+/// A cursor failure has priority over an earlier per-thread operation failure:
+/// it proves the walk itself stopped before every remaining thread was even
+/// attempted. After a normal end, the last per-thread failure is returned, which
+/// preserves the existing best-effort sweep semantics.
+#[cfg(feature = "process-control")]
+fn walk_member_threads<C, F>(
+    mut cursor: C,
+    members: &std::collections::HashSet<u32>,
+    mut operation: F,
+) -> io::Result<()>
+where
+    C: ThreadSnapshotCursor,
+    F: FnMut(ThreadSnapshotEntry) -> io::Result<()>,
+{
+    let mut last_operation_error = None;
+    while let Some(entry) = cursor.next_entry()? {
+        if members.contains(&entry.owner_process_id)
+            && let Err(error) = operation(entry)
+        {
+            last_operation_error = Some(error);
+        }
+    }
+
+    match last_operation_error {
+        Some(error) => Err(error),
+        None => Ok(()),
+    }
+}
+
+#[cfg(all(test, feature = "process-control"))]
+thread_local! {
+    static INJECTED_THREAD_WALK_ERROR: std::cell::Cell<Option<i32>> = const {
+        std::cell::Cell::new(None)
+    };
+}
+
+#[cfg(all(test, feature = "process-control"))]
+struct InjectedThreadWalkError {
+    previous: Option<i32>,
+}
+
+#[cfg(all(test, feature = "process-control"))]
+fn inject_thread_walk_error(code: i32) -> InjectedThreadWalkError {
+    let previous = INJECTED_THREAD_WALK_ERROR.with(|injected| injected.replace(Some(code)));
+    InjectedThreadWalkError { previous }
+}
+
+#[cfg(all(test, feature = "process-control"))]
+impl Drop for InjectedThreadWalkError {
+    fn drop(&mut self) {
+        INJECTED_THREAD_WALK_ERROR.with(|injected| injected.set(self.previous));
+    }
+}
 
 /// The single boundary every `SetInformationJobObject` call in this backend passes
 /// through — the Job Object's one "apply this limit/flag set" primitive.
@@ -812,6 +958,12 @@ impl Job {
             .suspend_lock
             .lock()
             .unwrap_or_else(|poisoned| poisoned.into_inner());
+
+        #[cfg(test)]
+        if let Some(code) = INJECTED_THREAD_WALK_ERROR.with(|injected| injected.replace(None)) {
+            return Err(io::Error::from_raw_os_error(code));
+        }
+
         let members: std::collections::HashSet<u32> =
             job_member_pids(self.handle)?.into_iter().collect();
         if members.is_empty() {
@@ -819,40 +971,15 @@ impl Job {
             return Ok(());
         }
 
-        // SAFETY: TH32CS_SNAPTHREAD always snapshots all threads system-wide;
-        // returns INVALID_HANDLE_VALUE on failure.
-        let snapshot = unsafe { CreateToolhelp32Snapshot(TH32CS_SNAPTHREAD, 0) };
-        if snapshot == INVALID_HANDLE_VALUE {
-            return Err(io::Error::last_os_error());
-        }
-
-        let mut entry: THREADENTRY32 = unsafe { std::mem::zeroed() };
-        entry.dwSize = std::mem::size_of::<THREADENTRY32>() as u32;
-
-        let mut last_err = None;
-        // SAFETY: valid snapshot; `entry` is sized via its `dwSize` field.
-        let mut ok = unsafe { Thread32First(snapshot, &mut entry) };
-        while ok != 0 {
-            if members.contains(&entry.th32OwnerProcessID)
-                && let Err(err) = suspend_or_resume_thread(
-                    entry.th32ThreadID,
-                    entry.th32OwnerProcessID,
-                    self.handle,
-                    suspend,
-                )
-            {
-                last_err = Some(err);
-            }
-            // SAFETY: same valid snapshot and entry.
-            ok = unsafe { Thread32Next(snapshot, &mut entry) };
-        }
-        // SAFETY: handle came from CreateToolhelp32Snapshot; closed exactly once.
-        unsafe { CloseHandle(snapshot) };
-
-        match last_err {
-            Some(err) => Err(err),
-            None => Ok(()),
-        }
+        let snapshot = ToolhelpThreadSnapshot::open()?;
+        walk_member_threads(snapshot, &members, |entry| {
+            suspend_or_resume_thread(
+                entry.thread_id,
+                entry.owner_process_id,
+                self.handle,
+                suspend,
+            )
+        })
     }
 
     pub(crate) async fn graceful_shutdown(
@@ -2403,6 +2530,206 @@ mod thread_resume_tests {
         let handle = child.raw_handle().expect("the child has a handle") as HANDLE;
         super::resume_process_threads(pid, handle).expect("the contained child is resumed");
         expect_resumed(&mut child).await;
+    }
+}
+
+// The group-wide ToolHelp walk is otherwise difficult to fail deterministically:
+// a healthy desktop normally ends every snapshot with ERROR_NO_MORE_FILES. These
+// tests drive the cursor boundary directly, and the public-verbs test injects a
+// failure at `Job::for_each_member_thread` so the real public error mapping is
+// covered without a subprocess or a damaged host.
+#[cfg(all(test, feature = "process-control"))]
+mod thread_walk_error_tests {
+    use std::cell::Cell;
+    use std::collections::HashSet;
+    use std::rc::Rc;
+
+    use windows_sys::Win32::Foundation::{
+        ERROR_ACCESS_DENIED, ERROR_INVALID_HANDLE, ERROR_NO_MORE_FILES,
+    };
+
+    use super::{
+        ThreadSnapshotCursor, ThreadSnapshotEntry, classify_thread_snapshot_false,
+        inject_thread_walk_error, walk_member_threads,
+    };
+    use crate::{ErrorReason, ProcessGroup};
+
+    const MEMBER_PID: u32 = 41;
+    const MEMBER_TID: u32 = 43;
+
+    enum Step {
+        Entry(ThreadSnapshotEntry),
+        End,
+        Error(i32),
+    }
+
+    struct Cursor {
+        steps: std::vec::IntoIter<Step>,
+        closes: Rc<Cell<usize>>,
+    }
+
+    impl Cursor {
+        fn new(steps: Vec<Step>, closes: Rc<Cell<usize>>) -> Self {
+            Self {
+                steps: steps.into_iter(),
+                closes,
+            }
+        }
+    }
+
+    impl ThreadSnapshotCursor for Cursor {
+        fn next_entry(&mut self) -> std::io::Result<Option<ThreadSnapshotEntry>> {
+            match self.steps.next().unwrap_or(Step::End) {
+                Step::Entry(entry) => Ok(Some(entry)),
+                Step::End => Ok(None),
+                Step::Error(code) => Err(std::io::Error::from_raw_os_error(code)),
+            }
+        }
+    }
+
+    impl Drop for Cursor {
+        fn drop(&mut self) {
+            self.closes.set(self.closes.get() + 1);
+        }
+    }
+
+    fn member_entry() -> ThreadSnapshotEntry {
+        ThreadSnapshotEntry {
+            thread_id: MEMBER_TID,
+            owner_process_id: MEMBER_PID,
+        }
+    }
+
+    fn members() -> HashSet<u32> {
+        HashSet::from([MEMBER_PID])
+    }
+
+    #[test]
+    fn a_first_failure_is_returned_and_closes_the_snapshot_once() {
+        let closes = Rc::new(Cell::new(0));
+        let cursor = Cursor::new(
+            vec![Step::Error(ERROR_ACCESS_DENIED as i32)],
+            Rc::clone(&closes),
+        );
+
+        let error = walk_member_threads(cursor, &members(), |_| -> std::io::Result<()> {
+            panic!("a failed first step must not yield an entry")
+        })
+        .expect_err("Thread32First failure must reach suspend/resume");
+
+        assert_eq!(error.raw_os_error(), Some(ERROR_ACCESS_DENIED as i32));
+        assert_eq!(closes.get(), 1, "the owned snapshot is closed exactly once");
+    }
+
+    #[test]
+    fn a_next_failure_after_an_entry_is_returned_and_closes_once() {
+        let closes = Rc::new(Cell::new(0));
+        let seen = Cell::new(0);
+        let cursor = Cursor::new(
+            vec![
+                Step::Entry(member_entry()),
+                Step::Error(ERROR_ACCESS_DENIED as i32),
+            ],
+            Rc::clone(&closes),
+        );
+
+        let error = walk_member_threads(cursor, &members(), |_| {
+            seen.set(seen.get() + 1);
+            Ok(())
+        })
+        .expect_err("Thread32Next failure must not look like normal exhaustion");
+
+        assert_eq!(seen.get(), 1, "one entry was handled before next failed");
+        assert_eq!(error.raw_os_error(), Some(ERROR_ACCESS_DENIED as i32));
+        assert_eq!(closes.get(), 1, "the owned snapshot is closed exactly once");
+    }
+
+    #[test]
+    fn normal_exhaustion_after_an_entry_is_successful() {
+        let closes = Rc::new(Cell::new(0));
+        let seen = Cell::new(0);
+        let cursor = Cursor::new(
+            vec![Step::Entry(member_entry()), Step::End],
+            Rc::clone(&closes),
+        );
+
+        walk_member_threads(cursor, &members(), |_| {
+            seen.set(seen.get() + 1);
+            Ok(())
+        })
+        .expect("ERROR_NO_MORE_FILES is normal snapshot exhaustion");
+
+        assert_eq!(seen.get(), 1);
+        assert_eq!(closes.get(), 1, "the owned snapshot is closed exactly once");
+    }
+
+    #[test]
+    fn iterator_failure_has_priority_over_an_earlier_thread_failure() {
+        let closes = Rc::new(Cell::new(0));
+        let cursor = Cursor::new(
+            vec![
+                Step::Entry(member_entry()),
+                Step::Error(ERROR_ACCESS_DENIED as i32),
+            ],
+            Rc::clone(&closes),
+        );
+
+        let error = walk_member_threads(cursor, &members(), |_| {
+            Err(std::io::Error::from_raw_os_error(
+                ERROR_INVALID_HANDLE as i32,
+            ))
+        })
+        .expect_err("an incomplete walk must report its iterator failure");
+
+        assert_eq!(
+            error.raw_os_error(),
+            Some(ERROR_ACCESS_DENIED as i32),
+            "the iterator error wins because later member threads were never attempted"
+        );
+        assert_eq!(closes.get(), 1, "the owned snapshot is closed exactly once");
+    }
+
+    fn assert_public_io_error(error: crate::Error, expected: i32, operation: &str) {
+        match error.reason() {
+            ErrorReason::Io(source) => assert_eq!(
+                source.raw_os_error(),
+                Some(expected),
+                "ProcessGroup::{operation} must preserve the ToolHelp error"
+            ),
+            other => panic!("ProcessGroup::{operation} returned {other:?}, expected Io"),
+        }
+    }
+
+    #[test]
+    fn public_suspend_and_resume_propagate_a_snapshot_failure() {
+        for (operation, invoke) in [
+            (
+                "suspend",
+                ProcessGroup::suspend as fn(&ProcessGroup) -> crate::Result<()>,
+            ),
+            (
+                "resume",
+                ProcessGroup::resume as fn(&ProcessGroup) -> crate::Result<()>,
+            ),
+        ] {
+            let _injected = inject_thread_walk_error(ERROR_ACCESS_DENIED as i32);
+            let group = ProcessGroup::new().expect("create an empty test Job Object");
+
+            let error = invoke(&group).expect_err("the public verb must propagate the failure");
+            assert_public_io_error(error, ERROR_ACCESS_DENIED as i32, operation);
+        }
+    }
+
+    #[test]
+    fn the_normal_end_code_is_the_documented_toolhelp_terminator() {
+        assert!(
+            classify_thread_snapshot_false(ERROR_NO_MORE_FILES)
+                .expect("NO_MORE_FILES is normal exhaustion")
+                .is_none()
+        );
+        let error = classify_thread_snapshot_false(ERROR_ACCESS_DENIED)
+            .expect_err("every other FALSE result is a real iterator failure");
+        assert_eq!(error.raw_os_error(), Some(ERROR_ACCESS_DENIED as i32));
     }
 }
 
