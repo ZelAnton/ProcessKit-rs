@@ -19,6 +19,7 @@ use std::sync::{
     atomic::{AtomicU64, Ordering},
 };
 use std::task::{Context, Poll};
+use std::thread::JoinHandle;
 use std::time::Duration;
 
 use tokio::io::{AsyncRead, AsyncWrite, ReadBuf};
@@ -562,6 +563,144 @@ impl Drop for NulledLauncherStdio {
     }
 }
 
+type BridgeTask = Box<dyn FnOnce() + Send + 'static>;
+
+/// Resources owned between `CreateProcessW` and a complete [`PtySpawn`].
+///
+/// Each pipe handle moves first into this guard, then into exactly one bridge
+/// closure. A successfully-created bridge remains pending here until every
+/// fallible bridge creation has completed. That lets rollback close the channel
+/// endpoints, tear down ConPTY, and join any already-started sibling instead of
+/// leaving a blocked detached thread behind.
+struct SpawnRollback {
+    process: Option<OwnedProcess>,
+    primary_thread: Option<SendHandle>,
+    hpc: HPCON,
+    input_write: Option<SendHandle>,
+    output_read: Option<SendHandle>,
+    reader: Option<PendingReader>,
+    writer: Option<PendingWriter>,
+}
+
+impl SpawnRollback {
+    fn new(
+        process: HANDLE,
+        primary_thread: HANDLE,
+        hpc: HPCON,
+        input_write: HANDLE,
+        output_read: HANDLE,
+    ) -> Self {
+        Self {
+            process: Some(OwnedProcess(process)),
+            primary_thread: Some(SendHandle(primary_thread)),
+            hpc,
+            input_write: Some(SendHandle(input_write)),
+            output_read: Some(SendHandle(output_read)),
+            reader: None,
+            writer: None,
+        }
+    }
+
+    fn process_handle(&self) -> HANDLE {
+        self.process
+            .as_ref()
+            .expect("spawn rollback process already transferred")
+            .0
+    }
+
+    fn primary_thread_handle(&self) -> HANDLE {
+        self.primary_thread
+            .as_ref()
+            .expect("spawn rollback primary thread already transferred")
+            .0
+    }
+
+    /// Disarm rollback after every fallible setup step has completed.
+    fn commit(mut self) -> (Arc<OwnedProcess>, HANDLE, HPCON) {
+        debug_assert!(self.input_write.is_none());
+        debug_assert!(self.output_read.is_none());
+        let process = Arc::new(
+            self.process
+                .take()
+                .expect("spawn rollback process must still be owned"),
+        );
+        let primary_thread = self
+            .primary_thread
+            .take()
+            .expect("spawn rollback primary thread must still be owned")
+            .into_raw();
+        let hpc = std::mem::replace(&mut self.hpc, 0);
+
+        // The successful live session owns the channel endpoints. Dropping a
+        // `JoinHandle` deliberately detaches its bridge, matching the established
+        // session-lifetime behavior; until this exact commit point the handles stay
+        // joinable so rollback cannot strand either bridge.
+        drop(
+            self.reader
+                .as_mut()
+                .and_then(|pending| pending.thread.take()),
+        );
+        drop(
+            self.writer
+                .as_mut()
+                .and_then(|pending| pending.thread.take()),
+        );
+        (process, primary_thread, hpc)
+    }
+}
+
+impl Drop for SpawnRollback {
+    fn drop(&mut self) {
+        // Close both async-side channel endpoints before joining. The reader may
+        // be backpressured in `blocking_send`, while the writer waits in
+        // `blocking_recv`; releasing those endpoints makes both states revocable.
+        let reader_thread = self.reader.take().and_then(|mut pending| {
+            drop(pending.reader.take());
+            pending.thread.take()
+        });
+        let writer_thread = self.writer.take().and_then(|mut pending| {
+            drop(pending.writer.take());
+            drop(pending.keepalive.take());
+            pending.thread.take()
+        });
+
+        let process = self.process.as_ref().map(|process| process.0);
+        if let Some(process) = process {
+            // SAFETY: this guard is the sole process-handle owner until commit.
+            // Termination comes before ConPTY close so a synchronous
+            // `ClosePseudoConsole` cannot wait on a client we left running.
+            unsafe { TerminateProcess(process, 1) };
+        }
+        if self.hpc != 0 {
+            // SAFETY: the guard owns the live HPCON until commit and clears it
+            // immediately, so neither this path nor `PtyChild` can close it twice.
+            unsafe { ClosePseudoConsole(self.hpc) };
+            self.hpc = 0;
+        }
+
+        // Handles that never reached a bridge close here through their RAII
+        // wrappers. Handles accepted by a bridge are owned by its thread instead.
+        drop(self.input_write.take());
+        drop(self.output_read.take());
+
+        if let Some(thread) = reader_thread {
+            let _ = thread.join();
+        }
+        if let Some(thread) = writer_thread {
+            let _ = thread.join();
+        }
+        if let Some(process) = process {
+            // `TerminateProcess` is asynchronous. Waiting through the still-owned
+            // handle completes rollback before the caller can observe the error or
+            // mistake the child for a live member of the shared Job.
+            // SAFETY: `process` remains owned by `self.process` through this call.
+            unsafe { WaitForSingleObject(process, INFINITE) };
+        }
+        // `primary_thread` and `process` drop after this method, closing their
+        // handles only after every bridge has stopped using the ConPTY pipes.
+    }
+}
+
 /// Spawn `cmd` under a ConPTY, assigning the child to `job` for containment.
 ///
 /// `env` is the child's resolved environment (see
@@ -574,6 +713,24 @@ pub(crate) fn spawn_pty(
     env: Option<Vec<(OsString, OsString)>>,
     job: &crate::sys::imp::Job,
 ) -> io::Result<PtySpawn> {
+    let mut spawn_thread = |name: &'static str, task: BridgeTask| {
+        std::thread::Builder::new()
+            .name(name.to_owned())
+            .spawn(task)
+    };
+    spawn_pty_with_thread_spawner(cmd, opts, env, job, &mut spawn_thread)
+}
+
+fn spawn_pty_with_thread_spawner<F>(
+    cmd: &mut Command,
+    opts: &SpawnOptions,
+    env: Option<Vec<(OsString, OsString)>>,
+    job: &crate::sys::imp::Job,
+    spawn_thread: &mut F,
+) -> io::Result<PtySpawn>
+where
+    F: FnMut(&'static str, BridgeTask) -> io::Result<JoinHandle<()>>,
+{
     // Two pipes: the child's input (we write `input_write`) and output (we read
     // `output_read`). The ConPTY takes ownership of `input_read`/`output_write`.
     let mut input_read: HANDLE = std::ptr::null_mut();
@@ -744,23 +901,20 @@ pub(crate) fn spawn_pty(
         close(output_write);
     }
 
+    // From here through both bridge spawns, every resource has one RAII owner.
+    // The guard kills and waits for the child on any early return; pipe ownership
+    // moves out of it only into a closure whose failed thread spawn drops it.
+    let mut rollback = SpawnRollback::new(pi.hProcess, pi.hThread, hpc, input_write, output_read);
+
     // Contain before resuming. The Job owns the complete assign → affinity →
     // resume discipline (including suspend-walk exclusion and CTRL leader
-    // registration); this module retains resource ownership for error cleanup.
-    let cleanup_created = |error| {
-        unsafe {
-            TerminateProcess(pi.hProcess, 1);
-            close(pi.hProcess);
-            close(pi.hThread);
-            ClosePseudoConsole(hpc);
-            close(input_write);
-            close(output_read);
-        }
-        error
-    };
-    if let Err(error) = job.contain_pty_child(pi.hProcess, pi.hThread, pi.dwProcessId, opts) {
-        return Err(cleanup_created(error));
-    }
+    // registration); `rollback` retains resource ownership until commit.
+    job.contain_pty_child(
+        rollback.process_handle(),
+        rollback.primary_thread_handle(),
+        pi.dwProcessId,
+        opts,
+    )?;
     let pid = pi.dwProcessId;
     // `output_read` (merged stdout+stderr) and `input_write` (stdin) are
     // *synchronous* anonymous pipes; tokio has no async adapter for them, so each
@@ -768,14 +922,46 @@ pub(crate) fn spawn_pty(
     // bridged to async over a channel (the established pattern for blocking Windows
     // pipes). Acceptable for the minimal, low-volume interactive PTY mode.
     let output_activity = Arc::new(OutputActivity::default());
-    let reader: PtyReader = Box::new(bridge_reader(output_read, Arc::clone(&output_activity)));
-    let (writer, input_keepalive) = bridge_writer(input_write);
-    let writer: PtyWriter = Box::new(writer);
+    let output_read = rollback
+        .output_read
+        .take()
+        .expect("spawn rollback must own the output pipe");
+    rollback.reader = Some(bridge_reader(
+        output_read,
+        Arc::clone(&output_activity),
+        spawn_thread,
+    )?);
+    let input_write = rollback
+        .input_write
+        .take()
+        .expect("spawn rollback must own the input pipe");
+    rollback.writer = Some(bridge_writer(input_write, spawn_thread)?);
+
+    let reader: PtyReader = Box::new(
+        rollback
+            .reader
+            .as_mut()
+            .and_then(|pending| pending.reader.take())
+            .expect("reader bridge must own its async endpoint"),
+    );
+    let writer: PtyWriter = Box::new(
+        rollback
+            .writer
+            .as_mut()
+            .and_then(|pending| pending.writer.take())
+            .expect("writer bridge must own its async endpoint"),
+    );
+    let input_keepalive = rollback
+        .writer
+        .as_mut()
+        .and_then(|pending| pending.keepalive.take())
+        .expect("writer bridge must own its input keepalive");
+    let (process, thread, hpc) = rollback.commit();
 
     Ok(PtySpawn {
         child: PtyChild {
-            process: Arc::new(OwnedProcess(pi.hProcess)),
-            thread: pi.hThread,
+            process,
+            thread,
             hpc,
             input_keepalive: Some(input_keepalive),
             hpc_closed: false,
@@ -788,9 +974,10 @@ pub(crate) fn spawn_pty(
     })
 }
 
-/// A raw handle moved into a bridge thread that owns it exclusively.
+/// A raw handle with one RAII owner, movable into a bridge thread.
 struct SendHandle(HANDLE);
-// SAFETY: the handle is owned solely by the bridge thread it is moved into.
+// SAFETY: the handle is owned solely by this wrapper or the bridge thread it is
+// moved into; Win32 permits closing it from either thread.
 unsafe impl Send for SendHandle {}
 
 impl SendHandle {
@@ -801,11 +988,36 @@ impl SendHandle {
     /// # Safety
     ///
     /// The wrapped handle must be a valid, open handle owned by the caller.
-    unsafe fn into_file(self) -> std::fs::File {
+    unsafe fn into_file(mut self) -> std::fs::File {
+        let handle = std::mem::replace(&mut self.0, std::ptr::null_mut());
         // SAFETY: forwarded from the caller's contract; ownership transfers to the
         // returned `File`.
-        unsafe { std::fs::File::from_raw_handle(self.0 as _) }
+        unsafe { std::fs::File::from_raw_handle(handle as _) }
     }
+
+    fn into_raw(mut self) -> HANDLE {
+        std::mem::replace(&mut self.0, std::ptr::null_mut())
+    }
+}
+
+impl Drop for SendHandle {
+    fn drop(&mut self) {
+        // SAFETY: this wrapper is the sole owner until `into_file`/`into_raw`
+        // clears it. In particular, a failed `Builder::spawn` drops the closure
+        // and closes a pipe that never reached a bridge thread.
+        unsafe { close(self.0) };
+    }
+}
+
+struct PendingReader {
+    reader: Option<ChannelReader>,
+    thread: Option<JoinHandle<()>>,
+}
+
+struct PendingWriter {
+    writer: Option<ChannelWriter>,
+    keepalive: Option<tokio::sync::mpsc::UnboundedSender<Vec<u8>>>,
+    thread: Option<JoinHandle<()>>,
 }
 
 /// Bridge a synchronous read pipe to async: a dedicated OS thread blocking-reads
@@ -813,39 +1025,51 @@ impl SendHandle {
 /// backpressures the reader thread, and thus the child). A `0`-length read or a
 /// broken pipe is normal pseudoconsole EOF; any other read error is forwarded so
 /// the output pump can report an incomplete capture instead of silent truncation.
-fn bridge_reader(handle: HANDLE, output_activity: Arc<OutputActivity>) -> ChannelReader {
+fn bridge_reader<F>(
+    handle: SendHandle,
+    output_activity: Arc<OutputActivity>,
+    spawn_thread: &mut F,
+) -> io::Result<PendingReader>
+where
+    F: FnMut(&'static str, BridgeTask) -> io::Result<JoinHandle<()>>,
+{
     let (tx, rx) = tokio::sync::mpsc::channel::<ReaderMessage>(64);
-    let h = SendHandle(handle);
-    std::thread::spawn(move || {
-        use std::io::Read;
-        // SAFETY: the handle is owned by this thread; the `File` closes it on drop.
-        let mut file = unsafe { h.into_file() };
-        let mut buf = [0u8; 8192];
-        loop {
-            match file.read(&mut buf) {
-                Ok(0) => break,
-                Ok(n) => {
-                    output_activity.record_chunk();
-                    if tx
-                        .blocking_send(ReaderMessage::Chunk(buf[..n].to_vec()))
-                        .is_err()
-                    {
+    let thread = spawn_thread(
+        "processkit-pty-reader",
+        Box::new(move || {
+            use std::io::Read;
+            // SAFETY: the handle is owned by this thread; the `File` closes it on drop.
+            let mut file = unsafe { handle.into_file() };
+            let mut buf = [0u8; 8192];
+            loop {
+                match file.read(&mut buf) {
+                    Ok(0) => break,
+                    Ok(n) => {
+                        output_activity.record_chunk();
+                        if tx
+                            .blocking_send(ReaderMessage::Chunk(buf[..n].to_vec()))
+                            .is_err()
+                        {
+                            break;
+                        }
+                    }
+                    Err(error) if crate::running::is_broken_pipe(&error) => break,
+                    Err(error) => {
+                        let _ = tx.blocking_send(ReaderMessage::Error(error));
                         break;
                     }
                 }
-                Err(error) if crate::running::is_broken_pipe(&error) => break,
-                Err(error) => {
-                    let _ = tx.blocking_send(ReaderMessage::Error(error));
-                    break;
-                }
             }
-        }
-    });
-    ChannelReader {
-        rx: std::sync::Mutex::new(rx),
-        leftover: Vec::new(),
-        pos: 0,
-    }
+        }),
+    )?;
+    Ok(PendingReader {
+        reader: Some(ChannelReader {
+            rx: std::sync::Mutex::new(rx),
+            leftover: Vec::new(),
+            pos: 0,
+        }),
+        thread: Some(thread),
+    })
 }
 
 enum ReaderMessage {
@@ -859,28 +1083,34 @@ enum ReaderMessage {
 /// The returned sender clone is owned by [`PtyChild`] for the session lifetime.
 /// ConPTY treats a closed host-input pipe as a request to close the pseudoconsole,
 /// so a public writer ending must not be what closes the underlying pipe.
-fn bridge_writer(handle: HANDLE) -> (ChannelWriter, tokio::sync::mpsc::UnboundedSender<Vec<u8>>) {
+fn bridge_writer<F>(handle: SendHandle, spawn_thread: &mut F) -> io::Result<PendingWriter>
+where
+    F: FnMut(&'static str, BridgeTask) -> io::Result<JoinHandle<()>>,
+{
     let (tx, mut rx) = tokio::sync::mpsc::unbounded_channel::<Vec<u8>>();
-    let h = SendHandle(handle);
-    std::thread::spawn(move || {
-        use std::io::Write;
-        // SAFETY: the handle is owned by this thread; the `File` closes it on drop.
-        let mut file = unsafe { h.into_file() };
-        while let Some(chunk) = rx.blocking_recv() {
-            if file.write_all(&chunk).is_err() {
-                break;
+    let thread = spawn_thread(
+        "processkit-pty-writer",
+        Box::new(move || {
+            use std::io::Write;
+            // SAFETY: the handle is owned by this thread; the `File` closes it on drop.
+            let mut file = unsafe { handle.into_file() };
+            while let Some(chunk) = rx.blocking_recv() {
+                if file.write_all(&chunk).is_err() {
+                    break;
+                }
+                let _ = file.flush();
             }
-            let _ = file.flush();
-        }
-    });
+        }),
+    )?;
     let keepalive = tx.clone();
-    (
-        ChannelWriter {
+    Ok(PendingWriter {
+        writer: Some(ChannelWriter {
             tx,
             shutdown: false,
-        },
-        keepalive,
-    )
+        }),
+        keepalive: Some(keepalive),
+        thread: Some(thread),
+    })
 }
 
 /// The async read half of the pipe bridge: drains `Vec<u8>` chunks from the reader
@@ -1025,6 +1255,109 @@ mod tests {
             .spawn_pty(&mut command, &options, None)
             .expect("spawn real ConPTY child");
         (spawn, job)
+    }
+
+    #[cfg(feature = "process-control")]
+    fn assert_bridge_spawn_failure_rolls_back(fail_on: usize) {
+        use std::sync::atomic::AtomicBool;
+
+        let job = test_job();
+        let mut command = Command::new("cmd");
+        // Interactive `cmd` waits on the ConPTY input without spawning a helper,
+        // so the fresh Job has exactly the direct child whose rollback we inspect.
+        command.args(["/d", "/q"]);
+        let options = SpawnOptions {
+            use_pty: true,
+            ..SpawnOptions::default()
+        };
+        let observed_pid = Arc::new(std::sync::Mutex::new(None));
+        let names = Arc::new(std::sync::Mutex::new(Vec::new()));
+        let successful_bridge_finished = Arc::new(AtomicBool::new(false));
+        let mut ordinal = 0usize;
+        let mut spawn_thread = |name: &'static str, task: BridgeTask| {
+            ordinal += 1;
+            names.lock().expect("bridge-name mutex poisoned").push(name);
+            let members = job.members().expect("read test Job membership");
+            assert_eq!(
+                members.len(),
+                1,
+                "the bridge seam must run after the direct child is contained"
+            );
+            *observed_pid.lock().expect("observed-pid mutex poisoned") = Some(members[0]);
+
+            if ordinal == fail_on {
+                return Err(io::Error::other(format!(
+                    "injected bridge thread creation failure #{ordinal}"
+                )));
+            }
+
+            let finished = Arc::clone(&successful_bridge_finished);
+            std::thread::Builder::new()
+                .name(name.to_owned())
+                .spawn(move || {
+                    task();
+                    finished.store(true, Ordering::Release);
+                })
+        };
+
+        let error = match spawn_pty_with_thread_spawner(
+            &mut command,
+            &options,
+            None,
+            &job.0,
+            &mut spawn_thread,
+        ) {
+            Ok(spawn) => {
+                drop(spawn);
+                panic!("bridge thread failure #{fail_on} unexpectedly succeeded");
+            }
+            Err(error) => error,
+        };
+        assert_eq!(error.kind(), io::ErrorKind::Other);
+        assert!(
+            error
+                .to_string()
+                .contains(&format!("creation failure #{fail_on}")),
+            "the injected thread-creation error must reach the caller: {error}"
+        );
+        let pid = observed_pid
+            .lock()
+            .expect("observed-pid mutex poisoned")
+            .expect("the contained child pid must be observed before failure");
+        assert!(
+            !job.members()
+                .expect("read rolled-back Job membership")
+                .contains(&pid),
+            "spawn_pty must not return while the failed child remains in the Job"
+        );
+        assert_eq!(
+            successful_bridge_finished.load(Ordering::Acquire),
+            fail_on == 2,
+            "a first sibling bridge must be joined before second-bridge failure returns"
+        );
+        let expected_names = if fail_on == 1 {
+            vec!["processkit-pty-reader"]
+        } else {
+            vec!["processkit-pty-reader", "processkit-pty-writer"]
+        };
+        assert_eq!(
+            *names.lock().expect("bridge-name mutex poisoned"),
+            expected_names
+        );
+    }
+
+    #[cfg(feature = "process-control")]
+    #[test]
+    #[ignore = "spawns a real Windows ConPTY child with an injected reader-thread failure"]
+    fn reader_bridge_creation_failure_rolls_back_the_contained_child() {
+        assert_bridge_spawn_failure_rolls_back(1);
+    }
+
+    #[cfg(feature = "process-control")]
+    #[test]
+    #[ignore = "spawns a real Windows ConPTY child with an injected writer-thread failure"]
+    fn writer_bridge_creation_failure_joins_reader_and_rolls_back_the_child() {
+        assert_bridge_spawn_failure_rolls_back(2);
     }
 
     /// Close the production-owned process handle and replace its stored value
