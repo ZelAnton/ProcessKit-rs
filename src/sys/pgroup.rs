@@ -575,7 +575,7 @@ enum SignalTarget {
 /// primitive.
 ///
 /// Behaviorally it is the bare `killpg`/`kill` plus this backend's usual
-/// `-1`→[`io::Error::last_os_error`] conversion, so the caller reads the errno from
+/// `-1`→[`std::io::Error::last_os_error()`] conversion, so the caller reads the errno from
 /// the returned error instead of a separate `last_os_error()` read. Funnelling the
 /// sweep's three sends through one place is what lets a `cfg(test)` rule order a
 /// specific delivery to fail with a specific errno — the `EPERM` a live,
