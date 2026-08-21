@@ -971,8 +971,10 @@ impl SupervisionSession {
     ///
     /// # Errors
     ///
-    /// The same surface as [`wait`](Self::wait); a graceful stop itself yields a
-    /// [`StopReason::Stopped`] outcome (`Ok`), not an error.
+    /// Returns an own-group teardown error if graceful termination of the
+    /// current or concurrently-published incarnation fails. A completed graceful
+    /// stop yields a [`StopReason::Stopped`] outcome (`Ok`), not a cancellation
+    /// error.
     pub async fn stop(mut self, grace: Duration) -> Result<SupervisionOutcome> {
         // Record the request and snapshot the current live child atomically
         // (closing the stop-vs-spawn race, see `SessionShared::publish_current`),
@@ -982,8 +984,11 @@ impl SupervisionSession {
         self.shared.stop.cancel();
         if let Some(stopper) = child {
             // Stop the live child through its graceful path; the in-flight
-            // capture then returns and the loop ends with `Stopped`.
-            stopper.graceful_stop(grace).await;
+            // capture then returns and the loop ends with `Stopped`. A teardown
+            // failure is terminal: returning it drops this session, whose abort
+            // handle cancels the incarnation so kill-on-drop can run immediately
+            // instead of waiting without a bound for an exit that may never come.
+            stopper.graceful_stop(grace).await?;
         }
         Self::await_completion(self.completion.take()).await
     }
@@ -1027,6 +1032,10 @@ struct SessionShared {
     /// sleep. Distinct from the command's [`cancel_on`](Command::cancel_on)
     /// token (whose cancellation is an *error*): a stop is not an error.
     stop: CancellationToken,
+    /// Per-session unit-test seam shared with every [`ChildStopper`], so a test
+    /// can replace the next own-group teardown result without cross-test races.
+    #[cfg(test)]
+    graceful_stop_fault: Arc<AtomicBool>,
 }
 
 /// The loop-owned mirror fields republished into an atomic [`SupervisionStatus`]
@@ -1064,20 +1073,34 @@ struct ChildStopper {
     /// own group to shut down gracefully (a shared-group child — just that
     /// child — or a capture-only double), the only stop lever there.
     inc_cancel: CancellationToken,
+    /// Test-only substitution of the fallible own-group operation. Shared with
+    /// the session so it can be armed before or after child publication.
+    #[cfg(test)]
+    graceful_stop_fault: Arc<AtomicBool>,
 }
 
 impl ChildStopper {
     /// Stop the current child. An own-group incarnation gets a graceful
     /// `SIGTERM` → `grace` → `SIGKILL`; any other (shared-group or capture-only)
     /// is stopped by firing its cancel token, the only available lever.
-    async fn graceful_stop(&self, grace: Duration) {
+    async fn graceful_stop(&self, grace: Duration) -> Result<()> {
+        #[cfg(test)]
+        if self.graceful_stop_fault.swap(false, Ordering::SeqCst) {
+            return Err(crate::Error::io(std::io::Error::new(
+                std::io::ErrorKind::PermissionDenied,
+                "injected graceful-stop teardown failure",
+            )));
+        }
         match &self.group {
             Some(group) => {
-                let _ = group
+                group
                     .graceful_terminate(grace, crate::sys::SIGTERM_RAW)
-                    .await;
+                    .await
             }
-            None => self.inc_cancel.cancel(),
+            None => {
+                self.inc_cancel.cancel();
+                Ok(())
+            }
         }
     }
 }
@@ -1096,6 +1119,8 @@ impl SessionShared {
             }),
             events,
             stop: CancellationToken::new(),
+            #[cfg(test)]
+            graceful_stop_fault: Arc::new(AtomicBool::new(false)),
         }
     }
 
@@ -1167,6 +1192,11 @@ impl SessionShared {
 
     fn is_stopping(&self) -> bool {
         self.lock().stopping
+    }
+
+    #[cfg(test)]
+    fn fail_next_graceful_stop(&self) {
+        self.graceful_stop_fault.store(true, Ordering::SeqCst);
     }
 
     /// Record a graceful-stop request and snapshot the current live child (its
@@ -2401,15 +2431,11 @@ impl<R: ProcessRunner> Supervisor<R> {
         let stopper = ChildStopper {
             group: handle.own_group_handle(),
             inc_cancel: command.cancel_token().unwrap_or_default(),
+            #[cfg(test)]
+            graceful_stop_fault: Arc::clone(&shared.graceful_stop_fault),
         };
-        if let Some(grace) =
-            shared.publish_current(handle.pid(), handle.start_time(), stopper.clone())
-        {
-            // A stop was pending before this child became current: stop it now,
-            // fire-and-forget — the output verb below observes the exit and the
-            // loop ends with `Stopped`.
-            tokio::spawn(async move { stopper.graceful_stop(grace).await });
-        }
+        let pending_grace =
+            shared.publish_current(handle.pid(), handle.start_time(), stopper.clone());
         // Release the published live child on *every* exit from here — a normal
         // return below, but crucially also this future being dropped mid-`await`
         // when a liveness kill wins `run_incarnation`'s `select!`. Without it the
@@ -2418,6 +2444,16 @@ impl<R: ProcessRunner> Supervisor<R> {
         // `publish_current`, pinning the wedged child's group alive — and its
         // stale pid observable — across the whole restart backoff.
         let _current_guard = CurrentGuard { shared };
+
+        if let Some(grace) = pending_grace {
+            // A stop was pending before this child became current. Keep the
+            // teardown in this incarnation instead of detaching it: success flows
+            // into the output verb and `Stopped`, while failure returns through
+            // the supervision completion channel. `_current_guard` and the live
+            // handle then drop on this error path, providing the bounded
+            // cancellation/kill-on-drop backstop.
+            stopper.graceful_stop(grace).await?;
+        }
 
         // Returned directly: `_current_guard` above still drops (clearing
         // `current`) as this function unwinds, after the value below is produced.
@@ -2468,6 +2504,8 @@ impl<R: ProcessRunner> Supervisor<R> {
         let stopper = ChildStopper {
             group: None,
             inc_cancel: command.cancel_token().unwrap_or_default(),
+            #[cfg(test)]
+            graceful_stop_fault: Arc::clone(&shared.graceful_stop_fault),
         };
         if shared
             .publish_current(None, SystemTime::now(), stopper.clone())
@@ -4764,6 +4802,46 @@ mod tests {
 
     // --- Live supervision session (T-158) ----------------------------------
 
+    struct CanaryRunner {
+        inner: ScriptedRunner,
+        _canary: Arc<()>,
+    }
+
+    #[async_trait::async_trait]
+    impl ProcessRunner for CanaryRunner {
+        async fn output_string(&self, command: &Command) -> Result<ProcessResult<String>> {
+            self.inner.output_string(command).await
+        }
+
+        async fn start(&self, command: &Command) -> Result<crate::RunningProcess> {
+            self.inner.start(command).await
+        }
+    }
+
+    struct GatedStartRunner {
+        inner: ScriptedRunner,
+        entered: Arc<tokio::sync::Semaphore>,
+        release: Arc<tokio::sync::Semaphore>,
+        _canary: Arc<()>,
+    }
+
+    #[async_trait::async_trait]
+    impl ProcessRunner for GatedStartRunner {
+        async fn output_string(&self, command: &Command) -> Result<ProcessResult<String>> {
+            self.inner.output_string(command).await
+        }
+
+        async fn start(&self, command: &Command) -> Result<crate::RunningProcess> {
+            self.entered.add_permits(1);
+            self.release
+                .acquire()
+                .await
+                .expect("start release semaphore")
+                .forget();
+            self.inner.start(command).await
+        }
+    }
+
     /// Poll `session.status()` until `pred` holds, yielding to let the detached
     /// supervision loop make progress. Panics rather than spin forever.
     async fn yield_until(
@@ -4780,6 +4858,97 @@ mod tests {
         panic!(
             "session status condition never held: {:?}",
             session.status()
+        );
+    }
+
+    async fn yield_until_runner_dropped(canary: &Arc<()>) {
+        for _ in 0..2000 {
+            if Arc::strong_count(canary) == 1 {
+                return;
+            }
+            tokio::task::yield_now().await;
+        }
+        panic!(
+            "supervision task kept its runner after terminal stop failure: {} owners",
+            Arc::strong_count(canary)
+        );
+    }
+
+    #[tokio::test]
+    async fn current_child_teardown_failure_is_terminal_and_bounded() {
+        let canary = Arc::new(());
+        let session = Supervisor::new(Command::new("server"))
+            .with_runner(CanaryRunner {
+                inner: ScriptedRunner::new().fallback(Reply::pending()),
+                _canary: Arc::clone(&canary),
+            })
+            .start();
+        yield_until(&session, |status| status.started_at().is_some()).await;
+        let shared = Arc::clone(&session.shared);
+        shared.fail_next_graceful_stop();
+
+        let error = tokio::time::timeout(
+            Duration::from_secs(1),
+            session.stop(Duration::from_secs(60)),
+        )
+        .await
+        .expect("a teardown error must not wait for the pending incarnation")
+        .expect_err("the injected graceful-stop failure must be observable");
+        assert_eq!(error.kind(), crate::ErrorKind::PermissionDenied);
+
+        yield_until_runner_dropped(&canary).await;
+        assert!(
+            shared.snapshot().started_at().is_none(),
+            "the stop error must abort the incarnation and clear its published handle"
+        );
+    }
+
+    #[tokio::test]
+    async fn publication_race_teardown_failure_reaches_stop_and_is_bounded() {
+        let entered = Arc::new(tokio::sync::Semaphore::new(0));
+        let release = Arc::new(tokio::sync::Semaphore::new(0));
+        let canary = Arc::new(());
+        let session = Supervisor::new(Command::new("server"))
+            .with_runner(GatedStartRunner {
+                inner: ScriptedRunner::new().fallback(Reply::pending()),
+                entered: Arc::clone(&entered),
+                release: Arc::clone(&release),
+                _canary: Arc::clone(&canary),
+            })
+            .start();
+        entered
+            .acquire()
+            .await
+            .expect("start-entry semaphore")
+            .forget();
+        let shared = Arc::clone(&session.shared);
+        shared.fail_next_graceful_stop();
+
+        let stop_task = tokio::spawn(async move { session.stop(Duration::from_secs(60)).await });
+        tokio::time::timeout(Duration::from_secs(1), shared.stop.cancelled())
+            .await
+            .expect("the gated stop request must be published");
+        assert!(
+            shared.is_stopping(),
+            "the stop request must win before publication"
+        );
+        assert!(
+            shared.snapshot().started_at().is_none(),
+            "the gated child must not be published before the stop request"
+        );
+        release.add_permits(1);
+
+        let error = tokio::time::timeout(Duration::from_secs(1), stop_task)
+            .await
+            .expect("the publication-race stop must not await the pending child")
+            .expect("the stop task must not panic")
+            .expect_err("the loop-owned teardown failure must reach session.stop");
+        assert_eq!(error.kind(), crate::ErrorKind::PermissionDenied);
+
+        yield_until_runner_dropped(&canary).await;
+        assert!(
+            shared.snapshot().started_at().is_none(),
+            "the failed pending-stop path must clear the just-published handle"
         );
     }
 
@@ -5091,24 +5260,10 @@ mod tests {
         // task is alive it holds the runner (hence a clone of the canary). Dropping
         // the session must abort that task — no orphaned supervision task — so the
         // runner drops and the canary's strong count falls back to 1.
-        struct CanaryRunner {
-            inner: ScriptedRunner,
-            _canary: std::sync::Arc<()>,
-        }
-        #[async_trait::async_trait]
-        impl ProcessRunner for CanaryRunner {
-            async fn output_string(&self, command: &Command) -> Result<ProcessResult<String>> {
-                self.inner.output_string(command).await
-            }
-            async fn start(&self, command: &Command) -> Result<crate::RunningProcess> {
-                self.inner.start(command).await
-            }
-        }
-
-        let canary = std::sync::Arc::new(());
+        let canary = Arc::new(());
         let runner = CanaryRunner {
             inner: ScriptedRunner::new().fallback(Reply::pending()),
-            _canary: std::sync::Arc::clone(&canary),
+            _canary: Arc::clone(&canary),
         };
         let session = Supervisor::new(Command::new("server"))
             .with_runner(runner)
@@ -5116,7 +5271,7 @@ mod tests {
         // Let the loop spawn the (pending) child so the task is genuinely running.
         yield_until(&session, |s| s.started_at().is_some()).await;
         assert_eq!(
-            std::sync::Arc::strong_count(&canary),
+            Arc::strong_count(&canary),
             2,
             "the live supervision task holds the runner"
         );
@@ -5124,13 +5279,13 @@ mod tests {
         drop(session);
         // Let the runtime process the abort and drop the task's future (the runner).
         for _ in 0..200 {
-            if std::sync::Arc::strong_count(&canary) == 1 {
+            if Arc::strong_count(&canary) == 1 {
                 break;
             }
             tokio::task::yield_now().await;
         }
         assert_eq!(
-            std::sync::Arc::strong_count(&canary),
+            Arc::strong_count(&canary),
             1,
             "dropping the session must abort supervision — no orphaned task holding the runner"
         );
