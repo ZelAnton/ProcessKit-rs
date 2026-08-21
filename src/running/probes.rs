@@ -370,7 +370,7 @@ impl RunningProcess {
                 // panicking) predicate without holding `Inner` — never blocking the
                 // pump or poisoning its state. A match wins over `closed`, so a
                 // final un-terminated prompt is still matchable right at close.
-                let (tail, closed) = sink.partial_tail_snapshot();
+                let (tail, closed, observed) = sink.partial_tail_snapshot();
                 if let Some(tail) = tail
                     && predicate(&tail)
                 {
@@ -380,10 +380,10 @@ impl RunningProcess {
                     return None; // stream ended with no match — none can arrive.
                 }
                 // Park until the next buffer change (a tail update, a pushed line,
-                // or close). `notify_one`'s stored permit covers a change that
-                // lands between the snapshot above and this await, so no wakeup is
-                // lost and the re-check sees it.
-                sink.clone().changed().await;
+                // or close). The snapshot's generation closes the gap before the
+                // waiter registers, while the broadcast wakes every observer of
+                // this sink rather than selecting just one.
+                sink.clone().changed(observed).await;
             }
         };
         match tokio::time::timeout(within, search).await {

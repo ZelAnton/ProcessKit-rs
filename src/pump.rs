@@ -430,6 +430,11 @@ fn apply_vt_sanitize(enabled: bool, line: String) -> String {
 pub(crate) struct SharedLines {
     inner: Mutex<Inner>,
     notify: Notify,
+    /// Monotonic publication generation paired with `notify_waiters`. A
+    /// consumer snapshots it with the state it inspected, then `changed`
+    /// registers before re-checking it. That closes both the snapshot-to-await
+    /// race and `Notify`'s lack of a stored broadcast permit.
+    generation: AtomicUsize,
     count: AtomicUsize,
     /// Lines discarded by the buffer *policy* (DropOldest/DropNewest/Error) —
     /// NOT lines a streaming consumer popped via [`try_pop`](Self::try_pop).
@@ -559,10 +564,14 @@ pub(crate) enum Popped {
     /// A buffered line.
     Line(String),
     /// No line available yet, and the pump is still running.
-    Empty,
+    Empty(ChangeToken),
     /// No line available and the pump has finished.
     Closed,
 }
+
+/// Opaque generation observed alongside a [`SharedLines`] state snapshot.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub(crate) struct ChangeToken(usize);
 
 impl SharedLines {
     #[cfg(any(test, fuzzing))]
@@ -595,6 +604,7 @@ impl SharedLines {
                 partial_tail_finalized: false,
             }),
             notify: Notify::new(),
+            generation: AtomicUsize::new(0),
             count: AtomicUsize::new(0),
             dropped: AtomicUsize::new(0),
             read_error: Mutex::new(None),
@@ -614,9 +624,7 @@ impl SharedLines {
         if policy_dropped {
             self.dropped.fetch_add(1, Ordering::Relaxed);
         }
-        // `notify_one` stores a permit if no consumer is waiting yet, so a
-        // streaming consumer that registers just after this can't miss it.
-        self.notify.notify_one();
+        self.publish_change();
     }
 
     /// The locked half of [`push`](Self::push): supersede the published partial
@@ -739,7 +747,7 @@ impl SharedLines {
         if policy_dropped {
             self.dropped.fetch_add(1, Ordering::Relaxed);
         }
-        self.notify.notify_one();
+        self.publish_change();
     }
 
     /// The locked half of
@@ -781,7 +789,7 @@ impl SharedLines {
             .lock()
             .unwrap_or_else(|poisoned| poisoned.into_inner())
             .closed = true;
-        self.notify.notify_one();
+        self.publish_change();
     }
 
     /// Mark the buffer finished without a pump (e.g. a second `stdout_lines`
@@ -878,10 +886,7 @@ impl SharedLines {
         inner.partial_tail_finalized = false;
         if changed {
             drop(inner);
-            // A tail update is a buffer change like a `push`: wake a parked
-            // `wait_for_output` (the stored permit covers a waiter that registers
-            // just after this).
-            self.notify.notify_one();
+            self.publish_change();
         }
     }
 
@@ -961,7 +966,7 @@ impl SharedLines {
             self.dropped.fetch_add(1, Ordering::Relaxed);
         }
         if salvaged {
-            self.notify.notify_one();
+            self.publish_change();
         }
         lines
     }
@@ -983,14 +988,15 @@ impl SharedLines {
     /// user predicate) and whether the pump has closed. `None` tail means there
     /// is no live partial line right now (the last content ended on a line
     /// boundary). Backs [`wait_for_output`](crate::RunningProcess::wait_for_output).
-    pub(crate) fn partial_tail_snapshot(&self) -> (Option<String>, bool) {
+    pub(crate) fn partial_tail_snapshot(&self) -> (Option<String>, bool, ChangeToken) {
         let inner = self.inner.lock().expect("SharedLines poisoned");
         let tail = if inner.partial_tail.is_empty() {
             None
         } else {
             Some(inner.partial_tail.clone())
         };
-        (tail, inner.closed)
+        let generation = ChangeToken(self.generation.load(Ordering::Acquire));
+        (tail, inner.closed, generation)
     }
 
     /// Lines discarded by the buffer policy (DropOldest/DropNewest/Error), not
@@ -1059,14 +1065,34 @@ impl SharedLines {
         } else if inner.closed {
             Popped::Closed
         } else {
-            Popped::Empty
+            let generation = ChangeToken(self.generation.load(Ordering::Acquire));
+            Popped::Empty(generation)
         }
     }
 
-    /// Await the next buffer change (a push or close). Owns the `Arc` so the
-    /// returned future is `'static` and can be boxed by the `Stream` impl.
-    pub(crate) async fn changed(self: Arc<Self>) {
-        self.notify.notified().await;
+    /// Publish one completed state transition to every currently parked
+    /// observer. The generation is advanced before broadcasting so an observer
+    /// that has not registered yet still detects the transition.
+    fn publish_change(&self) {
+        self.generation.fetch_add(1, Ordering::Release);
+        self.notify.notify_waiters();
+    }
+
+    /// Await a buffer change after `observed`. Owns the `Arc` so the returned
+    /// future is `'static` and can be boxed by the `Stream` impl.
+    ///
+    /// Registering before the acquire load closes the other half of the race: a
+    /// publication either advances the generation that this check sees or wakes
+    /// the already-enabled waiter. `notify_waiters` then wakes every observer of
+    /// the same sink rather than arbitrarily selecting one.
+    pub(crate) async fn changed(self: Arc<Self>, observed: ChangeToken) {
+        let notified = self.notify.notified();
+        tokio::pin!(notified);
+        notified.as_mut().enable();
+        if self.generation.load(Ordering::Acquire) != observed.0 {
+            return;
+        }
+        notified.await;
     }
 }
 
@@ -2011,7 +2037,7 @@ mod tests {
             with_tail.clone(),
         )
         .await;
-        let (tail, closed) = with_tail.partial_tail_snapshot();
+        let (tail, closed, _) = with_tail.partial_tail_snapshot();
         assert_eq!(tail.as_deref(), Some("Password: "));
         assert!(closed, "the pump closed at EOF");
         // The tail is a side view: at EOF the same un-terminated content is ALSO
@@ -2022,7 +2048,7 @@ mod tests {
         // A stream ending on a terminator has no live tail.
         let no_tail = SharedLines::new(&OutputBufferPolicy::unbounded());
         pump_lines(&b"done\n"[..], encoding_rs::UTF_8, None, no_tail.clone()).await;
-        let (tail, _) = no_tail.partial_tail_snapshot();
+        let (tail, _, _) = no_tail.partial_tail_snapshot();
         assert_eq!(
             tail, None,
             "content ending on a newline leaves no partial tail"
@@ -2041,8 +2067,28 @@ mod tests {
         assert_eq!(sink.seen_bytes(), raw.len(), "raw byte count is unchanged");
         assert_eq!(sink.count(), 3, "two lines plus the finalized tail line");
         assert_eq!(sink.dropped(), 0, "nothing was dropped");
-        let (tail, _) = sink.partial_tail_snapshot();
+        let (tail, _, _) = sink.partial_tail_snapshot();
         assert_eq!(tail.as_deref(), Some("tail-without-newline"));
+    }
+
+    /// `notify_waiters` deliberately stores no permit when nobody is registered.
+    /// A consumer that inspected state just before a publication must therefore
+    /// complete from the generation check even if it constructs and polls its
+    /// wait future only after the broadcast has already happened.
+    #[test]
+    fn changed_detects_a_publication_before_waiter_registration() {
+        use std::future::Future as _;
+
+        let sink = SharedLines::new(&OutputBufferPolicy::unbounded());
+        let (_, _, observed) = sink.partial_tail_snapshot();
+        sink.set_partial_tail("prompt> ");
+
+        let mut changed = Box::pin(sink.clone().changed(observed));
+        let mut cx = std::task::Context::from_waker(std::task::Waker::noop());
+        assert!(
+            changed.as_mut().poll(&mut cx).is_ready(),
+            "the generation advance must cover the pre-registration window"
+        );
     }
 
     /// A completed line and the pump's replacement tail are published under two
