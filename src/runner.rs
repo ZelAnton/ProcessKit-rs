@@ -736,6 +736,13 @@ impl ProcessRunner for ProcessGroup {
 pub(crate) fn take_stdin_for_run(
     command: &Command,
 ) -> Result<Option<crate::stdin::StdinReservation>> {
+    // PTY stdio compatibility is part of the same shared pre-child launch
+    // boundary as stdin reservation. Live, scripted, dry-run, and cassette
+    // record paths all route through here, so none can silently accept a
+    // destination the real single-master transport cannot honor.
+    #[cfg(feature = "pty")]
+    command.ensure_pty_stdio_compatible()?;
+
     if command.inherits_stdin() {
         // `inherit_stdin` hands the child the parent's own stdin fd, so the crate
         // neither drives nor closes stdin. That is a contradiction with either way

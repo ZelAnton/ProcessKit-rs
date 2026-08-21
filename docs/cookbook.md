@@ -492,8 +492,10 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
 Also remember that a PTY has no independent stderr channel. Both child file
 descriptors arrive through `stdout_lines`/`on_stdout_line`;
 `on_stderr_line` is not delivered, `stderr_tee` has nothing to write, and the
-finished result's stderr is empty. If stream identity matters, use ordinary
-pipes instead of PTY.
+finished result's stderr is empty. Keep both destinations `StdioMode::Piped`:
+PTY mode rejects `Inherit`, `Null`, and file redirects for either output
+descriptor before spawn. If stream identity or another destination matters, use
+ordinary pipes instead of PTY.
 
 *Fine print: [Streaming → interactive stdin](streaming.md#interactive-stdin) ·
 [Running commands → interactive auth / TTY](commands.md#privileges-and-spawn-flags).*

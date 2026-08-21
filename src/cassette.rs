@@ -1563,6 +1563,8 @@ fn replay_slots_from_text(text: &str) -> Result<HashMap<Key, ReplaySlot>> {
 #[async_trait::async_trait]
 impl<R: ProcessRunner> ProcessRunner for RecordReplayRunner<R> {
     async fn output_string(&self, command: &Command) -> Result<ProcessResult<String>> {
+        #[cfg(feature = "pty")]
+        command.ensure_pty_stdio_compatible()?;
         reject_unrecordable_stdin(command)?;
         match &self.mode {
             Mode::Record {
@@ -1688,6 +1690,8 @@ impl<R: ProcessRunner> ProcessRunner for RecordReplayRunner<R> {
     }
 
     async fn start(&self, command: &Command) -> Result<crate::RunningProcess> {
+        #[cfg(feature = "pty")]
+        command.ensure_pty_stdio_compatible()?;
         reject_unrecordable_stdin(command)?;
         match &self.mode {
             Mode::Record {

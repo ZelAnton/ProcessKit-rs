@@ -19,6 +19,12 @@ to a dated version section.
 
 ### Fixed
 
+- Reject `use_pty()` combined with stdout/stderr `Inherit`, `Null`, or file
+  redirects before opening a redirect file or spawning the child. PTY output is
+  now explicitly limited to its one supported destination — the merged master
+  exposed as piped logical stdout — instead of letting `build_tokio` create or
+  truncate an unused file, or marking inherited/null stdout as non-piped while
+  an internal pump silently drained the actual terminal output.
 - Prevent explicit process shutdown from re-arming the inactivity watchdog after
   teardown has begun while preserving a timeout outcome that already won.
 - Propagate Windows ToolHelp thread-enumeration cursor failures instead of

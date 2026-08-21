@@ -152,8 +152,10 @@ Separate transport from the child's own buffering:
   unbuffered/line-buffered switch when available. If its behavior is genuinely
   `isatty()`-gated, enable the `pty` feature and use `use_pty()`.
 - `StdioMode::Inherit`, `Null`, and `stdout_file*` intentionally bypass the
-  capture pump. A PTY instead merges stdout and stderr into logical stdout, so
-  its separate stderr capture is empty.
+  capture pump in ordinary pipe mode. A PTY instead exposes its merged stdout
+  and stderr only as piped logical stdout, so combining `use_pty` with those
+  destinations (or a separate stderr destination) is rejected before spawn;
+  its separate stderr capture is empty on a supported PTY run.
 
 PTY is a semantic change, not just a flushing switch: it merges streams, uses
 terminal line framing, and may add control sequences. Keep pipes when stream

@@ -1,18 +1,19 @@
 //! Real pseudo-terminal (`Command::use_pty`) integration tests.
 //!
-//! Like the rest of this binary they spawn actual child processes (here under a
-//! real `openpty` / ConPTY pseudo-terminal) and are `#[ignore]`d to keep
-//! `cargo test` hermetic; run them with:
+//! Most tests spawn actual child processes (here under a real `openpty` / ConPTY
+//! pseudo-terminal) and are `#[ignore]`d to keep `cargo test` hermetic; run them
+//! with:
 //!
 //! ```text
 //! cargo test --all-features -- --ignored
 //! ```
 //!
 //! The whole module is gated on the `pty` feature (via the `mod` declaration in
-//! `main.rs`). These prove the four things a PTY run must get right: the child
-//! sees a terminal (`isatty`), a prompt/response round-trips over the single
-//! master, terminal echo is disabled for secret entry (Unix), and the PTY child
-//! stays contained so kill-on-drop reaps it.
+//! `main.rs`). The pre-spawn destination-contract test remains hermetic and runs
+//! normally. Together these prove that invalid destinations have no file/child
+//! side effect, the child sees a terminal (`isatty`), a prompt/response
+//! round-trips over the single master, terminal echo is disabled for secret entry
+//! (Unix), and the PTY child stays contained so kill-on-drop reaps it.
 
 use std::time::Duration;
 
@@ -20,7 +21,7 @@ use std::time::Duration;
 use processkit::Stdin;
 #[cfg(windows)]
 use processkit::wait_any;
-use processkit::{Command, JobRunner, ProcessRunner};
+use processkit::{Command, ErrorReason, JobRunner, ProcessRunner, StdioMode};
 
 use crate::common::{completes_within, poll_until};
 
@@ -110,6 +111,79 @@ fn pid_alive(pid: u32) -> bool {
 #[cfg(windows)]
 fn pid_alive(pid: u32) -> bool {
     crate::common::windows_pid_alive(pid)
+}
+
+fn assert_unsupported_destination(error: processkit::Error, expected: &str) {
+    match error.into_reason() {
+        ErrorReason::Unsupported { operation } => assert_eq!(operation, expected),
+        other => panic!("expected Unsupported, got {other:?}"),
+    }
+}
+
+#[tokio::test]
+async fn pty_destinations_are_rejected_before_program_resolution_or_file_side_effects() {
+    let dir = tempfile::tempdir().expect("temp dir");
+    let stdout_truncate = dir.path().join("stdout-truncate.log");
+    let stdout_append = dir.path().join("stdout-append.log");
+    let stderr_truncate = dir.path().join("stderr-truncate.log");
+    let stderr_append = dir.path().join("stderr-append.log");
+    std::fs::write(&stdout_truncate, "stdout sentinel").expect("seed stdout sentinel");
+    std::fs::write(&stderr_truncate, "stderr sentinel").expect("seed stderr sentinel");
+
+    let base = Command::new("__processkit_pty_destination_must_fail_before_resolution__").use_pty();
+    let cases = [
+        (
+            base.clone().stdout(StdioMode::Inherit),
+            "use_pty with a non-piped stdout destination",
+        ),
+        (
+            base.clone().stdout(StdioMode::Null),
+            "use_pty with a non-piped stdout destination",
+        ),
+        (
+            base.clone().stdout_file(&stdout_truncate),
+            "use_pty with a non-piped stdout destination",
+        ),
+        (
+            base.clone().stdout_file_append(&stdout_append),
+            "use_pty with a non-piped stdout destination",
+        ),
+        (
+            base.clone().stderr(StdioMode::Inherit),
+            "use_pty with a separate stderr destination",
+        ),
+        (
+            base.clone().stderr(StdioMode::Null),
+            "use_pty with a separate stderr destination",
+        ),
+        (
+            base.clone().stderr_file(&stderr_truncate),
+            "use_pty with a separate stderr destination",
+        ),
+        (
+            base.stderr_file_append(&stderr_append),
+            "use_pty with a separate stderr destination",
+        ),
+    ];
+
+    for (command, expected) in cases {
+        let error = command
+            .start()
+            .await
+            .expect_err("an incompatible PTY destination must fail before spawn");
+        assert_unsupported_destination(error, expected);
+    }
+
+    assert_eq!(
+        std::fs::read_to_string(stdout_truncate).expect("read stdout sentinel"),
+        "stdout sentinel"
+    );
+    assert_eq!(
+        std::fs::read_to_string(stderr_truncate).expect("read stderr sentinel"),
+        "stderr sentinel"
+    );
+    assert!(!stdout_append.exists(), "append target must not be created");
+    assert!(!stderr_append.exists(), "append target must not be created");
 }
 
 #[tokio::test]

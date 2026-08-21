@@ -659,7 +659,11 @@ Two ways to satisfy them:
   not a terminal emulator, with four things to know:
   - **stdout and stderr are merged** onto the one master, so in this mode the
     `on_stderr_line` / `stderr_tee` split collapses and
-    `ProcessResult::stderr` is empty — the whole output arrives where stdout does.
+    `ProcessResult::stderr` is empty — the whole output arrives through piped
+    logical stdout. Both destinations must remain `StdioMode::Piped`: stdout or
+    stderr `Inherit`/`Null` and `*_file*` redirects are rejected before a file is
+    opened or a child is spawned, because the merged terminal cannot honor a
+    separate per-descriptor destination.
   - Interactive input runs over the same master
     (`keep_stdin_open` + `take_stdin`); on **Unix** terminal **echo is disabled**
     so a written password is not echoed back into the merged output (the ConPTY

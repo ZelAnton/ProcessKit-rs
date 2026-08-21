@@ -341,7 +341,7 @@ launches the child under a real pseudo-terminal instead of three pipes, so an
 | | Unix | Windows |
 |---|---|---|
 | Mechanism | `openpty` — the pty slave becomes the child's stdio, spawned through the **same** cgroup/process-group containment path as any other run | `CreatePseudoConsole` (ConPTY) — the child is created suspended, `AssignProcessToJobObject`'d to the **same** Job Object, then resumed |
-| stdout/stderr | **merged** onto the single master (the `on_stderr_line`/`stderr_tee` split collapses; `ProcessResult::stderr` is empty) | **merged**, same |
+| stdout/stderr | **merged** onto one piped logical-stdout master (`ProcessResult::stderr` is empty); `Inherit`/`Null`/file destinations on either descriptor are rejected before file open or spawn | **merged**, same destination contract and pre-spawn rejection |
 | Echo control | terminal **echo disabled** (termios) so a written secret is not echoed back into the merged output | ConPTY has no portable per-write echo control — echo behavior is host-managed (not disabled) |
 | Window size | `winsize` passed to `openpty`, default 80×24; set with [`Command::pty_size(cols, rows)`](https://docs.rs/processkit/latest/processkit/struct.Command.html#method.pty_size) | `COORD` passed to `CreatePseudoConsole`, default 80×24; same builder |
 | Terminal environment | `TERM=xterm-256color`; `COLUMNS`/`LINES` match the initial window size | `COLUMNS`/`LINES` match the initial window size; no synthetic `TERM` because ConPTY exposes VT handling through Windows console APIs |

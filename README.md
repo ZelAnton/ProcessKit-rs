@@ -98,8 +98,10 @@ direct child.
   `Command::use_pty()` for a child that requires a controlling terminal:
   `openpty` on Unix, `CreatePseudoConsole` (ConPTY) on Windows. Initial and live
   window sizing use `pty_size` / `resize_pty`; output is the terminal's merged
-  stdout/stderr stream, while the existing job/cgroup/process-group containment
-  and kill-on-drop guarantee remain unchanged. Start with the
+  stdout/stderr stream exposed as piped logical stdout (alternate stdio/file
+  destinations are rejected before spawn), while the existing
+  job/cgroup/process-group containment and kill-on-drop guarantee remain
+  unchanged. Start with the
   [PTY dialog guide](docs/streaming.md#pty-dialog-wait-for-a-prompt-then-answer)
   and check the [platform matrix](docs/platform-support.md#pty-mode-use_pty-the-pty-feature).
 - **Smaller, decomposed errors.** `Error` is now a pointer-sized wrapper around
