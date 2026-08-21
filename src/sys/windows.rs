@@ -2927,8 +2927,10 @@ mod toolhelp_iteration_error_tests {
         let _injected = inject_process_snapshot_error(ERROR_ACCESS_DENIED as i32);
         let pid = unsafe { GetCurrentProcessId() };
 
-        let error = crate::sys::process_info(pid)
-            .expect_err("process_info must preserve a process snapshot failure");
+        let error = crate::Error::io(
+            crate::sys::process_info(pid)
+                .expect_err("process_info must preserve a process snapshot failure"),
+        );
         assert_public_io_error(error, ERROR_ACCESS_DENIED as i32);
     }
 }
