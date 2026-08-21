@@ -461,6 +461,20 @@ impl Pipeline {
             if let Some(reader) = upstream.take() {
                 command.set_pipe_stdin(reader);
             }
+            // A stage-local token stays configured on the command so it remains
+            // an independent live trigger. That means the runner cannot see the
+            // chain token on this path, so enforce the chain's terminal contract
+            // here before *every* sequential spawn (including the first one).
+            if self
+                .cancel_token
+                .as_ref()
+                .is_some_and(tokio_util::sync::CancellationToken::is_cancelled)
+            {
+                return Err(crate::ErrorReason::Cancelled {
+                    program: command.program().to_string_lossy().into_owned(),
+                }
+                .into());
+            }
             #[cfg(test)]
             if let Some(runner) = &self.test_runner {
                 let mut process = runner.start(&command).await?;
@@ -2137,6 +2151,15 @@ mod tests {
         let runner = Arc::new(
             crate::doubles::ScriptedRunner::new().fallback(crate::doubles::Reply::pending()),
         );
+        pipeline_with_distinct_tokens(first_token, second_token, chain_token, runner)
+    }
+
+    fn pipeline_with_distinct_tokens(
+        first_token: tokio_util::sync::CancellationToken,
+        second_token: tokio_util::sync::CancellationToken,
+        chain_token: tokio_util::sync::CancellationToken,
+        runner: Arc<dyn crate::runner::ProcessRunner>,
+    ) -> Pipeline {
         Command::new("producer")
             .cancel_on(first_token)
             .pipe(Command::new("consumer").cancel_on(second_token))
@@ -2185,6 +2208,118 @@ mod tests {
             .expect("chain cancellation must bound the hermetic live session")
             .expect_err("the chain token must cancel every explicitly-tokened stage");
         assert!(matches!(err.reason(), crate::ErrorReason::Cancelled { .. }));
+        assert!(!first_token.is_cancelled() && !second_token.is_cancelled());
+    }
+
+    #[tokio::test]
+    async fn capture_precancelled_chain_does_not_launch_an_explicitly_tokened_stage() {
+        let first_token = tokio_util::sync::CancellationToken::new();
+        let second_token = tokio_util::sync::CancellationToken::new();
+        let chain_token = tokio_util::sync::CancellationToken::new();
+        chain_token.cancel();
+        let runner = Arc::new(crate::doubles::RecordingRunner::new(
+            crate::doubles::ScriptedRunner::new().fallback(crate::doubles::Reply::not_found()),
+        ));
+        let pipeline = pipeline_with_distinct_tokens(
+            first_token.clone(),
+            second_token.clone(),
+            chain_token,
+            runner.clone(),
+        );
+
+        let err = pipeline
+            .output_string()
+            .await
+            .expect_err("a pre-cancelled chain must short-circuit capture");
+        assert!(
+            matches!(
+                err.reason(),
+                crate::ErrorReason::Cancelled { program } if program == "producer"
+            ),
+            "the chain cancellation must win before the first scripted spawn: {err:?}"
+        );
+        assert!(
+            runner.calls().is_empty(),
+            "capture must not ask the runner to spawn any stage"
+        );
+        assert!(!first_token.is_cancelled() && !second_token.is_cancelled());
+    }
+
+    #[tokio::test]
+    async fn start_precancelled_chain_does_not_launch_an_explicitly_tokened_stage() {
+        let first_token = tokio_util::sync::CancellationToken::new();
+        let second_token = tokio_util::sync::CancellationToken::new();
+        let chain_token = tokio_util::sync::CancellationToken::new();
+        chain_token.cancel();
+        let runner = Arc::new(crate::doubles::RecordingRunner::new(
+            crate::doubles::ScriptedRunner::new().fallback(crate::doubles::Reply::not_found()),
+        ));
+        let pipeline = pipeline_with_distinct_tokens(
+            first_token.clone(),
+            second_token.clone(),
+            chain_token,
+            runner.clone(),
+        );
+
+        let err = pipeline
+            .start()
+            .await
+            .expect_err("a pre-cancelled chain must short-circuit session start");
+        assert!(
+            matches!(
+                err.reason(),
+                crate::ErrorReason::Cancelled { program } if program == "producer"
+            ),
+            "the chain cancellation must win before the first scripted spawn: {err:?}"
+        );
+        assert!(
+            runner.calls().is_empty(),
+            "start must not ask the runner to spawn any stage"
+        );
+        assert!(!first_token.is_cancelled() && !second_token.is_cancelled());
+    }
+
+    #[tokio::test]
+    async fn cancellation_between_launches_prevents_the_next_explicitly_tokened_stage() {
+        let first_token = tokio_util::sync::CancellationToken::new();
+        let second_token = tokio_util::sync::CancellationToken::new();
+        let chain_token = tokio_util::sync::CancellationToken::new();
+        let cancel_during_first_launch = chain_token.clone();
+        let scripted = crate::doubles::ScriptedRunner::new()
+            .when(
+                move |command| {
+                    if command.program() == std::ffi::OsStr::new("producer") {
+                        cancel_during_first_launch.cancel();
+                        true
+                    } else {
+                        false
+                    }
+                },
+                crate::doubles::Reply::pending(),
+            )
+            .on(["consumer"], crate::doubles::Reply::not_found());
+        let runner = Arc::new(crate::doubles::RecordingRunner::new(scripted));
+        let pipeline = pipeline_with_distinct_tokens(
+            first_token.clone(),
+            second_token.clone(),
+            chain_token,
+            runner.clone(),
+        );
+
+        let err = pipeline
+            .output_string()
+            .await
+            .expect_err("cancelling after stage one must stop before stage two");
+        assert!(
+            matches!(
+                err.reason(),
+                crate::ErrorReason::Cancelled { program } if program == "consumer"
+            ),
+            "the chain cancellation must beat the second stage's NotFound: {err:?}"
+        );
+        let calls = runner.calls();
+        assert_eq!(calls.len(), 1, "only the first stage may reach the runner");
+        assert_eq!(calls[0].program, std::ffi::OsStr::new("producer"));
         assert!(!first_token.is_cancelled() && !second_token.is_cancelled());
     }
 
