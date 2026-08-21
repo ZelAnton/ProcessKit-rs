@@ -853,6 +853,38 @@ async fn pipeline_cancel_on_tears_the_whole_chain_down() {
 }
 
 #[tokio::test]
+#[ignore = "spawns a real long-running pipeline whose stages have distinct cancellation tokens"]
+async fn pipeline_cancel_on_remains_chain_wide_with_distinct_stage_tokens() {
+    use tokio_util::sync::CancellationToken;
+
+    let producer_token = CancellationToken::new();
+    let consumer_token = CancellationToken::new();
+    let chain_token = CancellationToken::new();
+    let chain = endless_yes()
+        .cancel_on(producer_token.clone())
+        .unchecked_in_pipe()
+        .pipe(sleep_secs(30).cancel_on(consumer_token.clone()))
+        .cancel_on(chain_token.clone());
+
+    let run = tokio::spawn(async move { chain.output_string().await });
+    tokio::time::sleep(Duration::from_millis(300)).await;
+    chain_token.cancel();
+
+    let err = completes_within(Duration::from_secs(15), "the chain-wide cancellation", run)
+        .await
+        .expect("capture task")
+        .expect_err("the pipeline token must cancel stages that own distinct tokens");
+    assert!(
+        matches!(err.reason(), processkit::ErrorReason::Cancelled { .. }),
+        "expected Cancelled, got {err:?}"
+    );
+    assert!(
+        !producer_token.is_cancelled() && !consumer_token.is_cancelled(),
+        "chain cancellation must not fire either stage-owned token"
+    );
+}
+
+#[tokio::test]
 #[ignore = "spawns a real pipeline fed from a string stdin"]
 async fn pipeline_honors_first_stage_stdin() {
     let result = sort_stage()
@@ -1734,6 +1766,40 @@ async fn pipeline_start_cancel_ends_the_live_chain() {
         start.elapsed() < Duration::from_secs(15),
         "cancellation must be prompt, took {:?}",
         start.elapsed()
+    );
+}
+
+#[tokio::test]
+#[ignore = "spawns a real live chain whose stages have distinct cancellation tokens"]
+async fn pipeline_session_cancel_on_remains_chain_wide_with_distinct_stage_tokens() {
+    use tokio_util::sync::CancellationToken;
+
+    let producer_token = CancellationToken::new();
+    let consumer_token = CancellationToken::new();
+    let chain_token = CancellationToken::new();
+    let session = sleep_secs(30)
+        .cancel_on(producer_token.clone())
+        .pipe(sleep_secs(30).cancel_on(consumer_token.clone()))
+        .cancel_on(chain_token.clone())
+        .start()
+        .await
+        .expect("start the live chain");
+
+    chain_token.cancel();
+    let err = completes_within(
+        Duration::from_secs(15),
+        "finishing the chain-wide-cancelled live session",
+        session.finish(),
+    )
+    .await
+    .expect_err("the pipeline token must cancel stages that own distinct tokens");
+    assert!(
+        matches!(err.reason(), processkit::ErrorReason::Cancelled { .. }),
+        "expected Cancelled, got {err:?}"
+    );
+    assert!(
+        !producer_token.is_cancelled() && !consumer_token.is_cancelled(),
+        "chain cancellation must not fire either stage-owned token"
     );
 }
 
