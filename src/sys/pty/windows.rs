@@ -10,6 +10,7 @@
 //! child's whole tree exactly as for a pipe-spawned run.
 
 use std::ffi::{OsStr, OsString};
+use std::future::Future;
 use std::io;
 use std::os::windows::ffi::OsStrExt;
 use std::os::windows::io::FromRawHandle;
@@ -176,7 +177,7 @@ pub(crate) struct PtyChild {
     hpc: HPCON,
     /// Keeps the ConPTY host-input pipe open independently of the public writer.
     /// Closing that pipe asks conhost to close the console; it is not child EOF.
-    input_keepalive: Option<tokio::sync::mpsc::UnboundedSender<Vec<u8>>>,
+    input_keepalive: Option<tokio::sync::mpsc::Sender<WriterCommand>>,
     /// Set once the pseudoconsole has been closed, so it is closed exactly once
     /// (by the reap that ends the run, or by `Drop`) and never double-closed.
     hpc_closed: bool,
@@ -1022,7 +1023,7 @@ struct PendingReader {
 
 struct PendingWriter {
     writer: Option<ChannelWriter>,
-    keepalive: Option<tokio::sync::mpsc::UnboundedSender<Vec<u8>>>,
+    keepalive: Option<tokio::sync::mpsc::Sender<WriterCommand>>,
     thread: Option<JoinHandle<()>>,
 }
 
@@ -1083,8 +1084,109 @@ enum ReaderMessage {
     Error(io::Error),
 }
 
+/// No accepted command owns more than this many caller bytes. Together with the
+/// bounded command depth this is the bridge's explicit queued-byte ceiling.
+const WRITER_CHUNK_BYTES: usize = 8 * 1024;
+const WRITER_QUEUE_DEPTH: usize = 8;
+const CONPTY_EOF: &[u8] = &[0x1a, b'\r'];
+
+#[derive(Clone)]
+struct WriterFailure {
+    kind: io::ErrorKind,
+    raw_os_error: Option<i32>,
+    message: String,
+}
+
+impl WriterFailure {
+    fn capture(error: io::Error) -> Self {
+        Self {
+            kind: error.kind(),
+            raw_os_error: error.raw_os_error(),
+            message: error.to_string(),
+        }
+    }
+
+    fn into_io_error(self) -> io::Error {
+        match self.raw_os_error {
+            Some(code) => io::Error::from_raw_os_error(code),
+            None => io::Error::new(self.kind, self.message),
+        }
+    }
+}
+
+#[derive(Default)]
+struct WriterShared {
+    first_failure: std::sync::Mutex<Option<WriterFailure>>,
+}
+
+impl WriterShared {
+    fn record_failure(&self, failure: WriterFailure) -> WriterFailure {
+        let mut first = self
+            .first_failure
+            .lock()
+            .expect("pty writer failure mutex poisoned");
+        if let Some(existing) = first.as_ref() {
+            return existing.clone();
+        }
+        *first = Some(failure.clone());
+        failure
+    }
+
+    fn failure(&self) -> Option<io::Error> {
+        self.first_failure
+            .lock()
+            .expect("pty writer failure mutex poisoned")
+            .clone()
+            .map(WriterFailure::into_io_error)
+    }
+}
+
+enum WriterCommand {
+    Write(Vec<u8>),
+    Flush(tokio::sync::oneshot::Sender<Result<(), WriterFailure>>),
+    Shutdown(Option<tokio::sync::oneshot::Sender<Result<(), WriterFailure>>>),
+}
+
+/// Run the synchronous half of the writer bridge. Commands are processed FIFO,
+/// so a control acknowledgement proves every earlier accepted chunk reached the
+/// OS writer. The first failure is published before the receiver closes, letting
+/// an async operation distinguish it from an ordinary closed session.
+fn writer_bridge_loop<W>(
+    mut writer: W,
+    mut rx: tokio::sync::mpsc::Receiver<WriterCommand>,
+    shared: Arc<WriterShared>,
+) where
+    W: std::io::Write,
+{
+    while let Some(command) = rx.blocking_recv() {
+        let (result, response) = match command {
+            WriterCommand::Write(chunk) => (writer.write_all(&chunk), None),
+            WriterCommand::Flush(response) => (writer.flush(), Some(response)),
+            WriterCommand::Shutdown(response) => (
+                writer.write_all(CONPTY_EOF).and_then(|()| writer.flush()),
+                response,
+            ),
+        };
+
+        match result {
+            Ok(()) => {
+                if let Some(response) = response {
+                    let _ = response.send(Ok(()));
+                }
+            }
+            Err(error) => {
+                let failure = shared.record_failure(WriterFailure::capture(error));
+                if let Some(response) = response {
+                    let _ = response.send(Err(failure));
+                }
+                break;
+            }
+        }
+    }
+}
+
 /// Bridge a synchronous write pipe to async: a dedicated OS thread blocking-writes
-/// each chunk received over an unbounded channel.
+/// fixed-size chunks received over a bounded channel.
 ///
 /// The returned sender clone is owned by [`PtyChild`] for the session lifetime.
 /// ConPTY treats a closed host-input pipe as a request to close the pseudoconsole,
@@ -1093,26 +1195,32 @@ fn bridge_writer<F>(handle: SendHandle, spawn_thread: &mut F) -> io::Result<Pend
 where
     F: FnMut(&'static str, BridgeTask) -> io::Result<JoinHandle<()>>,
 {
-    let (tx, mut rx) = tokio::sync::mpsc::unbounded_channel::<Vec<u8>>();
+    // SAFETY: the handle has one owner and moves into the bridge closure below;
+    // if spawning the thread fails, dropping that closure closes the `File`.
+    let file = unsafe { handle.into_file() };
+    bridge_writer_with(file, spawn_thread)
+}
+
+fn bridge_writer_with<W, F>(writer: W, spawn_thread: &mut F) -> io::Result<PendingWriter>
+where
+    W: std::io::Write + Send + 'static,
+    F: FnMut(&'static str, BridgeTask) -> io::Result<JoinHandle<()>>,
+{
+    let (tx, rx) = tokio::sync::mpsc::channel::<WriterCommand>(WRITER_QUEUE_DEPTH);
+    let shared = Arc::new(WriterShared::default());
+    let thread_shared = Arc::clone(&shared);
     let thread = spawn_thread(
         "processkit-pty-writer",
-        Box::new(move || {
-            use std::io::Write;
-            // SAFETY: the handle is owned by this thread; the `File` closes it on drop.
-            let mut file = unsafe { handle.into_file() };
-            while let Some(chunk) = rx.blocking_recv() {
-                if file.write_all(&chunk).is_err() {
-                    break;
-                }
-                let _ = file.flush();
-            }
-        }),
+        Box::new(move || writer_bridge_loop(writer, rx, thread_shared)),
     )?;
     let keepalive = tx.clone();
     Ok(PendingWriter {
         writer: Some(ChannelWriter {
             tx,
+            shared,
+            state: std::sync::Mutex::new(WriterState::default()),
             shutdown: false,
+            shutdown_complete: false,
         }),
         keepalive: Some(keepalive),
         thread: Some(thread),
@@ -1173,63 +1281,249 @@ impl AsyncRead for ChannelReader {
     }
 }
 
-/// The async write half of the pipe bridge: hands each write to the writer
-/// thread's channel. Writes are buffered by the channel (small interactive input),
-/// so `poll_write` never blocks the runtime.
+type WriterReserveFuture = Pin<
+    Box<
+        dyn Future<Output = Option<tokio::sync::mpsc::OwnedPermit<WriterCommand>>> + Send + 'static,
+    >,
+>;
+type WriterControlFuture =
+    Pin<Box<dyn Future<Output = Result<(), WriterControlError>> + Send + 'static>>;
+
+#[derive(Clone, Copy, PartialEq, Eq)]
+enum WriterControlKind {
+    Flush,
+    Shutdown,
+}
+
+enum WriterControlError {
+    Failure(WriterFailure),
+    Closed,
+}
+
+struct PendingWriterControl {
+    kind: WriterControlKind,
+    future: WriterControlFuture,
+}
+
+#[derive(Default)]
+struct WriterState {
+    reserve: Option<WriterReserveFuture>,
+    control: Option<PendingWriterControl>,
+}
+
+fn closed_writer_error() -> io::Error {
+    io::Error::new(io::ErrorKind::BrokenPipe, "pty stdin writer closed")
+}
+
+fn writer_control_future(
+    tx: tokio::sync::mpsc::Sender<WriterCommand>,
+    kind: WriterControlKind,
+) -> WriterControlFuture {
+    Box::pin(async move {
+        let (response_tx, response_rx) = tokio::sync::oneshot::channel();
+        let command = match kind {
+            WriterControlKind::Flush => WriterCommand::Flush(response_tx),
+            WriterControlKind::Shutdown => WriterCommand::Shutdown(Some(response_tx)),
+        };
+        tx.send(command)
+            .await
+            .map_err(|_| WriterControlError::Closed)?;
+        response_rx
+            .await
+            .map_err(|_| WriterControlError::Closed)?
+            .map_err(WriterControlError::Failure)
+    })
+}
+
+fn poll_pending_writer_control(
+    state: &mut WriterState,
+    shared: &WriterShared,
+    cx: &mut Context<'_>,
+) -> Poll<io::Result<WriterControlKind>> {
+    let pending = state
+        .control
+        .as_mut()
+        .expect("caller only polls an existing writer control command");
+    let kind = pending.kind;
+    match pending.future.as_mut().poll(cx) {
+        Poll::Pending => Poll::Pending,
+        Poll::Ready(result) => {
+            state.control = None;
+            let result = match result {
+                Ok(()) => Ok(kind),
+                Err(WriterControlError::Failure(failure)) => Err(failure.into_io_error()),
+                Err(WriterControlError::Closed) => {
+                    Err(shared.failure().unwrap_or_else(closed_writer_error))
+                }
+            };
+            Poll::Ready(result)
+        }
+    }
+}
+
+/// The async write half of the pipe bridge. A completed `poll_write` means that
+/// at most one fixed-size chunk has been accepted into the bounded bridge; FIFO
+/// control acknowledgements make flush and shutdown wait for all such chunks.
 struct ChannelWriter {
-    tx: tokio::sync::mpsc::UnboundedSender<Vec<u8>>,
+    tx: tokio::sync::mpsc::Sender<WriterCommand>,
+    shared: Arc<WriterShared>,
+    // The boxed reservation/control futures are `Send` but need not be `Sync`.
+    // An uncontended mutex preserves the `PtyWriter: Sync` trait-object contract;
+    // AsyncWrite's `&mut self` means polling still has exactly one owner.
+    state: std::sync::Mutex<WriterState>,
     shutdown: bool,
+    shutdown_complete: bool,
 }
 
 impl ChannelWriter {
-    /// Deliver the Windows console EOF gesture without closing ConPTY's host
-    /// input pipe. `Console.ReadLine` recognizes Ctrl-Z followed by Enter as EOF.
-    fn send_eof(&mut self) -> io::Result<()> {
-        if self.shutdown {
-            return Ok(());
+    fn poll_control(
+        &mut self,
+        cx: &mut Context<'_>,
+        requested: WriterControlKind,
+    ) -> Poll<io::Result<()>> {
+        if requested == WriterControlKind::Shutdown {
+            self.shutdown = true;
         }
-        self.shutdown = true;
-        self.tx
-            .send(vec![0x1a, b'\r'])
-            .map_err(|_| io::Error::new(io::ErrorKind::BrokenPipe, "pty stdin writer closed"))
+
+        if let Some(error) = self.shared.failure() {
+            return Poll::Ready(Err(error));
+        }
+        if requested == WriterControlKind::Shutdown && self.shutdown_complete {
+            return Poll::Ready(Ok(()));
+        }
+
+        let tx = self.tx.clone();
+        let state = self
+            .state
+            .get_mut()
+            .expect("pty writer state mutex poisoned");
+        // A reserved write slot carries no caller bytes yet, so abandoning a
+        // cancelled poll_write before a flush is lossless and cancellation-safe.
+        state.reserve = None;
+
+        loop {
+            if state.control.is_none() {
+                if self.shutdown && requested == WriterControlKind::Flush {
+                    return Poll::Ready(Ok(()));
+                }
+                state.control = Some(PendingWriterControl {
+                    kind: requested,
+                    future: writer_control_future(tx.clone(), requested),
+                });
+            }
+
+            match poll_pending_writer_control(state, &self.shared, cx) {
+                Poll::Pending => return Poll::Pending,
+                Poll::Ready(Err(error)) => return Poll::Ready(Err(error)),
+                Poll::Ready(Ok(completed))
+                    if completed == requested
+                        || (completed == WriterControlKind::Shutdown
+                            && requested == WriterControlKind::Flush) =>
+                {
+                    if completed == WriterControlKind::Shutdown {
+                        self.shutdown_complete = true;
+                    }
+                    return Poll::Ready(Ok(()));
+                }
+                Poll::Ready(Ok(WriterControlKind::Flush)) => {
+                    // A cancelled flush completed while shutdown took over; now
+                    // enqueue the EOF+flush command behind it.
+                }
+                Poll::Ready(Ok(WriterControlKind::Shutdown)) => {
+                    self.shutdown_complete = true;
+                    return Poll::Ready(Ok(()));
+                }
+            }
+        }
     }
 }
 
 impl AsyncWrite for ChannelWriter {
     fn poll_write(
         self: Pin<&mut Self>,
-        _cx: &mut Context<'_>,
+        cx: &mut Context<'_>,
         buf: &[u8],
     ) -> Poll<io::Result<usize>> {
-        if self.shutdown {
+        let this = self.get_mut();
+        if let Some(error) = this.shared.failure() {
+            return Poll::Ready(Err(error));
+        }
+        if this.shutdown {
             return Poll::Ready(Err(io::Error::new(
                 io::ErrorKind::BrokenPipe,
                 "pty stdin writer closed",
             )));
         }
-        match self.tx.send(buf.to_vec()) {
-            Ok(()) => Poll::Ready(Ok(buf.len())),
-            Err(_) => Poll::Ready(Err(io::Error::new(
-                io::ErrorKind::BrokenPipe,
-                "pty stdin writer closed",
-            ))),
+        if buf.is_empty() {
+            return Poll::Ready(Ok(0));
+        }
+
+        let tx = this.tx.clone();
+        let state = this
+            .state
+            .get_mut()
+            .expect("pty writer state mutex poisoned");
+        if state.control.is_some() {
+            match poll_pending_writer_control(state, &this.shared, cx) {
+                Poll::Pending => return Poll::Pending,
+                Poll::Ready(Err(error)) => return Poll::Ready(Err(error)),
+                Poll::Ready(Ok(WriterControlKind::Shutdown)) => {
+                    this.shutdown = true;
+                    this.shutdown_complete = true;
+                    return Poll::Ready(Err(closed_writer_error()));
+                }
+                Poll::Ready(Ok(WriterControlKind::Flush)) => {}
+            }
+        }
+
+        if state.reserve.is_none() {
+            state.reserve = Some(Box::pin(async move { tx.reserve_owned().await.ok() }));
+        }
+        let reservation = state
+            .reserve
+            .as_mut()
+            .expect("writer reservation was just initialized");
+        match reservation.as_mut().poll(cx) {
+            Poll::Pending => Poll::Pending,
+            Poll::Ready(Some(permit)) => {
+                state.reserve = None;
+                let accepted = buf.len().min(WRITER_CHUNK_BYTES);
+                permit.send(WriterCommand::Write(buf[..accepted].to_vec()));
+                Poll::Ready(Ok(accepted))
+            }
+            Poll::Ready(None) => {
+                state.reserve = None;
+                Poll::Ready(Err(this
+                    .shared
+                    .failure()
+                    .unwrap_or_else(closed_writer_error)))
+            }
         }
     }
 
-    fn poll_flush(self: Pin<&mut Self>, _cx: &mut Context<'_>) -> Poll<io::Result<()>> {
-        Poll::Ready(Ok(()))
+    fn poll_flush(self: Pin<&mut Self>, cx: &mut Context<'_>) -> Poll<io::Result<()>> {
+        self.get_mut().poll_control(cx, WriterControlKind::Flush)
     }
 
-    fn poll_shutdown(mut self: Pin<&mut Self>, _cx: &mut Context<'_>) -> Poll<io::Result<()>> {
-        Poll::Ready(self.send_eof())
+    fn poll_shutdown(self: Pin<&mut Self>, cx: &mut Context<'_>) -> Poll<io::Result<()>> {
+        self.get_mut().poll_control(cx, WriterControlKind::Shutdown)
     }
 }
 
 impl Drop for ChannelWriter {
     fn drop(&mut self) {
-        // Drop has no error channel; an exited child routinely closes its input
-        // before its writer is released, so a failed best-effort EOF is benign.
-        let _ = self.send_eof();
+        let state = self
+            .state
+            .get_mut()
+            .expect("pty writer state mutex poisoned");
+        state.reserve = None;
+        state.control = None;
+        if !self.shutdown {
+            // Drop has no async error channel. Reserve one bounded queue slot if
+            // immediately available; an exited or stalled child may make this
+            // best-effort EOF impossible, while `PtyChild` still owns the session.
+            let _ = self.tx.try_send(WriterCommand::Shutdown(None));
+        }
     }
 }
 
@@ -1237,6 +1531,96 @@ impl Drop for ChannelWriter {
 mod tests {
     use super::*;
     use windows_sys::Win32::Foundation::{ERROR_INVALID_HANDLE, WAIT_FAILED};
+
+    fn test_writer_bridge<W>(writer: W) -> PendingWriter
+    where
+        W: std::io::Write + Send + 'static,
+    {
+        let mut spawn_thread = |name: &'static str, task: BridgeTask| {
+            std::thread::Builder::new()
+                .name(name.to_owned())
+                .spawn(task)
+        };
+        bridge_writer_with(writer, &mut spawn_thread).expect("start test writer bridge")
+    }
+
+    async fn join_writer_bridge(thread: JoinHandle<()>) {
+        tokio::time::timeout(
+            Duration::from_secs(2),
+            tokio::task::spawn_blocking(move || thread.join()),
+        )
+        .await
+        .expect("writer bridge must stop within the join bound")
+        .expect("writer bridge join task must run")
+        .expect("writer bridge thread must not panic");
+    }
+
+    struct StallControl {
+        released: std::sync::Mutex<bool>,
+        changed: std::sync::Condvar,
+        bytes_written: std::sync::atomic::AtomicUsize,
+    }
+
+    impl StallControl {
+        fn release(&self) {
+            *self.released.lock().expect("stall gate mutex poisoned") = true;
+            self.changed.notify_all();
+        }
+    }
+
+    struct StalledWriter {
+        control: Arc<StallControl>,
+        started: Option<std::sync::mpsc::SyncSender<()>>,
+    }
+
+    impl std::io::Write for StalledWriter {
+        fn write(&mut self, buf: &[u8]) -> io::Result<usize> {
+            if let Some(started) = self.started.take() {
+                let _ = started.send(());
+            }
+            let mut released = self
+                .control
+                .released
+                .lock()
+                .expect("stall gate mutex poisoned");
+            while !*released {
+                released = self
+                    .control
+                    .changed
+                    .wait(released)
+                    .expect("stall gate mutex poisoned while waiting");
+            }
+            self.control
+                .bytes_written
+                .fetch_add(buf.len(), Ordering::Relaxed);
+            Ok(buf.len())
+        }
+
+        fn flush(&mut self) -> io::Result<()> {
+            Ok(())
+        }
+    }
+
+    struct FaultWriter {
+        write_error: Option<i32>,
+        flush_error: Option<i32>,
+    }
+
+    impl std::io::Write for FaultWriter {
+        fn write(&mut self, buf: &[u8]) -> io::Result<usize> {
+            if let Some(code) = self.write_error.take() {
+                return Err(io::Error::from_raw_os_error(code));
+            }
+            Ok(buf.len())
+        }
+
+        fn flush(&mut self) -> io::Result<()> {
+            if let Some(code) = self.flush_error.take() {
+                return Err(io::Error::from_raw_os_error(code));
+            }
+            Ok(())
+        }
+    }
 
     fn test_job() -> crate::sys::Job {
         #[cfg(feature = "limits")]
@@ -1247,6 +1631,131 @@ mod tests {
         {
             crate::sys::Job::new().expect("create test job")
         }
+    }
+
+    #[tokio::test]
+    async fn writer_bridge_bounds_queued_bytes_and_shutdown_waits_for_a_stall() {
+        use tokio::io::AsyncWriteExt;
+
+        let control = Arc::new(StallControl {
+            released: std::sync::Mutex::new(false),
+            changed: std::sync::Condvar::new(),
+            bytes_written: std::sync::atomic::AtomicUsize::new(0),
+        });
+        let (started_tx, started_rx) = std::sync::mpsc::sync_channel(1);
+        let mut pending = test_writer_bridge(StalledWriter {
+            control: Arc::clone(&control),
+            started: Some(started_tx),
+        });
+        let mut writer = pending.writer.take().expect("test async writer");
+        let keepalive = pending.keepalive.take().expect("test keepalive");
+        let thread = pending.thread.take().expect("test writer thread");
+        let chunk = vec![b'x'; WRITER_CHUNK_BYTES];
+
+        assert_eq!(
+            writer.write(&chunk).await.expect("accept first chunk"),
+            chunk.len()
+        );
+        started_rx
+            .recv_timeout(Duration::from_secs(1))
+            .expect("writer thread must enter the injected stall");
+        for _ in 0..WRITER_QUEUE_DEPTH {
+            assert_eq!(
+                writer.write(&chunk).await.expect("fill bounded queue"),
+                chunk.len()
+            );
+        }
+
+        let backpressured = tokio::time::timeout(Duration::from_millis(50), writer.write(b"y"))
+            .await
+            .is_err();
+        let shutdown_waited = tokio::time::timeout(Duration::from_millis(50), writer.shutdown())
+            .await
+            .is_err();
+
+        control.release();
+        let shutdown_result = tokio::time::timeout(Duration::from_secs(2), writer.shutdown()).await;
+        drop(writer);
+        drop(keepalive);
+        join_writer_bridge(thread).await;
+
+        assert!(
+            backpressured,
+            "one in-flight chunk plus {WRITER_QUEUE_DEPTH} queued chunks must fill the bridge"
+        );
+        assert!(shutdown_waited, "shutdown must wait behind accepted bytes");
+        shutdown_result
+            .expect("released shutdown must complete")
+            .expect("released shutdown must succeed");
+        assert_eq!(
+            control.bytes_written.load(Ordering::Relaxed),
+            (WRITER_QUEUE_DEPTH + 1) * WRITER_CHUNK_BYTES + CONPTY_EOF.len(),
+            "the timed-out reservation must not retain or later submit caller bytes"
+        );
+    }
+
+    #[tokio::test]
+    async fn writer_bridge_shutdown_surfaces_the_first_write_error_and_joins() {
+        use tokio::io::AsyncWriteExt;
+
+        const WRITE_ERROR: i32 = 1_234;
+        let mut pending = test_writer_bridge(FaultWriter {
+            write_error: Some(WRITE_ERROR),
+            flush_error: Some(4_321),
+        });
+        let mut writer = pending.writer.take().expect("test async writer");
+        let keepalive = pending.keepalive.take().expect("test keepalive");
+        let thread = pending.thread.take().expect("test writer thread");
+
+        let accepted = writer.write(b"accepted").await;
+        let failure = writer.shutdown().await;
+        drop(writer);
+        drop(keepalive);
+        join_writer_bridge(thread).await;
+
+        assert_eq!(accepted.expect("bounded bridge accepts the chunk"), 8);
+        assert_eq!(
+            failure
+                .expect_err("shutdown must observe the earlier write failure")
+                .raw_os_error(),
+            Some(WRITE_ERROR),
+            "the first write error wins over any later control operation"
+        );
+    }
+
+    #[tokio::test]
+    async fn writer_bridge_flush_error_is_exact_and_sticky() {
+        use tokio::io::AsyncWriteExt;
+
+        const FLUSH_ERROR: i32 = 2_345;
+        let mut pending = test_writer_bridge(FaultWriter {
+            write_error: None,
+            flush_error: Some(FLUSH_ERROR),
+        });
+        let mut writer = pending.writer.take().expect("test async writer");
+        let keepalive = pending.keepalive.take().expect("test keepalive");
+        let thread = pending.thread.take().expect("test writer thread");
+
+        let accepted = writer.write(b"accepted").await;
+        let flush_failure = writer.flush().await;
+        let repeated = writer.shutdown().await;
+        drop(writer);
+        drop(keepalive);
+        join_writer_bridge(thread).await;
+
+        assert_eq!(accepted.expect("bounded bridge accepts the chunk"), 8);
+        assert_eq!(
+            flush_failure
+                .expect_err("flush must surface its OS failure")
+                .raw_os_error(),
+            Some(FLUSH_ERROR)
+        );
+        assert_eq!(
+            repeated
+                .expect_err("the first writer failure remains observable")
+                .raw_os_error(),
+            Some(FLUSH_ERROR)
+        );
     }
 
     fn live_pty_spawn() -> (super::super::PtySpawn, crate::sys::Job) {
