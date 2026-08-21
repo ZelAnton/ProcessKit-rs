@@ -13,9 +13,8 @@ use tokio::process::{Child, Command};
 use windows_sys::Win32::Foundation::FILETIME;
 use windows_sys::Win32::Foundation::{CloseHandle, HANDLE, HWND, INVALID_HANDLE_VALUE, LPARAM};
 #[cfg(feature = "process-control")]
-use windows_sys::Win32::Foundation::{
-    ERROR_INVALID_PARAMETER, ERROR_MORE_DATA, ERROR_NO_MORE_FILES, GetLastError,
-};
+use windows_sys::Win32::Foundation::{ERROR_INVALID_PARAMETER, ERROR_MORE_DATA};
+use windows_sys::Win32::Foundation::{ERROR_NO_MORE_FILES, GetLastError};
 use windows_sys::Win32::System::Console::{CTRL_BREAK_EVENT, GenerateConsoleCtrlEvent};
 use windows_sys::Win32::System::Diagnostics::ToolHelp::{
     CreateToolhelp32Snapshot, TH32CS_SNAPTHREAD, THREADENTRY32, Thread32First, Thread32Next,
@@ -162,20 +161,17 @@ const EXTENDED_LIMIT_AXIS: &str = "extended-limit";
 #[cfg(feature = "limits")]
 const CPU_RATE_AXIS: &str = "cpu-rate";
 
-#[cfg(feature = "process-control")]
 #[derive(Debug, Clone, Copy)]
 struct ThreadSnapshotEntry {
     thread_id: u32,
     owner_process_id: u32,
 }
 
-#[cfg(feature = "process-control")]
 trait ThreadSnapshotCursor {
     fn next_entry(&mut self) -> io::Result<Option<ThreadSnapshotEntry>>;
 }
 
-#[cfg(feature = "process-control")]
-fn classify_thread_snapshot_false(error: u32) -> io::Result<Option<ThreadSnapshotEntry>> {
+fn classify_toolhelp_false<T>(error: u32) -> io::Result<Option<T>> {
     if error == ERROR_NO_MORE_FILES {
         Ok(None)
     } else {
@@ -183,15 +179,17 @@ fn classify_thread_snapshot_false(error: u32) -> io::Result<Option<ThreadSnapsho
     }
 }
 
+fn classify_thread_snapshot_false(error: u32) -> io::Result<Option<ThreadSnapshotEntry>> {
+    classify_toolhelp_false(error)
+}
+
 /// An owned ToolHelp snapshot cursor. Keeping the handle in this RAII wrapper
 /// makes every first/next error path close it at the same single ownership point.
-#[cfg(feature = "process-control")]
 struct ToolhelpThreadSnapshot {
     handle: HANDLE,
     first: bool,
 }
 
-#[cfg(feature = "process-control")]
 impl ToolhelpThreadSnapshot {
     fn open() -> io::Result<Self> {
         // SAFETY: TH32CS_SNAPTHREAD always snapshots all threads system-wide;
@@ -208,7 +206,6 @@ impl ToolhelpThreadSnapshot {
     }
 }
 
-#[cfg(feature = "process-control")]
 impl ThreadSnapshotCursor for ToolhelpThreadSnapshot {
     fn next_entry(&mut self) -> io::Result<Option<ThreadSnapshotEntry>> {
         let mut entry: THREADENTRY32 = unsafe { std::mem::zeroed() };
@@ -241,8 +238,99 @@ impl ThreadSnapshotCursor for ToolhelpThreadSnapshot {
     }
 }
 
-#[cfg(feature = "process-control")]
 impl Drop for ToolhelpThreadSnapshot {
+    fn drop(&mut self) {
+        // SAFETY: `handle` was returned by CreateToolhelp32Snapshot and this
+        // wrapper is its sole owner, so Drop closes it exactly once.
+        unsafe { CloseHandle(self.handle) };
+    }
+}
+
+#[cfg(feature = "process-control")]
+#[derive(Debug)]
+struct ProcessSnapshotEntry {
+    process_id: u32,
+    parent_process_id: u32,
+    executable: String,
+}
+
+#[cfg(feature = "process-control")]
+trait ProcessSnapshotCursor {
+    fn next_entry(&mut self) -> io::Result<Option<ProcessSnapshotEntry>>;
+}
+
+#[cfg(feature = "process-control")]
+fn classify_process_snapshot_false(error: u32) -> io::Result<Option<ProcessSnapshotEntry>> {
+    classify_toolhelp_false(error)
+}
+
+/// An owned process ToolHelp snapshot cursor. Keeping the handle in this RAII
+/// wrapper makes first/next failures close the snapshot exactly once.
+#[cfg(feature = "process-control")]
+struct ToolhelpProcessSnapshot {
+    handle: HANDLE,
+    first: bool,
+}
+
+#[cfg(feature = "process-control")]
+impl ToolhelpProcessSnapshot {
+    fn open() -> io::Result<Self> {
+        // SAFETY: TH32CS_SNAPPROCESS snapshots all processes system-wide;
+        // returns INVALID_HANDLE_VALUE on failure.
+        let handle = unsafe { CreateToolhelp32Snapshot(TH32CS_SNAPPROCESS, 0) };
+        if handle == INVALID_HANDLE_VALUE {
+            Err(io::Error::last_os_error())
+        } else {
+            Ok(Self {
+                handle,
+                first: true,
+            })
+        }
+    }
+}
+
+#[cfg(feature = "process-control")]
+impl ProcessSnapshotCursor for ToolhelpProcessSnapshot {
+    fn next_entry(&mut self) -> io::Result<Option<ProcessSnapshotEntry>> {
+        let mut entry: PROCESSENTRY32W = unsafe { std::mem::zeroed() };
+        entry.dwSize = std::mem::size_of::<PROCESSENTRY32W>() as u32;
+
+        // SAFETY: `handle` is a live ToolHelp snapshot and `entry` advertises
+        // the exact buffer size expected by Process32FirstW/Process32NextW.
+        let ok = unsafe {
+            if self.first {
+                self.first = false;
+                Process32FirstW(self.handle, &mut entry)
+            } else {
+                Process32NextW(self.handle, &mut entry)
+            }
+        };
+        if ok != 0 {
+            // `szExeFile` is a NUL-terminated UTF-16 array; decode up to the NUL.
+            let len = entry
+                .szExeFile
+                .iter()
+                .position(|&c| c == 0)
+                .unwrap_or(entry.szExeFile.len());
+            return Ok(Some(ProcessSnapshotEntry {
+                process_id: entry.th32ProcessID,
+                parent_process_id: entry.th32ParentProcessID,
+                executable: String::from_utf16_lossy(&entry.szExeFile[..len]),
+            }));
+        }
+
+        // GetLastError must be the first Win32 call after the FALSE result: even
+        // CloseHandle can overwrite the thread-local error slot. NO_MORE_FILES
+        // is the documented normal terminator; every other value is a failed
+        // first/next operation and must reach the metadata caller.
+        // SAFETY: GetLastError has no preconditions and reads the calling thread.
+        let error = unsafe { GetLastError() };
+        classify_process_snapshot_false(error)
+    }
+}
+
+#[cfg(feature = "process-control")]
+impl Drop for ToolhelpProcessSnapshot {
     fn drop(&mut self) {
         // SAFETY: `handle` was returned by CreateToolhelp32Snapshot and this
         // wrapper is its sole owner, so Drop closes it exactly once.
@@ -303,6 +391,31 @@ fn inject_thread_walk_error(code: i32) -> InjectedThreadWalkError {
 impl Drop for InjectedThreadWalkError {
     fn drop(&mut self) {
         INJECTED_THREAD_WALK_ERROR.with(|injected| injected.set(self.previous));
+    }
+}
+
+#[cfg(all(test, feature = "process-control"))]
+thread_local! {
+    static INJECTED_PROCESS_SNAPSHOT_ERROR: std::cell::Cell<Option<i32>> = const {
+        std::cell::Cell::new(None)
+    };
+}
+
+#[cfg(all(test, feature = "process-control"))]
+struct InjectedProcessSnapshotError {
+    previous: Option<i32>,
+}
+
+#[cfg(all(test, feature = "process-control"))]
+fn inject_process_snapshot_error(code: i32) -> InjectedProcessSnapshotError {
+    let previous = INJECTED_PROCESS_SNAPSHOT_ERROR.with(|injected| injected.replace(Some(code)));
+    InjectedProcessSnapshotError { previous }
+}
+
+#[cfg(all(test, feature = "process-control"))]
+impl Drop for InjectedProcessSnapshotError {
+    fn drop(&mut self) {
+        INJECTED_PROCESS_SNAPSHOT_ERROR.with(|injected| injected.set(self.previous));
     }
 }
 
@@ -1665,33 +1778,32 @@ fn resume_process_threads_direct(process: HANDLE) -> bool {
 /// `TH32CS_SNAPTHREAD` snapshot. See [`resume_process_threads`] for why this is
 /// no longer the first choice.
 fn resume_process_threads_via_snapshot(pid: u32) -> io::Result<()> {
-    // SAFETY: TH32CS_SNAPTHREAD always snapshots all threads system-wide (the
-    // pid argument is ignored for the thread list); returns INVALID_HANDLE_VALUE
-    // on failure.
-    let snapshot = unsafe { CreateToolhelp32Snapshot(TH32CS_SNAPTHREAD, 0) };
-    if snapshot == INVALID_HANDLE_VALUE {
-        return Err(io::Error::last_os_error());
-    }
+    let snapshot = ToolhelpThreadSnapshot::open()?;
+    resume_process_threads_via_cursor(pid, snapshot, resume_thread)
+}
 
-    let mut entry: THREADENTRY32 = unsafe { std::mem::zeroed() };
-    entry.dwSize = std::mem::size_of::<THREADENTRY32>() as u32;
-
+/// Apply the launch-path resume operation to the matching entries from a
+/// ToolHelp cursor. A cursor failure has priority over an earlier per-thread
+/// failure because it proves that some matching threads were never attempted.
+fn resume_process_threads_via_cursor<C, F>(
+    pid: u32,
+    mut cursor: C,
+    mut operation: F,
+) -> io::Result<()>
+where
+    C: ThreadSnapshotCursor,
+    F: FnMut(u32) -> io::Result<()>,
+{
     let mut resumed = 0u32;
     let mut last_err = None;
-    // SAFETY: valid snapshot; `entry` is sized via its `dwSize` field.
-    let mut ok = unsafe { Thread32First(snapshot, &mut entry) };
-    while ok != 0 {
-        if entry.th32OwnerProcessID == pid {
-            match resume_thread(entry.th32ThreadID) {
+    while let Some(entry) = cursor.next_entry()? {
+        if entry.owner_process_id == pid {
+            match operation(entry.thread_id) {
                 Ok(()) => resumed += 1,
                 Err(err) => last_err = Some(err),
             }
         }
-        // SAFETY: same valid snapshot and entry.
-        ok = unsafe { Thread32Next(snapshot, &mut entry) };
     }
-    // SAFETY: handle came from CreateToolhelp32Snapshot; closed exactly once.
-    unsafe { CloseHandle(snapshot) };
 
     if resumed == 0 {
         return Err(last_err
@@ -1903,38 +2015,31 @@ fn job_member_pids(handle: HANDLE) -> io::Result<Vec<u32>> {
 ///
 /// Best-effort, like the thread walk in [`for_each_member_thread`](Job::for_each_member_thread):
 /// a process created or reaped during the walk may be briefly present or missing.
-/// `Err` only when the snapshot itself can't be created — a genuine inability to
-/// read any metadata, which the caller surfaces rather than reporting a populated
-/// job as empty.
+/// `Err` covers an inability to create or completely enumerate the snapshot — a
+/// genuine inability to read all metadata, which the caller surfaces rather than
+/// reporting a populated job as empty.
 #[cfg(feature = "process-control")]
 fn snapshot_process_metadata() -> io::Result<std::collections::HashMap<u32, (u32, String)>> {
-    // SAFETY: TH32CS_SNAPPROCESS snapshots all processes system-wide; returns
-    // INVALID_HANDLE_VALUE on failure.
-    let snapshot = unsafe { CreateToolhelp32Snapshot(TH32CS_SNAPPROCESS, 0) };
-    if snapshot == INVALID_HANDLE_VALUE {
-        return Err(io::Error::last_os_error());
+    #[cfg(test)]
+    if let Some(code) = INJECTED_PROCESS_SNAPSHOT_ERROR.with(|injected| injected.replace(None)) {
+        return Err(io::Error::from_raw_os_error(code));
     }
 
-    let mut entry: PROCESSENTRY32W = unsafe { std::mem::zeroed() };
-    entry.dwSize = std::mem::size_of::<PROCESSENTRY32W>() as u32;
+    let snapshot = ToolhelpProcessSnapshot::open()?;
+    collect_process_metadata(snapshot)
+}
 
+#[cfg(feature = "process-control")]
+fn collect_process_metadata<C: ProcessSnapshotCursor>(
+    mut cursor: C,
+) -> io::Result<std::collections::HashMap<u32, (u32, String)>> {
     let mut map = std::collections::HashMap::new();
-    // SAFETY: valid snapshot; `entry` is sized via its `dwSize` field.
-    let mut ok = unsafe { Process32FirstW(snapshot, &mut entry) };
-    while ok != 0 {
-        // `szExeFile` is a NUL-terminated UTF-16 array; decode up to the NUL.
-        let len = entry
-            .szExeFile
-            .iter()
-            .position(|&c| c == 0)
-            .unwrap_or(entry.szExeFile.len());
-        let exe = String::from_utf16_lossy(&entry.szExeFile[..len]);
-        map.insert(entry.th32ProcessID, (entry.th32ParentProcessID, exe));
-        // SAFETY: same valid snapshot and entry.
-        ok = unsafe { Process32NextW(snapshot, &mut entry) };
+    while let Some(entry) = cursor.next_entry()? {
+        map.insert(
+            entry.process_id,
+            (entry.parent_process_id, entry.executable),
+        );
     }
-    // SAFETY: handle came from CreateToolhelp32Snapshot; closed exactly once.
-    unsafe { CloseHandle(snapshot) };
     Ok(map)
 }
 
@@ -2530,6 +2635,301 @@ mod thread_resume_tests {
         let handle = child.raw_handle().expect("the child has a handle") as HANDLE;
         super::resume_process_threads(pid, handle).expect("the contained child is resumed");
         expect_resumed(&mut child).await;
+    }
+}
+
+// ToolHelp walks normally terminate with ERROR_NO_MORE_FILES, so failure paths
+// are driven through the cursor seams rather than depending on a damaged host.
+// The public metadata tests additionally inject the cursor error at the API
+// boundary, proving that a failed snapshot is not mistaken for a vanished pid.
+#[cfg(all(test, feature = "process-control"))]
+mod toolhelp_iteration_error_tests {
+    use std::cell::Cell;
+    use std::collections::HashMap;
+    use std::rc::Rc;
+
+    use windows_sys::Win32::Foundation::{ERROR_ACCESS_DENIED, ERROR_INVALID_HANDLE};
+    use windows_sys::Win32::System::Threading::GetCurrentProcessId;
+
+    use super::{
+        ProcessSnapshotCursor, ProcessSnapshotEntry, ThreadSnapshotCursor, ThreadSnapshotEntry,
+        classify_process_snapshot_false, classify_thread_snapshot_false, collect_process_metadata,
+        inject_process_snapshot_error, resume_process_threads_via_cursor,
+    };
+    use crate::{ErrorReason, ProcessGroup};
+
+    const CHILD_PID: u32 = 41;
+    const CHILD_TID: u32 = 43;
+
+    enum ThreadStep {
+        Entry(ThreadSnapshotEntry),
+        End,
+        Error(i32),
+    }
+
+    struct ThreadCursor {
+        steps: std::vec::IntoIter<ThreadStep>,
+        closes: Rc<Cell<usize>>,
+    }
+
+    impl ThreadCursor {
+        fn new(steps: Vec<ThreadStep>, closes: Rc<Cell<usize>>) -> Self {
+            Self {
+                steps: steps.into_iter(),
+                closes,
+            }
+        }
+    }
+
+    impl ThreadSnapshotCursor for ThreadCursor {
+        fn next_entry(&mut self) -> std::io::Result<Option<ThreadSnapshotEntry>> {
+            match self.steps.next().unwrap_or(ThreadStep::End) {
+                ThreadStep::Entry(entry) => Ok(Some(entry)),
+                ThreadStep::End => Ok(None),
+                ThreadStep::Error(code) => Err(std::io::Error::from_raw_os_error(code)),
+            }
+        }
+    }
+
+    impl Drop for ThreadCursor {
+        fn drop(&mut self) {
+            self.closes.set(self.closes.get() + 1);
+        }
+    }
+
+    enum ProcessStep {
+        Entry(ProcessSnapshotEntry),
+        End,
+        Error(i32),
+    }
+
+    struct ProcessCursor {
+        steps: std::vec::IntoIter<ProcessStep>,
+        closes: Rc<Cell<usize>>,
+    }
+
+    impl ProcessCursor {
+        fn new(steps: Vec<ProcessStep>, closes: Rc<Cell<usize>>) -> Self {
+            Self {
+                steps: steps.into_iter(),
+                closes,
+            }
+        }
+    }
+
+    impl ProcessSnapshotCursor for ProcessCursor {
+        fn next_entry(&mut self) -> std::io::Result<Option<ProcessSnapshotEntry>> {
+            match self.steps.next().unwrap_or(ProcessStep::End) {
+                ProcessStep::Entry(entry) => Ok(Some(entry)),
+                ProcessStep::End => Ok(None),
+                ProcessStep::Error(code) => Err(std::io::Error::from_raw_os_error(code)),
+            }
+        }
+    }
+
+    impl Drop for ProcessCursor {
+        fn drop(&mut self) {
+            self.closes.set(self.closes.get() + 1);
+        }
+    }
+
+    fn thread_entry() -> ThreadSnapshotEntry {
+        ThreadSnapshotEntry {
+            thread_id: CHILD_TID,
+            owner_process_id: CHILD_PID,
+        }
+    }
+
+    fn process_entry() -> ProcessSnapshotEntry {
+        ProcessSnapshotEntry {
+            process_id: CHILD_PID,
+            parent_process_id: 7,
+            executable: "child.exe".to_owned(),
+        }
+    }
+
+    #[test]
+    fn process_snapshot_first_failure_is_returned_and_closes_once() {
+        let closes = Rc::new(Cell::new(0));
+        let cursor = ProcessCursor::new(
+            vec![ProcessStep::Error(ERROR_ACCESS_DENIED as i32)],
+            Rc::clone(&closes),
+        );
+
+        let error = collect_process_metadata(cursor)
+            .expect_err("Process32FirstW failure must not yield a partial map");
+
+        assert_eq!(error.raw_os_error(), Some(ERROR_ACCESS_DENIED as i32));
+        assert_eq!(closes.get(), 1, "the owned snapshot is closed exactly once");
+    }
+
+    #[test]
+    fn process_snapshot_next_failure_after_an_entry_is_returned_and_closes_once() {
+        let closes = Rc::new(Cell::new(0));
+        let cursor = ProcessCursor::new(
+            vec![
+                ProcessStep::Entry(process_entry()),
+                ProcessStep::Error(ERROR_ACCESS_DENIED as i32),
+            ],
+            Rc::clone(&closes),
+        );
+
+        let error = collect_process_metadata(cursor)
+            .expect_err("Process32NextW failure must not look like normal exhaustion");
+
+        assert_eq!(error.raw_os_error(), Some(ERROR_ACCESS_DENIED as i32));
+        assert_eq!(closes.get(), 1, "the owned snapshot is closed exactly once");
+    }
+
+    #[test]
+    fn process_snapshot_normal_exhaustion_returns_the_complete_map() {
+        let closes = Rc::new(Cell::new(0));
+        let cursor = ProcessCursor::new(
+            vec![ProcessStep::Entry(process_entry()), ProcessStep::End],
+            Rc::clone(&closes),
+        );
+
+        let map = collect_process_metadata(cursor).expect("normal ToolHelp exhaustion");
+
+        assert_eq!(
+            map,
+            HashMap::from([(CHILD_PID, (7, String::from("child.exe")))])
+        );
+        assert_eq!(closes.get(), 1, "the owned snapshot is closed exactly once");
+    }
+
+    #[test]
+    fn resume_snapshot_first_failure_is_returned_and_closes_once() {
+        let closes = Rc::new(Cell::new(0));
+        let cursor = ThreadCursor::new(
+            vec![ThreadStep::Error(ERROR_ACCESS_DENIED as i32)],
+            Rc::clone(&closes),
+        );
+
+        let error = resume_process_threads_via_cursor(CHILD_PID, cursor, |_| {
+            panic!("a failed Thread32First must not yield an entry")
+        })
+        .expect_err("Thread32First failure must reach the resume caller");
+
+        assert_eq!(error.raw_os_error(), Some(ERROR_ACCESS_DENIED as i32));
+        assert_eq!(closes.get(), 1, "the owned snapshot is closed exactly once");
+    }
+
+    #[test]
+    fn resume_snapshot_next_failure_after_an_entry_is_returned_and_closes_once() {
+        let closes = Rc::new(Cell::new(0));
+        let seen = Cell::new(0);
+        let cursor = ThreadCursor::new(
+            vec![
+                ThreadStep::Entry(thread_entry()),
+                ThreadStep::Error(ERROR_ACCESS_DENIED as i32),
+            ],
+            Rc::clone(&closes),
+        );
+
+        let error = resume_process_threads_via_cursor(CHILD_PID, cursor, |_| {
+            seen.set(seen.get() + 1);
+            Ok(())
+        })
+        .expect_err("Thread32Next failure must not look like normal exhaustion");
+
+        assert_eq!(seen.get(), 1, "the entry before the failure was attempted");
+        assert_eq!(error.raw_os_error(), Some(ERROR_ACCESS_DENIED as i32));
+        assert_eq!(closes.get(), 1, "the owned snapshot is closed exactly once");
+    }
+
+    #[test]
+    fn resume_snapshot_normal_exhaustion_resumes_the_matching_entry() {
+        let closes = Rc::new(Cell::new(0));
+        let seen = Cell::new(0);
+        let cursor = ThreadCursor::new(
+            vec![ThreadStep::Entry(thread_entry()), ThreadStep::End],
+            Rc::clone(&closes),
+        );
+
+        resume_process_threads_via_cursor(CHILD_PID, cursor, |tid| {
+            assert_eq!(tid, CHILD_TID);
+            seen.set(seen.get() + 1);
+            Ok(())
+        })
+        .expect("ERROR_NO_MORE_FILES is normal snapshot exhaustion");
+
+        assert_eq!(seen.get(), 1);
+        assert_eq!(closes.get(), 1, "the owned snapshot is closed exactly once");
+    }
+
+    #[test]
+    fn resume_snapshot_iteration_failure_has_priority_over_thread_failure() {
+        let closes = Rc::new(Cell::new(0));
+        let cursor = ThreadCursor::new(
+            vec![
+                ThreadStep::Entry(thread_entry()),
+                ThreadStep::Error(ERROR_ACCESS_DENIED as i32),
+            ],
+            Rc::clone(&closes),
+        );
+
+        let error = resume_process_threads_via_cursor(CHILD_PID, cursor, |_| {
+            Err(std::io::Error::from_raw_os_error(
+                ERROR_INVALID_HANDLE as i32,
+            ))
+        })
+        .expect_err("an incomplete walk must report its iterator failure");
+
+        assert_eq!(
+            error.raw_os_error(),
+            Some(ERROR_ACCESS_DENIED as i32),
+            "the iterator error wins because later entries were never attempted"
+        );
+        assert_eq!(closes.get(), 1, "the owned snapshot is closed exactly once");
+    }
+
+    #[test]
+    fn both_snapshot_false_classifiers_only_accept_normal_exhaustion() {
+        assert!(
+            classify_thread_snapshot_false(windows_sys::Win32::Foundation::ERROR_NO_MORE_FILES)
+                .expect("NO_MORE_FILES is normal exhaustion")
+                .is_none()
+        );
+        assert!(
+            classify_process_snapshot_false(windows_sys::Win32::Foundation::ERROR_NO_MORE_FILES)
+                .expect("NO_MORE_FILES is normal exhaustion")
+                .is_none()
+        );
+        assert_eq!(
+            classify_process_snapshot_false(ERROR_ACCESS_DENIED)
+                .expect_err("other FALSE results are iterator failures")
+                .raw_os_error(),
+            Some(ERROR_ACCESS_DENIED as i32)
+        );
+    }
+
+    fn assert_public_io_error(error: crate::Error, expected: i32) {
+        match error.reason() {
+            ErrorReason::Io(source) => assert_eq!(source.raw_os_error(), Some(expected)),
+            other => panic!("expected an I/O error, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn members_info_propagates_a_process_snapshot_failure() {
+        let _injected = inject_process_snapshot_error(ERROR_ACCESS_DENIED as i32);
+        let group = ProcessGroup::new().expect("create an empty test Job Object");
+
+        let error = group
+            .members_info()
+            .expect_err("members_info must preserve a process snapshot failure");
+        assert_public_io_error(error, ERROR_ACCESS_DENIED as i32);
+    }
+
+    #[test]
+    fn process_info_propagates_a_process_snapshot_failure() {
+        let _injected = inject_process_snapshot_error(ERROR_ACCESS_DENIED as i32);
+        let pid = unsafe { GetCurrentProcessId() };
+
+        let error = crate::sys::process_info(pid)
+            .expect_err("process_info must preserve a process snapshot failure");
+        assert_public_io_error(error, ERROR_ACCESS_DENIED as i32);
     }
 }
 
