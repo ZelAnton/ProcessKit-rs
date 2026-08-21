@@ -712,7 +712,7 @@ impl RunningProcess {
     /// Add another cancellation source without replacing the command's own token.
     ///
     /// A pipeline uses this once after attaching the stage's private group: its
-    /// chain-wide token must cancel the handle even when the [`Command`] already
+    /// chain-wide token must cancel the handle even when the [`crate::Command`] already
     /// carried a distinct stage-local token. Both tokens remain independently
     /// observable by every reap/probe/finisher, while one watchdog owns the same
     /// idempotent teardown as the ordinary single-token path.
