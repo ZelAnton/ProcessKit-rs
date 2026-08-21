@@ -1010,8 +1010,8 @@ impl Job {
     /// handle. A member the snapshot doesn't list exited between the job
     /// enumeration and the snapshot and is skipped (a vanished member, never a
     /// fabricated record). `Err` only if the job membership can't be read *or* the
-    /// metadata snapshot can't be created (a total inability to read metadata,
-    /// distinct from one pid vanishing).
+    /// metadata snapshot can't be created or completely enumerated (a total inability
+    /// to read metadata, distinct from one pid vanishing).
     #[cfg(feature = "process-control")]
     pub(crate) fn members_info(&self) -> io::Result<Vec<MemberInfo>> {
         let pids = job_member_pids(self.handle)?;

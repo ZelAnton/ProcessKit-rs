@@ -1012,7 +1012,8 @@ impl ProcessGroup {
     /// [`crate::ErrorReason::Io`] only if the group's membership cannot be read (the same
     /// failure as [`members`](Self::members) — a failed `cgroup.procs` read or Job
     /// Object query) or, on Windows, if the process-metadata snapshot cannot be
-    /// created at all. A single member vanishing is not an error (it is skipped).
+    /// created or completely enumerated. A single member vanishing is not an error
+    /// (it is skipped).
     #[cfg(feature = "process-control")]
     pub fn members_info(&self) -> Result<Vec<MemberInfo>> {
         let infos = self.job.members_info().map_err(Error::io)?;
