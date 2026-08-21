@@ -249,6 +249,48 @@ async fn pty_unused_stdin_does_not_close_the_conpty_session() {
 
 #[cfg(windows)]
 #[tokio::test]
+#[ignore = "spawns a real ConPTY child that deliberately stalls stdin"]
+async fn conpty_stalled_reader_backpressures_bulk_stdin_and_tears_down() {
+    let child = Command::new("powershell").args([
+        "-NoProfile",
+        "-NonInteractive",
+        "-Command",
+        "Start-Sleep -Seconds 30",
+    ]);
+    let mut process = JobRunner::new()
+        .start(&child.use_pty().keep_stdin_open())
+        .await
+        .expect("start stalled ConPTY child");
+    let mut stdin = process.take_stdin().expect("ConPTY stdin writer");
+    // This buffer is much larger than the OS pipe plus the bridge's explicit
+    // queued-byte ceiling. The call must park instead of cloning it into an
+    // unbounded sequence of bridge messages.
+    let payload = vec![b'x'; 16 * 1024 * 1024];
+    let backpressured = tokio::time::timeout(Duration::from_secs(1), stdin.write(&payload))
+        .await
+        .is_err();
+    drop(payload);
+    drop(stdin);
+    let outcome = completes_within(
+        Duration::from_secs(20),
+        "stalled ConPTY teardown",
+        process.shutdown(Duration::ZERO),
+    )
+    .await
+    .expect("stalled ConPTY child must tear down");
+
+    assert!(
+        backpressured,
+        "a stalled ConPTY reader must apply backpressure"
+    );
+    assert!(
+        !matches!(outcome, processkit::Outcome::Exited(0)),
+        "forced teardown must not wait for the sleeping child: {outcome:?}"
+    );
+}
+
+#[cfg(windows)]
+#[tokio::test]
 #[ignore = "spawns a real pseudo-terminal"]
 async fn pty_finish_sends_console_eof_without_closing_the_session() {
     let child = Command::new("powershell").args([
