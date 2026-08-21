@@ -102,6 +102,10 @@ pub struct Pipeline {
     stages: Vec<Command>,
     timeout: Option<Duration>,
     cancel_token: Option<tokio_util::sync::CancellationToken>,
+    /// Hermetic launch seam for this module's public-path tests. Production
+    /// pipelines always spawn through a fresh per-stage [`ProcessGroup`].
+    #[cfg(test)]
+    test_runner: Option<Arc<dyn crate::runner::ProcessRunner>>,
 }
 
 impl std::fmt::Debug for Pipeline {
@@ -266,7 +270,17 @@ impl Pipeline {
             stages: vec![first, second],
             timeout: None,
             cancel_token: None,
+            #[cfg(test)]
+            test_runner: None,
         }
+    }
+
+    /// Replace real process launch only for in-crate tests that must drive the
+    /// complete capture/session orchestration without a subprocess.
+    #[cfg(test)]
+    fn with_test_runner(mut self, runner: Arc<dyn crate::runner::ProcessRunner>) -> Self {
+        self.test_runner = Some(runner);
+        self
     }
 
     /// Append another stage: the current last stage's stdout becomes `next`'s
@@ -312,7 +326,7 @@ impl Pipeline {
     }
 
     /// Cancel the **whole chain** when `token` fires: the token reaches every
-    /// stage (see gap-fill below), so each stage's run is cancelled and kills its
+    /// stage, so each stage's run is cancelled and kills its
     /// own subtree, and the run resolves to
     /// [`ErrorReason::Cancelled`](crate::ErrorReason::Cancelled). This is **proactive** —
     /// firing the token cancels the stages directly, it does not wait for them to
@@ -334,14 +348,12 @@ impl Pipeline {
     /// [`unchecked_in_pipe`](Command::unchecked_in_pipe) stage's — its unclean exit
     /// is forgiven, so it leaves the rest of the chain running.
     ///
-    /// The token **gap-fills** — at launch it is applied to every stage that does
-    /// not already carry its own [`Command::cancel_on`], leaving an explicit
-    /// per-stage token intact (which still cancels the chain, since cancelling one
-    /// stage errors the run and the group tears the rest down). This matches
-    /// [`CliClient::default_cancel_on`](crate::CliClient::default_cancel_on)
-    /// rather than silently overriding a per-stage choice. To have a stage
-    /// cancelled by **both** its own token and the chain token, pass a child of
-    /// this token as the stage's token (`token.child_token()`).
+    /// At launch the token **gap-fills** a stage with no token of its own. A stage
+    /// that already carries an explicit [`Command::cancel_on`] keeps that token
+    /// and observes the chain token as an additional trigger — firing either one
+    /// cancels the stage, while neither token is cancelled as a side effect of the
+    /// other. The chain therefore never overrides a per-stage choice, while its
+    /// own token remains unconditionally chain-wide.
     ///
     /// Like [`Command::cancel_on`], a cancelled run is terminal: it is not
     /// retried, and the chain cannot be re-run through a token that stays
@@ -354,14 +366,14 @@ impl Pipeline {
     /// Launch every stage of the chain — the shared start-up core reused by the
     /// buffering [`capture`](Self::capture) verbs and the streaming
     /// [`start`](Self::start) session, so a change to how a chain comes up (per-stage
-    /// sub-groups, the stdout→stdin relay, cancel-token gap-fill) lands on both.
+    /// sub-groups, the stdout→stdin relay, chain cancellation) lands on both.
     ///
     /// Each stage spawns into its **own** kill-on-drop sub-group, retained as a
     /// strong handle so a per-stage [`Command::timeout`]/[`cancel_on`](Command::cancel_on)
     /// tears down that stage's *whole* subtree (grandchildren of a forking `sh -c …`
     /// included) and a chain-wide teardown can fan a kill across every one. The
-    /// pipeline [`cancel_on`](Self::cancel_on) token gap-fills onto every stage that
-    /// carries no token of its own.
+    /// pipeline [`cancel_on`](Self::cancel_on) token gap-fills a stage without a
+    /// token and becomes an additional trigger for a stage with one of its own.
     ///
     /// # A non-final stage's stdout belongs to the pipe
     ///
@@ -420,6 +432,7 @@ impl Pipeline {
         let mut upstream = None;
         for (index, stage) in self.stages.iter().enumerate() {
             let mut command = stage.clone();
+            let has_stage_cancel = command.cancel_token().is_some();
             let non_final = index + 1 < self.stages.len();
             if non_final && stage.wants_stderr_merged_in_pipe() {
                 command.activate_stderr_merge_in_pipe();
@@ -436,14 +449,29 @@ impl Pipeline {
             if non_final && !stage.stdout_is_piped() {
                 command.pipe_stdout_for_downstream();
             }
-            // Gap-fill: apply the pipeline cancel token only where a stage has no token of its own.
+            // Preserve the command-level gap-fill for stages without their own
+            // token, including the runner's pre-spawn cancellation check. A stage
+            // with an explicit token gets the chain token as a second live-handle
+            // trigger below, after its private group is attached.
             if let Some(token) = &self.cancel_token
-                && command.cancel_token().is_none()
+                && !has_stage_cancel
             {
                 command = command.cancel_on(token.clone());
             }
             if let Some(reader) = upstream.take() {
                 command.set_pipe_stdin(reader);
+            }
+            #[cfg(test)]
+            if let Some(runner) = &self.test_runner {
+                let mut process = runner.start(&command).await?;
+                if has_stage_cancel && let Some(token) = &self.cancel_token {
+                    process.add_cancel_trigger(token.clone());
+                }
+                if non_final {
+                    upstream = process.take_stdout_pipe();
+                }
+                running.push((process, stage.is_unchecked()));
+                continue;
             }
             // Spawn into a fresh per-stage group, then hand it to the stage handle
             // (`attach_group` also upgrades the cancel watchdog to a group+pid kill)
@@ -451,6 +479,9 @@ impl Pipeline {
             let group = ProcessGroup::new()?;
             let mut process = group.start(&command).await?;
             process.attach_group(group);
+            if has_stage_cancel && let Some(token) = &self.cancel_token {
+                process.add_cancel_trigger(token.clone());
+            }
             if let Some(handle) = process.own_group_handle() {
                 stage_groups.push(handle);
             }
@@ -2096,6 +2127,65 @@ mod tests {
         fn assert_send_sync<T: Send + Sync>(_: &T) {}
         assert_send_sync(session);
         assert_send(&session.wait_for_line(|line| line.is_empty(), Duration::ZERO));
+    }
+
+    fn pending_pipeline_with_distinct_tokens(
+        first_token: tokio_util::sync::CancellationToken,
+        second_token: tokio_util::sync::CancellationToken,
+        chain_token: tokio_util::sync::CancellationToken,
+    ) -> Pipeline {
+        let runner = Arc::new(
+            crate::doubles::ScriptedRunner::new().fallback(crate::doubles::Reply::pending()),
+        );
+        Command::new("producer")
+            .cancel_on(first_token)
+            .pipe(Command::new("consumer").cancel_on(second_token))
+            .cancel_on(chain_token)
+            .with_test_runner(runner)
+    }
+
+    #[tokio::test]
+    async fn capture_uses_the_chain_token_when_every_stage_owns_a_distinct_token() {
+        let first_token = tokio_util::sync::CancellationToken::new();
+        let second_token = tokio_util::sync::CancellationToken::new();
+        let chain_token = tokio_util::sync::CancellationToken::new();
+        let pipeline = pending_pipeline_with_distinct_tokens(
+            first_token.clone(),
+            second_token.clone(),
+            chain_token.clone(),
+        );
+        let capture = tokio::spawn(async move { pipeline.output_string().await });
+
+        tokio::task::yield_now().await;
+        chain_token.cancel();
+        let err = tokio::time::timeout(Duration::from_secs(5), capture)
+            .await
+            .expect("chain cancellation must bound the hermetic capture")
+            .expect("capture task")
+            .expect_err("the chain token must cancel every explicitly-tokened stage");
+        assert!(matches!(err.reason(), crate::ErrorReason::Cancelled { .. }));
+        assert!(!first_token.is_cancelled() && !second_token.is_cancelled());
+    }
+
+    #[tokio::test]
+    async fn session_uses_the_chain_token_when_every_stage_owns_a_distinct_token() {
+        let first_token = tokio_util::sync::CancellationToken::new();
+        let second_token = tokio_util::sync::CancellationToken::new();
+        let chain_token = tokio_util::sync::CancellationToken::new();
+        let pipeline = pending_pipeline_with_distinct_tokens(
+            first_token.clone(),
+            second_token.clone(),
+            chain_token.clone(),
+        );
+        let session = pipeline.start().await.expect("start hermetic live session");
+
+        chain_token.cancel();
+        let err = tokio::time::timeout(Duration::from_secs(5), session.finish())
+            .await
+            .expect("chain cancellation must bound the hermetic live session")
+            .expect_err("the chain token must cancel every explicitly-tokened stage");
+        assert!(matches!(err.reason(), crate::ErrorReason::Cancelled { .. }));
+        assert!(!first_token.is_cancelled() && !second_token.is_cancelled());
     }
 
     fn stage(program: &str, outcome: Outcome) -> StageOutcome {

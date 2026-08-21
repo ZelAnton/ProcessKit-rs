@@ -84,6 +84,29 @@ enum ExitCause {
     Cancelled,
 }
 
+/// Wait until either of the two independent cancellation sources fires.
+///
+/// This future deliberately observes the original tokens rather than a derived
+/// token published by another task: a consuming waiter must see a token that was
+/// already cancelled before it was polled, even if no spawned watchdog has run.
+async fn wait_for_cancellation(
+    configured: Option<tokio_util::sync::CancellationToken>,
+    additional: Option<tokio_util::sync::CancellationToken>,
+) {
+    match (configured, additional) {
+        (Some(configured), Some(additional)) => {
+            tokio::select! {
+                biased;
+                () = configured.cancelled() => {}
+                () = additional.cancelled() => {}
+            }
+        }
+        (Some(configured), None) => configured.cancelled().await,
+        (None, Some(additional)) => additional.cancelled().await,
+        (None, None) => std::future::pending::<()>().await,
+    }
+}
+
 /// Internal result of `finish_lines` — distinct from the public `Finished`.
 struct FinishedLines {
     outcome: Outcome,
@@ -306,6 +329,11 @@ pub struct RunningProcess {
     // detached.
     pid_gate: Arc<PidGate>,
     cancel_token: Option<tokio_util::sync::CancellationToken>,
+    // A pipeline-wide source kept separate from the command's own token. Keeping
+    // both originals lets every consuming path observe either source directly;
+    // forwarding through a spawned bridge task would add a scheduler race where
+    // a ready child could be classified as successful before the bridge ran.
+    additional_cancel_token: Option<tokio_util::sync::CancellationToken>,
     // The cancellation teardown policy — the exact mirror of
     // `timeout_grace`/`timeout_signal` for the token path (`Command::cancel_grace`/
     // `cancel_signal`). `None` (the default) keeps a cancellation an immediate hard
@@ -542,6 +570,7 @@ impl RunningProcess {
             timeout_state: Arc::new(AtomicU8::new(TS_PENDING)),
             pid_gate: Arc::new(PidGate::new(s.pid)),
             cancel_token: s.cancel_token,
+            additional_cancel_token: None,
             cancel_grace: s.cancel_grace,
             cancel_signal: s.cancel_signal,
             cancel_task: None,
@@ -604,6 +633,7 @@ impl RunningProcess {
             timeout_state: Arc::new(AtomicU8::new(TS_PENDING)),
             pid_gate: Arc::new(PidGate::new(s.pid)),
             cancel_token: s.cancel_token,
+            additional_cancel_token: None,
             cancel_grace: s.cancel_grace,
             cancel_signal: s.cancel_signal,
             cancel_task: None,
@@ -661,60 +691,101 @@ impl RunningProcess {
     ///   by `RunningProcess::Drop` mid-grace. Every raw op stays gated, so the
     ///   `PidGate` remains the stand-down and the recycled-pid backstop.
     pub(crate) fn arm_cancel_watchdog(&mut self) {
-        {
-            if let Some(old) = self.cancel_task.take() {
-                old.abort();
-            }
-            let Some(token) = self.cancel_token.clone() else {
-                return;
-            };
-            let group_weak = self.backend.own_group().map(Arc::downgrade);
-            let gate = self.pid_gate.clone();
-            let grace = self.cancel_grace;
-            let signal = self.cancel_signal;
-            self.cancel_task = Some(tokio::spawn(async move {
-                token.cancelled().await;
-                // Stand down if a `Child`-owning finisher has taken over teardown:
-                // it kills the tree/child through the owned handles (`start_kill`,
-                // a no-op once reaped), so a raw `kill(pid)` here could only signal
-                // a pid the OS recycled. This early `is_retired` load is only an
-                // optimization to skip even the group kill; the raw direct-child
-                // kill below re-checks retirement *atomically with the kill* under
-                // the gate lock, so — unlike the old bare `handed_off` load whose
-                // load→kill gap let a reap slip in — it can never fire on a freed pid.
-                if gate.is_retired() {
-                    return;
-                }
-                match group_weak {
-                    Some(group) => match grace {
-                        // Whole tree, gracefully: signal → grace → hard kill, driven
-                        // by the shared escalation driver. Like the deadline
-                        // watchdog, this task cannot reap the child, so a child that
-                        // exits on the signal is only observed as gone once whoever
-                        // owns the `Child` reaps it.
-                        Some(grace) => match group.upgrade() {
-                            Some(group) => {
-                                let _ = group.graceful_terminate(grace, signal).await;
-                            }
-                            None => crate::sys::pid_gate::force_kill(&gate), // group gone
-                        },
-                        // The unchanged default: `kill_all` on a still-reachable
-                        // group, then the gated raw kill of the direct child.
-                        None => stream::kill_via_weak(&group, &gate),
-                    },
-                    // Shared group: pid-only teardown (a forking child's
-                    // grandchildren are the documented shared-group teardown gap).
-                    None => match grace {
-                        // Detached on purpose — see `spawn_graceful_kill_and_reap`:
-                        // this watchdog is aborted by `RunningProcess::Drop`, and a
-                        // child that catches the signal, closes stdout and keeps
-                        // running must still be forced down when the grace elapses.
-                        Some(grace) => stream::spawn_graceful_kill_and_reap(gate, grace, signal),
-                        None => crate::sys::pid_gate::force_kill(&gate),
-                    },
-                }
-            }));
+        let configured = self.cancel_token.clone();
+        let additional = self.additional_cancel_token.clone();
+        if configured.is_none() && additional.is_none() {
+            return;
         }
+        self.arm_cancel_watchdog_on(wait_for_cancellation(configured, additional));
+    }
+
+    fn is_cancelled(&self) -> bool {
+        self.cancel_token
+            .as_ref()
+            .is_some_and(tokio_util::sync::CancellationToken::is_cancelled)
+            || self
+                .additional_cancel_token
+                .as_ref()
+                .is_some_and(tokio_util::sync::CancellationToken::is_cancelled)
+    }
+
+    /// Add another cancellation source without replacing the command's own token.
+    ///
+    /// A pipeline uses this once after attaching the stage's private group: its
+    /// chain-wide token must cancel the handle even when the [`Command`] already
+    /// carried a distinct stage-local token. Both tokens remain independently
+    /// observable by every reap/probe/finisher, while one watchdog owns the same
+    /// idempotent teardown as the ordinary single-token path.
+    pub(crate) fn add_cancel_trigger(&mut self, additional: tokio_util::sync::CancellationToken) {
+        if self.cancel_token.is_none() {
+            self.cancel_token = Some(additional);
+            self.arm_cancel_watchdog();
+            return;
+        }
+        debug_assert!(
+            self.additional_cancel_token.is_none(),
+            "a running process accepts only one additional cancellation source"
+        );
+        self.additional_cancel_token = Some(additional);
+        self.arm_cancel_watchdog();
+    }
+
+    /// Install the one cancellation watchdog around an arbitrary trigger future.
+    /// Keeping the teardown body here prevents the single-token and combined-token
+    /// paths from drifting in grace, group ownership, or recycled-pid handling.
+    fn arm_cancel_watchdog_on(
+        &mut self,
+        cancelled: impl std::future::Future<Output = ()> + Send + 'static,
+    ) {
+        if let Some(old) = self.cancel_task.take() {
+            old.abort();
+        }
+        let group_weak = self.backend.own_group().map(Arc::downgrade);
+        let gate = self.pid_gate.clone();
+        let grace = self.cancel_grace;
+        let signal = self.cancel_signal;
+        self.cancel_task = Some(tokio::spawn(async move {
+            cancelled.await;
+            // Stand down if a `Child`-owning finisher has taken over teardown:
+            // it kills the tree/child through the owned handles (`start_kill`,
+            // a no-op once reaped), so a raw `kill(pid)` here could only signal
+            // a pid the OS recycled. This early `is_retired` load is only an
+            // optimization to skip even the group kill; the raw direct-child
+            // kill below re-checks retirement *atomically with the kill* under
+            // the gate lock, so — unlike the old bare `handed_off` load whose
+            // load→kill gap let a reap slip in — it can never fire on a freed pid.
+            if gate.is_retired() {
+                return;
+            }
+            match group_weak {
+                Some(group) => match grace {
+                    // Whole tree, gracefully: signal → grace → hard kill, driven
+                    // by the shared escalation driver. Like the deadline
+                    // watchdog, this task cannot reap the child, so a child that
+                    // exits on the signal is only observed as gone once whoever
+                    // owns the `Child` reaps it.
+                    Some(grace) => match group.upgrade() {
+                        Some(group) => {
+                            let _ = group.graceful_terminate(grace, signal).await;
+                        }
+                        None => crate::sys::pid_gate::force_kill(&gate), // group gone
+                    },
+                    // The unchanged default: `kill_all` on a still-reachable
+                    // group, then the gated raw kill of the direct child.
+                    None => stream::kill_via_weak(&group, &gate),
+                },
+                // Shared group: pid-only teardown (a forking child's
+                // grandchildren are the documented shared-group teardown gap).
+                None => match grace {
+                    // Detached on purpose — see `spawn_graceful_kill_and_reap`:
+                    // this watchdog is aborted by `RunningProcess::Drop`, and a
+                    // child that catches the signal, closes stdout and keeps
+                    // running must still be forced down when the grace elapses.
+                    Some(grace) => stream::spawn_graceful_kill_and_reap(gate, grace, signal),
+                    None => crate::sys::pid_gate::force_kill(&gate),
+                },
+            }
+        }));
     }
 
     /// Take the raw stdout reader for `Pipeline` plumbing. Usually a child's
@@ -1509,13 +1580,9 @@ impl RunningProcess {
             ExitCause::Exited(self.backend_wait().await?)
         } else {
             // No deadline arm: a streamed run's deadline is owned by its watchdog.
-            let token = self.cancel_token.clone();
-            let cancelled = async {
-                match &token {
-                    Some(token) => token.cancelled().await,
-                    None => std::future::pending::<()>().await,
-                }
-            };
+            let configured = self.cancel_token.clone();
+            let additional = self.additional_cancel_token.clone();
+            let cancelled = wait_for_cancellation(configured, additional);
             tokio::select! {
                 biased; // cancel arm first: a cancel that fires mid-wait wins
                 () = cancelled => {
@@ -2137,17 +2204,13 @@ impl RunningProcess {
         let limit = self.timeout;
         let inactivity_limit = self.inactivity_timeout;
         let output_activity = self.output_activity.clone();
-        let token = self.cancel_token.clone();
+        let configured = self.cancel_token.clone();
+        let additional = self.additional_cancel_token.clone();
         // The deadline anchor is on tokio's clock (see the field docs) so the
         // `limit - started.elapsed()` in `wait_deadline_and_claim` counts virtual
         // time already burned before this consuming call armed the deadline.
         let started = self.deadline_anchor;
-        let cancelled = async {
-            match &token {
-                Some(token) => token.cancelled().await,
-                None => std::future::pending::<()>().await,
-            }
-        };
+        let cancelled = wait_for_cancellation(configured, additional);
         // Anchor to spawn time so a late consuming call can't re-grant the full
         // limit. The CAS runs as part of this raced future itself (rather than
         // after `select!` names a winner). With the streaming watchdog now
@@ -2514,8 +2577,7 @@ impl RunningProcess {
             // *earlier* cancel that was already active — and already killed the
             // tree via the cancel watchdog — by the time the probe noticed.
             if self.cancel_at_exit.is_none() {
-                self.cancel_at_exit =
-                    Some(self.cancel_token.as_ref().is_some_and(|t| t.is_cancelled()));
+                self.cancel_at_exit = Some(self.is_cancelled());
             }
             // Same override, in the same order relative to the claim above, as the
             // reap choke point `on_reaped` applies: a deadline that won the arbitration
@@ -2582,6 +2644,7 @@ impl Drop for RunningProcess {
         if let Some(task) = self.cancel_task.take() {
             task.abort();
         }
+        let graceful_cancel_fired = self.cancel_grace.is_some() && self.is_cancelled();
         // A surviving grandchild holding the pipe could keep a pump alive
         // indefinitely on a shared-group handle without this abort.
         if let Some(task) = self.stdout_pump.take() {
@@ -2678,8 +2741,7 @@ impl Drop for RunningProcess {
                 if real.own_group.is_none()
                     && (((self.timeout.is_some() || self.inactivity_timeout.is_some())
                         && self.timeout_grace.is_some())
-                        || (self.cancel_grace.is_some()
-                            && self.cancel_token.as_ref().is_some_and(|t| t.is_cancelled())))
+                        || graceful_cancel_fired)
                     && !self.pid_gate.is_retired()
                     && let Ok(handle) = tokio::runtime::Handle::try_current()
                     && let Some(child) = real.child.take()
@@ -3767,6 +3829,55 @@ mod tests {
             Err(ErrorReason::Cancelled { .. }) => {}
             other => panic!("expected Err(Cancelled), got {other:?}"),
         }
+    }
+
+    #[tokio::test]
+    async fn an_additional_cancel_trigger_cancels_without_firing_the_configured_token() {
+        let configured = tokio_util::sync::CancellationToken::new();
+        let additional = tokio_util::sync::CancellationToken::new();
+        // A ready success is intentional: after cancellation, the biased waiter
+        // must observe the additional source synchronously, before a separately
+        // spawned watchdog gets any scheduler turn.
+        let runner = ScriptedRunner::new().fallback(Reply::ok(""));
+        let mut run = runner
+            .start(&Command::new("tool").cancel_on(configured.clone()))
+            .await
+            .expect("scripted start");
+        run.add_cancel_trigger(additional.clone());
+
+        additional.cancel();
+        let err = run
+            .wait_exit()
+            .await
+            .expect_err("the additional trigger is a cancellation");
+        assert!(matches!(err.reason(), ErrorReason::Cancelled { .. }));
+        assert!(
+            !configured.is_cancelled(),
+            "an additional trigger must not cancel the command-owned token"
+        );
+    }
+
+    #[tokio::test]
+    async fn the_configured_token_still_cancels_after_an_additional_trigger_is_attached() {
+        let configured = tokio_util::sync::CancellationToken::new();
+        let additional = tokio_util::sync::CancellationToken::new();
+        let runner = ScriptedRunner::new().fallback(Reply::pending());
+        let mut run = runner
+            .start(&Command::new("tool").cancel_on(configured.clone()))
+            .await
+            .expect("scripted start");
+        run.add_cancel_trigger(additional.clone());
+
+        configured.cancel();
+        let err = tokio::time::timeout(Duration::from_secs(5), run.finish())
+            .await
+            .expect("the configured token must still bound the pending handle")
+            .expect_err("the configured token remains a cancellation");
+        assert!(matches!(err.reason(), ErrorReason::Cancelled { .. }));
+        assert!(
+            !additional.is_cancelled(),
+            "the command-owned token must not cancel the additional trigger"
+        );
     }
 
     /// Cancel disposition is the race result (`ExitCause`), not a post-hoc read.
