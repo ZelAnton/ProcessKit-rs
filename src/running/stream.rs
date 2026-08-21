@@ -845,9 +845,9 @@ impl Stream for StdoutLines {
                     return Poll::Ready(Some(line));
                 }
                 Popped::Closed => return Poll::Ready(None),
-                Popped::Empty => {
+                Popped::Empty(observed) => {
                     if this.wait.is_none() {
-                        this.wait = Some(Box::pin(this.sink.clone().changed()));
+                        this.wait = Some(Box::pin(this.sink.clone().changed(observed)));
                     }
                     match this.wait.as_mut().expect("just set").as_mut().poll(cx) {
                         Poll::Ready(()) => {
@@ -1086,6 +1086,8 @@ impl Stream for ProcessEvents {
             }));
         }
         loop {
+            let mut stdout_observed = None;
+            let mut stderr_observed = None;
             for stdout_turn in [this.prefer_stdout, !this.prefer_stdout] {
                 if stdout_turn && !this.stdout_done {
                     match this.stdout_sink.try_pop() {
@@ -1100,7 +1102,7 @@ impl Stream for ProcessEvents {
                             this.stdout_done = true;
                             this.stdout_wait = None;
                         }
-                        Popped::Empty => {}
+                        Popped::Empty(observed) => stdout_observed = Some(observed),
                     }
                 } else if !stdout_turn && !this.stderr_done {
                     match this.stderr_sink.try_pop() {
@@ -1115,7 +1117,7 @@ impl Stream for ProcessEvents {
                             this.stderr_done = true;
                             this.stderr_wait = None;
                         }
-                        Popped::Empty => {}
+                        Popped::Empty(observed) => stderr_observed = Some(observed),
                     }
                 }
             }
@@ -1147,7 +1149,8 @@ impl Stream for ProcessEvents {
             let mut any_ready = false;
             if !this.stdout_done {
                 if this.stdout_wait.is_none() {
-                    this.stdout_wait = Some(Box::pin(this.stdout_sink.clone().changed()));
+                    let observed = stdout_observed.expect("open stdout was inspected");
+                    this.stdout_wait = Some(Box::pin(this.stdout_sink.clone().changed(observed)));
                 }
                 if this
                     .stdout_wait
@@ -1163,7 +1166,8 @@ impl Stream for ProcessEvents {
             }
             if !this.stderr_done {
                 if this.stderr_wait.is_none() {
-                    this.stderr_wait = Some(Box::pin(this.stderr_sink.clone().changed()));
+                    let observed = stderr_observed.expect("open stderr was inspected");
+                    this.stderr_wait = Some(Box::pin(this.stderr_sink.clone().changed(observed)));
                 }
                 if this
                     .stderr_wait
@@ -1291,6 +1295,134 @@ mod tests {
             started_emitted: true,
             exit_rx: None,
         }
+    }
+
+    #[derive(Default)]
+    struct WakeCount(std::sync::atomic::AtomicUsize);
+
+    impl std::task::Wake for WakeCount {
+        fn wake(self: Arc<Self>) {
+            self.0.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+        }
+
+        fn wake_by_ref(self: &Arc<Self>) {
+            self.0.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+        }
+    }
+
+    fn counting_waker() -> (Arc<WakeCount>, std::task::Waker) {
+        let count = Arc::new(WakeCount::default());
+        let waker = std::task::Waker::from(count.clone());
+        (count, waker)
+    }
+
+    /// Both the owned line stream and `wait_for_output`-shaped observer are
+    /// parked before the prompt arrives. One partial-tail publication must wake
+    /// both; the stream then remains usable and receives that tail when EOF
+    /// finalizes it as a line.
+    #[test]
+    fn partial_tail_publication_wakes_stream_and_readiness_observer() {
+        let sink = SharedLines::new(&OutputBufferPolicy::unbounded());
+        let mut lines = StdoutLines {
+            sink: sink.clone(),
+            wait: None,
+        };
+        let mut next_line = Box::pin(lines.next());
+        let observer_sink = sink.clone();
+        let mut observe_prompt = Box::pin(async move {
+            loop {
+                let (tail, closed, observed) = observer_sink.partial_tail_snapshot();
+                if tail.as_deref() == Some("Password: ") {
+                    return tail;
+                }
+                if closed {
+                    return None;
+                }
+                observer_sink.clone().changed(observed).await;
+            }
+        });
+        let (stream_wakes, stream_waker) = counting_waker();
+        let (probe_wakes, probe_waker) = counting_waker();
+        let mut stream_cx = Context::from_waker(&stream_waker);
+        let mut probe_cx = Context::from_waker(&probe_waker);
+
+        assert!(next_line.as_mut().poll(&mut stream_cx).is_pending());
+        assert!(observe_prompt.as_mut().poll(&mut probe_cx).is_pending());
+
+        sink.set_partial_tail("Password: ");
+        assert_eq!(
+            stream_wakes.0.load(std::sync::atomic::Ordering::SeqCst),
+            1,
+            "the owned stream must be woken by the shared tail publication"
+        );
+        assert_eq!(
+            probe_wakes.0.load(std::sync::atomic::Ordering::SeqCst),
+            1,
+            "the readiness observer must be woken by the same publication"
+        );
+        assert!(matches!(
+            observe_prompt.as_mut().poll(&mut probe_cx),
+            Poll::Ready(Some(tail)) if tail == "Password: "
+        ));
+        assert!(next_line.as_mut().poll(&mut stream_cx).is_pending());
+
+        sink.push("Password: ".to_owned());
+        sink.close_now();
+        assert!(matches!(
+            next_line.as_mut().poll(&mut stream_cx),
+            Poll::Ready(Some(line)) if line == "Password: "
+        ));
+        drop(next_line);
+        assert!(matches!(
+            Pin::new(&mut lines).poll_next(&mut stream_cx),
+            Poll::Ready(None)
+        ));
+    }
+
+    /// The merged event stream and an unmatched readiness observer park on the
+    /// same stdout sink. A lone close/EOF publication must wake both, otherwise
+    /// either future could remain pending forever without another event.
+    #[test]
+    fn close_wakes_event_stream_and_readiness_observer() {
+        let stdout_sink = SharedLines::new(&OutputBufferPolicy::unbounded());
+        let stderr_sink = SharedLines::new(&OutputBufferPolicy::unbounded());
+        stderr_sink.close_now();
+        let mut events = line_only_events(stdout_sink.clone(), stderr_sink);
+        let mut next_event = Box::pin(events.next());
+        let observer_sink = stdout_sink.clone();
+        let mut observe_close = Box::pin(async move {
+            loop {
+                let (_, closed, observed) = observer_sink.partial_tail_snapshot();
+                if closed {
+                    return;
+                }
+                observer_sink.clone().changed(observed).await;
+            }
+        });
+        let (events_wakes, events_waker) = counting_waker();
+        let (probe_wakes, probe_waker) = counting_waker();
+        let mut events_cx = Context::from_waker(&events_waker);
+        let mut probe_cx = Context::from_waker(&probe_waker);
+
+        assert!(next_event.as_mut().poll(&mut events_cx).is_pending());
+        assert!(observe_close.as_mut().poll(&mut probe_cx).is_pending());
+
+        stdout_sink.close_now();
+        assert_eq!(
+            events_wakes.0.load(std::sync::atomic::Ordering::SeqCst),
+            1,
+            "the event stream must be woken by EOF"
+        );
+        assert_eq!(
+            probe_wakes.0.load(std::sync::atomic::Ordering::SeqCst),
+            1,
+            "the readiness observer must be woken by the same EOF"
+        );
+        assert!(matches!(
+            next_event.as_mut().poll(&mut events_cx),
+            Poll::Ready(None)
+        ));
+        assert!(observe_close.as_mut().poll(&mut probe_cx).is_ready());
     }
 
     #[tokio::test]

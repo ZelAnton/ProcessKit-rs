@@ -423,6 +423,63 @@ async fn stdout_lines_streams_incrementally() {
     );
 }
 
+/// A `stdout_lines` future and the non-consuming `wait_for_output` probe can
+/// legitimately park on the same sink. The scripted prompt is emitted only
+/// after both futures have registered (the current-thread runtime cannot poll
+/// the spawned pump until this task yields), so one tail publication must wake
+/// both observers without needing a later line or EOF.
+#[tokio::test]
+async fn stdout_stream_and_output_probe_share_an_unterminated_prompt() {
+    use processkit::ProcessRunner;
+    use processkit::testing::{Reply, ScriptedRunner};
+    use tokio_stream::StreamExt;
+
+    let mut process = ScriptedRunner::new()
+        .fallback(Reply::dialog("Password: ", "accepted\n"))
+        .start(&Command::new("login").keep_stdin_open())
+        .await
+        .expect("scripted dialog start");
+    let mut lines = process.stdout_lines().expect("take stdout stream");
+    let mut next_line = Box::pin(lines.next());
+    let mut prompt =
+        Box::pin(process.wait_for_output(|tail| tail == "Password: ", Duration::from_secs(1)));
+
+    let matched = tokio::time::timeout(Duration::from_secs(2), async {
+        tokio::select! {
+            biased;
+            line = &mut next_line => panic!("the stream completed before the prompt probe: {line:?}"),
+            result = &mut prompt => result,
+        }
+    })
+    .await
+    .expect("both observers were woken by the prompt publication")
+    .expect("the prompt matched");
+    assert_eq!(matched, "Password: ");
+    drop(prompt);
+
+    process
+        .take_stdin()
+        .expect("dialog stdin")
+        .write_line("secret")
+        .await
+        .expect("answer prompt");
+    let completed = tokio::time::timeout(Duration::from_secs(2), &mut next_line)
+        .await
+        .expect("the stream received the completed prompt line");
+    assert_eq!(completed.as_deref(), Some("Password: accepted"));
+    drop(next_line);
+    assert!(
+        tokio::time::timeout(Duration::from_secs(2), lines.next())
+            .await
+            .expect("the stream observed EOF")
+            .is_none()
+    );
+    assert_eq!(
+        process.finish().await.expect("finish dialog").outcome,
+        Outcome::Exited(0)
+    );
+}
+
 #[tokio::test]
 #[ignore = "spawns a real subprocess: stream stdout, then collect exit + stderr"]
 async fn finish_returns_code_and_stderr() {
