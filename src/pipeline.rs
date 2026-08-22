@@ -42,7 +42,7 @@ const TEARDOWN_DRAIN_GRACE: Duration = Duration::from_millis(500);
 const LAST_STAGE_PROBE_MIN: Duration = Duration::from_millis(25);
 const LAST_STAGE_PROBE_MAX: Duration = Duration::from_millis(500);
 
-#[cfg(test)]
+#[cfg(all(test, feature = "process-control"))]
 thread_local! {
     /// Deterministic race seam: run one synchronous callback after the proactive
     /// drain grace but before its fallback group kill. Keeping it thread-local
@@ -51,10 +51,10 @@ thread_local! {
         const { std::cell::RefCell::new(None) };
 }
 
-#[cfg(test)]
+#[cfg(all(test, feature = "process-control"))]
 struct PipelineFallbackKillHookGuard;
 
-#[cfg(test)]
+#[cfg(all(test, feature = "process-control"))]
 impl Drop for PipelineFallbackKillHookGuard {
     fn drop(&mut self) {
         BEFORE_PIPELINE_FALLBACK_KILL.with(|slot| {
@@ -63,7 +63,7 @@ impl Drop for PipelineFallbackKillHookGuard {
     }
 }
 
-#[cfg(test)]
+#[cfg(all(test, feature = "process-control"))]
 fn before_pipeline_fallback_kill(hook: impl FnOnce() + 'static) -> PipelineFallbackKillHookGuard {
     BEFORE_PIPELINE_FALLBACK_KILL.with(|slot| {
         assert!(
@@ -74,7 +74,7 @@ fn before_pipeline_fallback_kill(hook: impl FnOnce() + 'static) -> PipelineFallb
     PipelineFallbackKillHookGuard
 }
 
-#[cfg(test)]
+#[cfg(all(test, feature = "process-control"))]
 fn run_before_pipeline_fallback_kill() {
     BEFORE_PIPELINE_FALLBACK_KILL.with(|slot| {
         if let Some(hook) = slot.borrow_mut().take() {
@@ -83,7 +83,7 @@ fn run_before_pipeline_fallback_kill() {
     });
 }
 
-#[cfg(not(test))]
+#[cfg(not(all(test, feature = "process-control")))]
 fn run_before_pipeline_fallback_kill() {}
 
 #[cfg(test)]
@@ -2953,7 +2953,8 @@ type InnerDrain = std::result::Result<Vec<InnerStage>, PartialDrainError<InnerSt
 ///
 /// After the first raw error the drain keeps collecting sibling terminal
 /// dispositions. The proactive teardown/group-killer paths bound those siblings;
-/// this extra collection is what lets a later [`ErrorReason::Teardown`] outrank an
+/// this extra collection is what lets a later
+/// [`ErrorReason::Teardown`](crate::ErrorReason::Teardown) outrank an
 /// ordinary `Cancelled`/stdin/pump error instead of aborting the task that carries
 /// proof of a potentially-live process. The first teardown error in completion
 /// order remains authoritative.
@@ -3109,7 +3110,7 @@ mod tests {
                     marker.display()
                 ),
             ]);
-            return (producer, consumer);
+            (producer, consumer)
         }
         #[cfg(windows)]
         {
@@ -3148,6 +3149,7 @@ mod tests {
         }
     }
 
+    #[cfg(feature = "process-control")]
     fn partial_prefix_pipeline(
         marker: &std::path::Path,
         producer_pid: &std::path::Path,
@@ -3174,7 +3176,7 @@ mod tests {
                     marker.display()
                 ),
             ]);
-            return producer.pipe(consumer.cancel_on(token));
+            producer.pipe(consumer.cancel_on(token))
         }
         #[cfg(windows)]
         {
@@ -3208,6 +3210,7 @@ mod tests {
         }
     }
 
+    #[cfg(feature = "process-control")]
     fn cancellable_marked_pipeline(
         marker: &std::path::Path,
         producer_pid: &std::path::Path,
@@ -3218,6 +3221,7 @@ mod tests {
         producer.pipe(consumer)
     }
 
+    #[cfg(feature = "process-control")]
     fn stage_local_cancellable_marked_pipeline(
         marker: &std::path::Path,
         producer_pid: &std::path::Path,
@@ -3239,6 +3243,7 @@ mod tests {
         producer.pipe(consumer)
     }
 
+    #[cfg(feature = "process-control")]
     fn survivor_held_output_pipeline(
         marker: &std::path::Path,
         survivor_pid: &std::path::Path,
@@ -3300,6 +3305,7 @@ mod tests {
         );
     }
 
+    #[cfg(feature = "process-control")]
     async fn read_pipeline_pids(paths: &[&std::path::Path]) -> Vec<u32> {
         for _ in 0..500 {
             let parsed: Option<Vec<u32>> = paths
@@ -3370,6 +3376,7 @@ mod tests {
         }
     }
 
+    #[cfg(feature = "process-control")]
     fn assert_pipeline_confirmation_source(
         error: &crate::Error,
         expected: crate::TeardownCause,
@@ -3523,6 +3530,11 @@ mod tests {
         )
         .await
         .expect("both text partial tails must reach the production pump seam");
+        // Make the chain deadline observably older than the pump-salvage bound.
+        // Fast Unix hosts can publish both tails in under 20 ms, so advancing
+        // 4.95 s without this settle does not yet reach the five-second chain
+        // timeout and tests scheduler speed instead of the teardown race.
+        tokio::time::sleep(Duration::from_millis(100)).await;
         let faults = crate::sys::fault_injection::Faults::new()
             .fail_nth(
                 crate::sys::fault_injection::Site::ProcessGroupTeardown,
@@ -3613,6 +3625,9 @@ mod tests {
         )
         .await
         .expect("raw stdout bytes must reach the production capture buffer");
+        // Keep the chain deadline strictly ahead of the pump-salvage deadline
+        // on fast Unix hosts; see the text-capture counterpart above.
+        tokio::time::sleep(Duration::from_millis(100)).await;
         let faults = crate::sys::fault_injection::Faults::new()
             .fail_nth(
                 crate::sys::fault_injection::Site::ProcessGroupTeardown,

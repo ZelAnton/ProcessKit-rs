@@ -46,7 +46,7 @@ use crate::sys::pid_gate::PidGate;
 /// surviving grandchild holding a pipe can't hang the run.
 pub(crate) const PUMP_TEARDOWN: Duration = Duration::from_secs(5);
 
-#[cfg(test)]
+#[cfg(all(test, feature = "process-control"))]
 #[derive(Debug)]
 struct DeferredBackendWaitFailure {
     entered: AtomicBool,
@@ -56,7 +56,7 @@ struct DeferredBackendWaitFailure {
     raw_os_error: i32,
 }
 
-#[cfg(test)]
+#[cfg(all(test, feature = "process-control"))]
 impl DeferredBackendWaitFailure {
     async fn wait_until_entered(&self) {
         loop {
@@ -88,7 +88,7 @@ impl DeferredBackendWaitFailure {
     }
 }
 
-#[cfg(test)]
+#[cfg(all(test, feature = "process-control"))]
 thread_local! {
     static BACKEND_WAIT_FAILURE: std::cell::RefCell<Option<Arc<DeferredBackendWaitFailure>>> =
         const { std::cell::RefCell::new(None) };
@@ -98,12 +98,12 @@ thread_local! {
 /// ownership boundary, then blocks until released and returns the requested OS
 /// error. This lets pipeline tests race a genuine wait failure against their
 /// chain deadline without faking `PipelineTerminalState` calls.
-#[cfg(test)]
+#[cfg(all(test, feature = "process-control"))]
 pub(crate) struct BackendWaitFailureGuard {
     failure: Arc<DeferredBackendWaitFailure>,
 }
 
-#[cfg(test)]
+#[cfg(all(test, feature = "process-control"))]
 impl BackendWaitFailureGuard {
     pub(crate) async fn wait_until_entered(&self) {
         self.failure.wait_until_entered().await;
@@ -114,7 +114,7 @@ impl BackendWaitFailureGuard {
     }
 }
 
-#[cfg(test)]
+#[cfg(all(test, feature = "process-control"))]
 impl Drop for BackendWaitFailureGuard {
     fn drop(&mut self) {
         self.failure.release();
@@ -130,7 +130,7 @@ impl Drop for BackendWaitFailureGuard {
     }
 }
 
-#[cfg(test)]
+#[cfg(all(test, feature = "process-control"))]
 pub(crate) fn defer_next_backend_wait_error(raw_os_error: i32) -> BackendWaitFailureGuard {
     let failure = Arc::new(DeferredBackendWaitFailure {
         entered: AtomicBool::new(false),
@@ -148,12 +148,12 @@ pub(crate) fn defer_next_backend_wait_error(raw_os_error: i32) -> BackendWaitFai
     BackendWaitFailureGuard { failure }
 }
 
-#[cfg(test)]
+#[cfg(all(test, feature = "process-control"))]
 fn take_backend_wait_failure() -> Option<Arc<DeferredBackendWaitFailure>> {
     BACKEND_WAIT_FAILURE.with(|slot| slot.borrow_mut().take())
 }
 
-#[cfg(test)]
+#[cfg(all(test, feature = "process-control"))]
 thread_local! {
     static RAW_STDOUT_TEST_TX:
         std::cell::RefCell<Option<tokio::sync::mpsc::UnboundedSender<Vec<u8>>>> =
@@ -163,13 +163,13 @@ thread_local! {
 /// Test-only observation of bytes accepted by the production raw stdout pump.
 /// The guard lets pipeline regressions synchronize teardown with a real captured
 /// prefix instead of relying on a scheduler delay after the child wrote it.
-#[cfg(test)]
+#[cfg(all(test, feature = "process-control"))]
 pub(crate) struct RawStdoutPublicationGuard {
     receiver: tokio::sync::mpsc::UnboundedReceiver<Vec<u8>>,
     observed: Vec<u8>,
 }
 
-#[cfg(test)]
+#[cfg(all(test, feature = "process-control"))]
 impl RawStdoutPublicationGuard {
     pub(crate) async fn wait_until_contains(&mut self, expected: &[u8]) {
         if expected.is_empty() {
@@ -190,7 +190,7 @@ impl RawStdoutPublicationGuard {
     }
 }
 
-#[cfg(test)]
+#[cfg(all(test, feature = "process-control"))]
 impl Drop for RawStdoutPublicationGuard {
     fn drop(&mut self) {
         RAW_STDOUT_TEST_TX.with(|slot| {
@@ -199,7 +199,7 @@ impl Drop for RawStdoutPublicationGuard {
     }
 }
 
-#[cfg(test)]
+#[cfg(all(test, feature = "process-control"))]
 pub(crate) fn observe_raw_stdout_publications() -> RawStdoutPublicationGuard {
     let (sender, receiver) = tokio::sync::mpsc::unbounded_channel();
     RAW_STDOUT_TEST_TX.with(|slot| {
@@ -214,7 +214,7 @@ pub(crate) fn observe_raw_stdout_publications() -> RawStdoutPublicationGuard {
     }
 }
 
-#[cfg(test)]
+#[cfg(all(test, feature = "process-control"))]
 fn publish_raw_stdout_for_test(chunk: &[u8]) {
     RAW_STDOUT_TEST_TX.with(|slot| {
         if let Some(sender) = slot.borrow().as_ref() {
@@ -2575,7 +2575,7 @@ impl RunningProcess {
     /// (captures Unix signal number when available). Scripted: resolves at the
     /// canned `exit_at`, or immediately as `Signalled` if killed.
     async fn backend_wait(&mut self) -> Result<Outcome> {
-        #[cfg(test)]
+        #[cfg(all(test, feature = "process-control"))]
         if let Some(failure) = take_backend_wait_failure() {
             failure.entered.store(true, Ordering::Release);
             failure.entered_changed.notify_waiters();
@@ -3765,7 +3765,7 @@ async fn pump_raw_bytes<R>(
                     &signals.truncated,
                 );
                 drop(guard);
-                #[cfg(test)]
+                #[cfg(all(test, feature = "process-control"))]
                 publish_raw_stdout_for_test(&chunk[..n]);
             }
             // Broken pipe = the writer end closed = the normal end of a child
@@ -3894,6 +3894,7 @@ mod tests {
         }
     }
 
+    #[cfg(all(feature = "process-control", windows))]
     fn survivor_held_output_command(marker: &std::path::Path, use_pty: bool) -> Command {
         #[cfg(unix)]
         let command = Command::new("sh").args([
@@ -3947,6 +3948,7 @@ mod tests {
         );
     }
 
+    #[cfg(all(feature = "process-control", windows))]
     async fn read_survivor_pid(marker: &std::path::Path) -> u32 {
         for _ in 0..500 {
             if let Ok(text) = std::fs::read_to_string(marker)
@@ -3959,7 +3961,7 @@ mod tests {
         panic!("survivor pid was not published: {}", marker.display());
     }
 
-    #[cfg(feature = "process-control")]
+    #[cfg(all(feature = "process-control", windows))]
     async fn cleanup_group_members(group: &ProcessGroup) {
         group.kill_all().expect("cleanup survivor group");
         for _ in 0..500 {
@@ -3971,7 +3973,7 @@ mod tests {
         panic!("process-group members remained after explicit cleanup");
     }
 
-    #[cfg(feature = "process-control")]
+    #[cfg(all(feature = "process-control", windows))]
     async fn assert_survivor_and_cleanup(group: &ProcessGroup, survivor: u32) {
         assert!(
             group.members().expect("members").contains(&survivor),
@@ -4103,7 +4105,7 @@ mod tests {
         let _ = std::fs::remove_file(marker);
     }
 
-    #[cfg(feature = "process-control")]
+    #[cfg(all(feature = "process-control", windows))]
     #[tokio::test(flavor = "current_thread")]
     #[ignore = "spawns a real owned-group child for deterministic kill fault injection"]
     async fn whole_group_hard_kill_failure_outranks_cancellation() {
@@ -4224,7 +4226,7 @@ mod tests {
         let _ = std::fs::remove_file(marker);
     }
 
-    #[cfg(feature = "process-control")]
+    #[cfg(all(feature = "process-control", windows))]
     #[tokio::test(flavor = "current_thread")]
     #[ignore = "spawns a real owned-group child for deterministic graceful fault injection"]
     async fn graceful_group_failure_outranks_cancellation() {
@@ -4272,7 +4274,7 @@ mod tests {
         let _ = std::fs::remove_file(marker);
     }
 
-    #[cfg(all(feature = "pty", feature = "process-control"))]
+    #[cfg(all(feature = "pty", feature = "process-control", windows))]
     #[tokio::test(flavor = "current_thread")]
     #[ignore = "spawns an owned-group PTY tree for deterministic hard-kill fault injection"]
     async fn owned_pty_group_hard_failure_bounds_survivor_output_and_salvages_prefix() {
@@ -4342,7 +4344,7 @@ mod tests {
         let _ = std::fs::remove_file(marker);
     }
 
-    #[cfg(all(feature = "pty", feature = "process-control"))]
+    #[cfg(all(feature = "pty", feature = "process-control", windows))]
     #[tokio::test(flavor = "current_thread")]
     #[ignore = "spawns an owned-group PTY tree for deterministic graceful fault injection"]
     async fn owned_pty_group_graceful_failure_bounds_survivor_output_and_salvages_prefix() {
@@ -4423,7 +4425,11 @@ mod tests {
         let _ = std::fs::remove_file(marker);
     }
 
-    #[cfg(all(feature = "pty", feature = "process-control"))]
+    #[cfg(all(
+        feature = "pty",
+        feature = "process-control",
+        any(windows, target_os = "linux")
+    ))]
     #[tokio::test(flavor = "current_thread")]
     #[ignore = "spawns a real shared-group PTY child for deterministic kill fault injection"]
     async fn shared_pty_child_kill_failure_is_not_reported_as_cancelled() {

@@ -118,7 +118,7 @@ fn observe_guard_entry() {
     });
 }
 
-#[cfg(test)]
+#[cfg(all(test, feature = "process-control"))]
 thread_local! {
     static PARTIAL_TAIL_TEST_TX:
         std::cell::RefCell<Option<tokio::sync::mpsc::UnboundedSender<String>>> =
@@ -128,12 +128,12 @@ thread_local! {
 /// Test-only observation of the real pump publication seam. Pipeline regression
 /// tests use it to prove that unterminated stdout/stderr text reached
 /// `SharedLines::partial_tail` before they fire teardown.
-#[cfg(test)]
+#[cfg(all(test, feature = "process-control"))]
 pub(crate) struct PartialTailPublicationGuard {
     receiver: tokio::sync::mpsc::UnboundedReceiver<String>,
 }
 
-#[cfg(test)]
+#[cfg(all(test, feature = "process-control"))]
 impl PartialTailPublicationGuard {
     pub(crate) async fn wait_for_all(&mut self, expected: &[&str]) {
         let mut remaining: std::collections::BTreeSet<String> =
@@ -149,7 +149,7 @@ impl PartialTailPublicationGuard {
     }
 }
 
-#[cfg(test)]
+#[cfg(all(test, feature = "process-control"))]
 impl Drop for PartialTailPublicationGuard {
     fn drop(&mut self) {
         PARTIAL_TAIL_TEST_TX.with(|slot| {
@@ -158,7 +158,7 @@ impl Drop for PartialTailPublicationGuard {
     }
 }
 
-#[cfg(test)]
+#[cfg(all(test, feature = "process-control"))]
 pub(crate) fn observe_partial_tail_publications() -> PartialTailPublicationGuard {
     let (sender, receiver) = tokio::sync::mpsc::unbounded_channel();
     PARTIAL_TAIL_TEST_TX.with(|slot| {
@@ -170,7 +170,7 @@ pub(crate) fn observe_partial_tail_publications() -> PartialTailPublicationGuard
     PartialTailPublicationGuard { receiver }
 }
 
-#[cfg(test)]
+#[cfg(all(test, feature = "process-control"))]
 fn publish_partial_tail_for_test(tail: &str) {
     if tail.is_empty() {
         return;
@@ -952,7 +952,7 @@ impl SharedLines {
         if changed {
             drop(inner);
             self.publish_change();
-            #[cfg(test)]
+            #[cfg(all(test, feature = "process-control"))]
             publish_partial_tail_for_test(tail);
         }
     }
