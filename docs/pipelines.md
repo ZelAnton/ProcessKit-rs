@@ -331,7 +331,10 @@ including siblings that settle after the first `Cancelled` error. If any sibling
 reports an unconfirmed kill/escalation/reap, its `ErrorReason::Teardown`
 deterministically outranks ordinary cancellation, stdin, and output-pump errors;
 the first teardown error observed in completion order supplies the retained OS
-source.
+source. A failed fallback group kill also keeps the cause latched when proactive
+teardown first fired: stage-local or chain cancellation reports
+`TeardownCause::Cancellation`, while an earlier stage failure remains
+`TeardownCause::PipelineFailure` even if a token fires during the drain grace.
 
 ## Streaming a live chain
 

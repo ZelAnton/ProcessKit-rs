@@ -25,7 +25,9 @@ to a dated version section.
   bounded captured prefix instead of reporting `Timeout`/`Cancelled` over a
   potentially-live process. Pipeline cancellation collects bounded sibling
   terminal dispositions so a sibling teardown failure cannot be hidden by the
-  first ordinary `Cancelled` error. Such errors are never retried automatically.
+  first ordinary `Cancelled` error, and fallback group-kill failures retain the
+  first proactive cause instead of being relabelled by a later cancellation
+  token. Such errors are never retried automatically.
 - Reject zero PTY dimensions on every platform and dimensions above `i16::MAX`
   on Windows before launch or live resize. ConPTY no longer silently clamps a
   large request while leaving `COLUMNS`/`LINES` at the caller's original values;

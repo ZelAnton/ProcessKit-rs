@@ -42,6 +42,50 @@ const TEARDOWN_DRAIN_GRACE: Duration = Duration::from_millis(500);
 const LAST_STAGE_PROBE_MIN: Duration = Duration::from_millis(25);
 const LAST_STAGE_PROBE_MAX: Duration = Duration::from_millis(500);
 
+#[cfg(test)]
+thread_local! {
+    /// Deterministic race seam: run one synchronous callback after the proactive
+    /// drain grace but before its fallback group kill. Keeping it thread-local
+    /// matches the existing fault injector and isolates parallel test runtimes.
+    static BEFORE_PIPELINE_FALLBACK_KILL: std::cell::RefCell<Option<Box<dyn FnOnce()>>> =
+        const { std::cell::RefCell::new(None) };
+}
+
+#[cfg(test)]
+struct PipelineFallbackKillHookGuard;
+
+#[cfg(test)]
+impl Drop for PipelineFallbackKillHookGuard {
+    fn drop(&mut self) {
+        BEFORE_PIPELINE_FALLBACK_KILL.with(|slot| {
+            slot.borrow_mut().take();
+        });
+    }
+}
+
+#[cfg(test)]
+fn before_pipeline_fallback_kill(hook: impl FnOnce() + 'static) -> PipelineFallbackKillHookGuard {
+    BEFORE_PIPELINE_FALLBACK_KILL.with(|slot| {
+        assert!(
+            slot.borrow_mut().replace(Box::new(hook)).is_none(),
+            "pipeline fallback-kill hook already armed on this thread"
+        );
+    });
+    PipelineFallbackKillHookGuard
+}
+
+#[cfg(test)]
+fn run_before_pipeline_fallback_kill() {
+    BEFORE_PIPELINE_FALLBACK_KILL.with(|slot| {
+        if let Some(hook) = slot.borrow_mut().take() {
+            hook();
+        }
+    });
+}
+
+#[cfg(not(test))]
+fn run_before_pipeline_fallback_kill() {}
+
 /// A chain of [`Command`]s connected stdout→stdin — built with
 /// [`Command::pipe`], extended with [`pipe`](Self::pipe), driven with the same
 /// verb vocabulary as a single [`Command`]:
@@ -385,6 +429,10 @@ impl Pipeline {
     /// disposition: a sibling [`ErrorReason::Teardown`](crate::ErrorReason::Teardown)
     /// outranks ordinary `Cancelled`, stdin, or pump errors, so the chain never
     /// claims confirmed cancellation while another stage may still be live.
+    /// If the fallback group kill itself fails, its [`TeardownCause`](crate::TeardownCause)
+    /// is the first condition that fired proactive teardown: stage-local or chain
+    /// cancellation remains `Cancellation`, while an earlier stage failure remains
+    /// `PipelineFailure` even if another token fires during the drain grace.
     pub fn cancel_on(mut self, token: tokio_util::sync::CancellationToken) -> Self {
         self.cancel_token = Some(token);
         self
@@ -634,6 +682,7 @@ impl Pipeline {
         // reacts by tearing the whole live chain down — so a quiet upstream can't
         // hold a failed streaming chain open.
         let teardown = tokio_util::sync::CancellationToken::new();
+        let teardown_cause: PipelineTeardownCause = Arc::default();
 
         // Background-drain every inner stage while the caller streams the last. Each
         // task reuses `finish_inner_stage` (the shared classify-and-teardown body)
@@ -650,6 +699,7 @@ impl Pipeline {
             let ok_codes = stage.ok_codes_vec();
             let timeout = stage.configured_timeout();
             let teardown = teardown.clone();
+            let teardown_cause = teardown_cause.clone();
             inner_tasks.spawn(async move {
                 let result = finish_inner_stage(
                     process,
@@ -659,10 +709,15 @@ impl Pipeline {
                     timeout,
                     unchecked,
                     teardown.clone(),
+                    teardown_cause.clone(),
                 )
                 .await;
-                if result.is_err() {
-                    teardown.cancel();
+                if let Err(error) = &result {
+                    trigger_pipeline_teardown(
+                        &teardown,
+                        &teardown_cause,
+                        pipeline_error_teardown_cause(error),
+                    );
                 }
                 result
             });
@@ -678,7 +733,7 @@ impl Pipeline {
             teardown.clone(),
             &stage_groups,
             teardown_failure.clone(),
-            self.cancel_token.clone(),
+            teardown_cause.clone(),
         );
 
         // The last stage is the caller's to stream, so it gets no `inner_tasks`-style
@@ -696,6 +751,7 @@ impl Pipeline {
             last_ok_codes.clone(),
             last_unchecked,
             teardown.clone(),
+            teardown_cause.clone(),
             last_disposition.clone(),
         );
 
@@ -737,6 +793,7 @@ impl Pipeline {
             inner_count,
             stage_groups,
             teardown,
+            teardown_cause,
             timeout: self.timeout,
             chain_state,
             deadline_task,
@@ -823,9 +880,10 @@ impl Pipeline {
         // open after the failure. Stages ended by that kill are flagged `torn_down` and
         // de-prioritized in the pipefail fold, so the real culprit is still blamed.
         // This is distinct from the user's `cancel_token`: a cancelled stage errors
-        // out (`Err(Cancelled)`) before producing a `StageOutcome`, so cancellation
-        // never fires this teardown and the cancel path is unchanged.
+        // out (`Err(Cancelled)`) before producing a `StageOutcome`; the central raw
+        // error path fires this token with `Cancellation` as its latched cause.
         let teardown = tokio_util::sync::CancellationToken::new();
+        let teardown_cause: PipelineTeardownCause = Arc::default();
         let teardown_failure: PipelineTeardownFailure = Arc::default();
 
         // Drain concurrently: a stderr-chatty inner stage must not block on a full pipe.
@@ -859,12 +917,20 @@ impl Pipeline {
             let ok_codes = stage.ok_codes_vec();
             let timeout = stage.configured_timeout();
             let teardown = teardown.clone();
+            let teardown_cause = teardown_cause.clone();
             tasks.spawn(async move {
                 // `finish_inner_stage` is the shared classify-and-teardown body,
                 // reused by `start`'s streaming inner drains — so both paths blame
                 // a stage and fire proactive teardown identically.
                 let (index, outcome) = finish_inner_stage(
-                    process, index, program, ok_codes, timeout, unchecked, teardown,
+                    process,
+                    index,
+                    program,
+                    ok_codes,
+                    timeout,
+                    unchecked,
+                    teardown,
+                    teardown_cause,
                 )
                 .await?;
                 Ok(Joined::Inner(index, outcome))
@@ -891,6 +957,7 @@ impl Pipeline {
         });
         {
             let teardown = teardown.clone();
+            let teardown_cause = teardown_cause.clone();
             let last_ok_codes = last_ok_codes.clone();
             let completed = completed.clone();
             tasks.spawn(async move {
@@ -904,13 +971,18 @@ impl Pipeline {
                 if !torn_down
                     && is_checked_failure(result.outcome(), &last_ok_codes, last_unchecked)
                 {
-                    teardown.cancel();
+                    trigger_pipeline_teardown(
+                        &teardown,
+                        &teardown_cause,
+                        crate::TeardownCause::PipelineFailure,
+                    );
                 }
                 Ok(Joined::Last(result, torn_down))
             });
         }
 
         let collect_failure = teardown_failure.clone();
+        let collect_cause = teardown_cause.clone();
         let collect = async {
             // On a bad completion `drain_unordered` fires `teardown` itself; the
             // killer arm below wakes and tears every stage's sub-group down,
@@ -918,7 +990,7 @@ impl Pipeline {
             // `gather` (however long the drain takes to notice) still finishes
             // and wins the `select!` rather than hanging next to a pending kill.
             let gather = async {
-                let joined = drain_unordered(tasks, &teardown)
+                let joined = drain_unordered(tasks, &teardown, &teardown_cause)
                     .await
                     .map_err(|failure| failure.error)?;
                 let mut inner_outcomes: Vec<Option<StageOutcome>> =
@@ -948,19 +1020,11 @@ impl Pipeline {
                 () = async {
                     teardown.cancelled().await;
                     tokio::time::sleep(TEARDOWN_DRAIN_GRACE).await;
+                    run_before_pipeline_fallback_kill();
                     if let Err(source) = kill_all_stage_groups(&stage_groups) {
-                        let cause = if self
-                            .cancel_token
-                            .as_ref()
-                            .is_some_and(tokio_util::sync::CancellationToken::is_cancelled)
-                        {
-                            crate::TeardownCause::Cancellation
-                        } else {
-                            crate::TeardownCause::PipelineFailure
-                        };
                         record_pipeline_teardown_failure(
                             &collect_failure,
-                            cause,
+                            latched_pipeline_teardown_cause(&collect_cause),
                             source,
                         );
                     }
@@ -1291,12 +1355,13 @@ impl Pipeline {
 /// same teardown, so an unfinished session is not a way for a failed chain's
 /// upstream to keep running. The teardown is therefore prompt but not
 /// instantaneous — it lands within one probe interval of the failure plus the
-/// drain grace. Only the last stage's *process outcome* is watched this way; a
-/// non-outcome failure of that stage ([`ErrorReason::Stdin`](crate::ErrorReason::Stdin),
+/// drain grace. The watcher observes the last stage's *process outcome* and the
+/// cancellation disposition latched with that exit; other non-outcome failures
+/// ([`ErrorReason::Stdin`](crate::ErrorReason::Stdin),
 /// [`ErrorReason::OutputTooLarge`](crate::ErrorReason::OutputTooLarge), …) still
-/// surfaces at `finish`, and a last stage that exits *cleanly* deliberately fires
-/// no teardown — a chain whose stages all succeed is not a failed chain, and
-/// `finish` still waits for the rest of it.
+/// surface at `finish`. A last stage that exits cleanly without cancellation
+/// deliberately fires no teardown — a chain whose stages all succeed is not a
+/// failed chain, and `finish` still waits for the rest of it.
 #[must_use = "a PipelineSession streams a live chain; drop it and the whole chain is killed unread"]
 pub struct PipelineSession {
     /// The last stage's live handle — the streaming surface the caller drives —
@@ -1331,6 +1396,8 @@ pub struct PipelineSession {
     stage_groups: Vec<Arc<ProcessGroup>>,
     /// Proactive teardown token, fired by an inner stage's checked/raw failure.
     teardown: tokio_util::sync::CancellationToken,
+    /// Cause paired with the first proactive trigger, published before `teardown`.
+    teardown_cause: PipelineTeardownCause,
     /// The chain-wide [`Pipeline::timeout`], if any (gates the arbiter read).
     timeout: Option<Duration>,
     /// The chain-wide deadline arbiter (reusing the shared `running::deadline` CAS
@@ -1493,6 +1560,7 @@ impl PipelineSession {
         // out of the public `finish`.
         let (last, inner_tasks) = self.take_live_parts();
         let teardown = self.teardown.clone();
+        let teardown_cause = self.teardown_cause.clone();
         let last_ok_codes = self.last_ok_codes.clone();
         let last_unchecked = self.last_unchecked;
 
@@ -1503,6 +1571,7 @@ impl PipelineSession {
         // wedge the finalize; the killer then tears the chain down.
         let last_fut = {
             let teardown = teardown.clone();
+            let teardown_cause = teardown_cause.clone();
             let disposition = self.last_disposition.clone();
             async move {
                 // Same shape as `finish_inner_stage`: latch `torn_down` at the
@@ -1531,10 +1600,18 @@ impl PipelineSession {
                         if !torn_down
                             && is_checked_failure(finished.outcome, &last_ok_codes, last_unchecked)
                         {
-                            teardown.cancel();
+                            trigger_pipeline_teardown(
+                                &teardown,
+                                &teardown_cause,
+                                crate::TeardownCause::PipelineFailure,
+                            );
                         }
                     }
-                    Err(_) if !torn_down => teardown.cancel(),
+                    Err(error) if !torn_down => trigger_pipeline_teardown(
+                        &teardown,
+                        &teardown_cause,
+                        pipeline_error_teardown_cause(error),
+                    ),
                     Err(_) => {}
                 }
                 (result, torn_down)
@@ -1547,7 +1624,10 @@ impl PipelineSession {
             biased;
             () = wait_pipeline_teardown_failure(&self.teardown_failure) => None,
             settled = async {
-                tokio::join!(last_fut, drain_unordered(inner_tasks, &teardown))
+                tokio::join!(
+                    last_fut,
+                    drain_unordered(inner_tasks, &teardown, &teardown_cause)
+                )
             } => Some(settled),
         };
 
@@ -1814,6 +1894,35 @@ struct PipelineTeardownState {
 
 type PipelineTeardownFailure = Arc<PipelineTeardownState>;
 
+/// The condition that first fired a pipeline's proactive teardown. It is
+/// published before the cancellation token so every fallback observer sees the
+/// initiating cause, never a later token's ambient state.
+type PipelineTeardownCause = Arc<std::sync::OnceLock<crate::TeardownCause>>;
+
+fn trigger_pipeline_teardown(
+    teardown: &tokio_util::sync::CancellationToken,
+    cause_slot: &PipelineTeardownCause,
+    cause: crate::TeardownCause,
+) {
+    let _ = cause_slot.set(cause);
+    teardown.cancel();
+}
+
+fn pipeline_error_teardown_cause(error: &crate::Error) -> crate::TeardownCause {
+    match error.reason() {
+        crate::ErrorReason::Cancelled { .. } => crate::TeardownCause::Cancellation,
+        crate::ErrorReason::Teardown { cause, .. } => *cause,
+        _ => crate::TeardownCause::PipelineFailure,
+    }
+}
+
+fn latched_pipeline_teardown_cause(cause_slot: &PipelineTeardownCause) -> crate::TeardownCause {
+    cause_slot
+        .get()
+        .copied()
+        .unwrap_or(crate::TeardownCause::PipelineFailure)
+}
+
 fn record_pipeline_teardown_failure(
     slot: &PipelineTeardownFailure,
     cause: crate::TeardownCause,
@@ -1890,27 +1999,25 @@ fn kill_weak_stage_groups(groups: &[Weak<ProcessGroup>]) -> std::io::Result<()> 
 /// waits on `teardown`, gives downstream filters a bounded window to drain final
 /// bytes and EOF, then fans a hard kill across every stage's sub-group (the last
 /// stage included). Holds [`Weak`] handles so it never pins the groups; the
-/// session aborts it on `finish`/drop.
+/// session aborts it on `finish`/drop. The initiating cause was latched before
+/// `teardown` fired, so a token that changes later cannot relabel a failed kill.
 fn spawn_group_killer(
     teardown: tokio_util::sync::CancellationToken,
     stage_groups: &[Arc<ProcessGroup>],
     teardown_failure: PipelineTeardownFailure,
-    chain_cancel: Option<tokio_util::sync::CancellationToken>,
+    teardown_cause: PipelineTeardownCause,
 ) -> JoinHandle<()> {
     let groups: Vec<Weak<ProcessGroup>> = stage_groups.iter().map(Arc::downgrade).collect();
     tokio::spawn(async move {
         teardown.cancelled().await;
         tokio::time::sleep(TEARDOWN_DRAIN_GRACE).await;
+        run_before_pipeline_fallback_kill();
         if let Err(source) = kill_weak_stage_groups(&groups) {
-            let cause = if chain_cancel
-                .as_ref()
-                .is_some_and(tokio_util::sync::CancellationToken::is_cancelled)
-            {
-                crate::TeardownCause::Cancellation
-            } else {
-                crate::TeardownCause::PipelineFailure
-            };
-            record_pipeline_teardown_failure(&teardown_failure, cause, source);
+            record_pipeline_teardown_failure(
+                &teardown_failure,
+                latched_pipeline_teardown_cause(&teardown_cause),
+                source,
+            );
         }
     })
 }
@@ -2019,14 +2126,16 @@ impl ExitDisposition {
 /// The last stage cannot be driven that way: the caller streams it and
 /// [`finish`](PipelineSession::finish) consumes it, so nothing may take it over.
 /// This task instead **observes** it — a non-blocking
-/// [`exit_outcome_now`](RunningProcess::exit_outcome_now) probe under the shared
-/// slot's lock, which neither consumes the handle nor touches its streams, so the
+/// [`exit_outcome_now`](RunningProcess::exit_outcome_now) probe plus its latched
+/// cancellation disposition under the shared slot's lock. The probe neither
+/// consumes the handle nor touches its streams, so the
 /// consume-once contract of
 /// [`stdout_lines`](PipelineSession::stdout_lines)/[`events`](PipelineSession::events)
 /// is untouched — and then applies `finish_inner_stage`'s rule to what it sees:
 /// latch the stage's [`ExitDisposition`] against the teardown in flight (if any),
-/// and fire `teardown` only for a checked failure that no sibling's teardown
-/// preceded. Both drives observe the same thing — the stage's *exit* — so this
+/// and fire `teardown` only for a checked failure or observed cancellation that no
+/// sibling's teardown preceded. Both drives observe the same thing — the stage's
+/// *exit* — so this
 /// watcher reaches the attribution `finish` would have reached, sooner; it does not
 /// reach a different one. The latch is also what stops `finish` from reading the
 /// teardown *this* stage triggered as evidence that a sibling killed it.
@@ -2045,6 +2154,7 @@ fn spawn_last_stage_watcher(
     ok_codes: Vec<i32>,
     unchecked: bool,
     teardown: tokio_util::sync::CancellationToken,
+    teardown_cause: PipelineTeardownCause,
     disposition: ExitDisposition,
 ) -> JoinHandle<()> {
     let slot = Arc::downgrade(last);
@@ -2060,11 +2170,13 @@ fn spawn_last_stage_watcher(
             };
             // An empty slot means an `async` session call holds the handle right now
             // (`wait_for_line`); skip this round rather than making the caller wait.
-            let observed = lock_last(&slot)
-                .as_mut()
-                .and_then(RunningProcess::exit_outcome_now);
+            let observed = lock_last(&slot).as_mut().and_then(|process| {
+                process
+                    .exit_outcome_now()
+                    .map(|outcome| (outcome, process.cancelled_at_exit()))
+            });
             drop(slot);
-            let Some(outcome) = observed else {
+            let Some((outcome, cancelled)) = observed else {
                 continue;
             };
             // Same rule and same order as `finish_inner_stage`: latch the stage's
@@ -2074,9 +2186,17 @@ fn spawn_last_stage_watcher(
             // makes the fired token safe to read: anything that observes the teardown
             // also observes who fired it.
             if !disposition.latch(teardown.is_cancelled())
-                && is_checked_failure(outcome, &ok_codes, unchecked)
+                && (cancelled || is_checked_failure(outcome, &ok_codes, unchecked))
             {
-                teardown.cancel();
+                trigger_pipeline_teardown(
+                    &teardown,
+                    &teardown_cause,
+                    if cancelled {
+                        crate::TeardownCause::Cancellation
+                    } else {
+                        crate::TeardownCause::PipelineFailure
+                    },
+                );
             }
             return;
         }
@@ -2105,6 +2225,7 @@ async fn finish_inner_stage(
     timeout: Option<Duration>,
     unchecked: bool,
     teardown: tokio_util::sync::CancellationToken,
+    teardown_cause: PipelineTeardownCause,
 ) -> Result<(usize, StageOutcome)> {
     // Nothing else observes an inner stage, so this latch has exactly one writer —
     // it is here to read the teardown at the right *instant*, not to arbitrate
@@ -2127,7 +2248,11 @@ async fn finish_inner_stage(
     // drain grace can't cut the culprit's diagnostics short.
     let torn_down = disposition.latch(teardown.is_cancelled());
     if !torn_down && is_checked_failure(outcome, &ok_codes, unchecked) {
-        teardown.cancel();
+        trigger_pipeline_teardown(
+            &teardown,
+            &teardown_cause,
+            crate::TeardownCause::PipelineFailure,
+        );
     }
     Ok((
         index,
@@ -2370,6 +2495,10 @@ type InnerDrain = std::result::Result<Vec<InnerStage>, PartialDrainError<InnerSt
 /// proof of a potentially-live process. The first teardown error in completion
 /// order remains authoritative.
 ///
+/// Every bad completion also publishes its proactive-teardown cause before firing
+/// the token: raw cancellation preserves `Cancellation`, an existing stage
+/// `Teardown` preserves its cause, and other errors or panics use `PipelineFailure`.
+///
 /// On success, every task's `Ok` payload is returned — in **completion** order,
 /// not submission order; a payload that must be rebuilt in original stage order
 /// (as `capture` does) needs to carry its own position, the way [`Joined::Inner`]'s
@@ -2377,6 +2506,7 @@ type InnerDrain = std::result::Result<Vec<InnerStage>, PartialDrainError<InnerSt
 async fn drain_unordered<Item: 'static>(
     mut tasks: tokio::task::JoinSet<Result<Item>>,
     teardown: &tokio_util::sync::CancellationToken,
+    teardown_cause: &PipelineTeardownCause,
 ) -> std::result::Result<Vec<Item>, PartialDrainError<Item>> {
     let mut collected = Vec::with_capacity(tasks.len());
     let mut first_error = None;
@@ -2384,14 +2514,22 @@ async fn drain_unordered<Item: 'static>(
         match joined {
             Ok(Ok(item)) => collected.push(item),
             Ok(Err(err)) => {
-                teardown.cancel();
+                trigger_pipeline_teardown(
+                    teardown,
+                    teardown_cause,
+                    pipeline_error_teardown_cause(&err),
+                );
                 first_error = Some(match first_error {
                     Some(first) => prefer_pipeline_terminal_error(first, err),
                     None => err,
                 });
             }
             Err(join_err) => {
-                teardown.cancel();
+                trigger_pipeline_teardown(
+                    teardown,
+                    teardown_cause,
+                    crate::TeardownCause::PipelineFailure,
+                );
                 let error = join_error(join_err);
                 first_error = Some(match first_error {
                     Some(first) => prefer_pipeline_terminal_error(first, error),
@@ -2483,34 +2621,43 @@ mod tests {
         }
     }
 
-    fn cancellable_marked_pipeline(
+    fn marked_pipeline_commands(
         marker: &std::path::Path,
         producer_pid: &std::path::Path,
         consumer_pid: &std::path::Path,
-    ) -> Pipeline {
+        fail_consumer: bool,
+    ) -> (Command, Command) {
         #[cfg(unix)]
-        return Command::new("sh")
-            .args([
+        {
+            let producer = Command::new("sh").args([
                 "-c",
                 &format!(
                     "printf '%s' \"$$\" > '{}'; sleep 60",
                     producer_pid.display()
                 ),
-            ])
-            .pipe(Command::new("sh").args([
+            ]);
+            let consumer_tail = if fail_consumer { "exit 7" } else { "sleep 60" };
+            let consumer = Command::new("sh").args([
                 "-c",
                 &format!(
                     "printf 'pipeline-prefix\\n'; printf 'pipeline-stderr-prefix\\n' >&2; \
-                     printf '%s' \"$$\" > '{}'; : > '{}'; sleep 60",
+                     printf '%s' \"$$\" > '{}'; : > '{}'; {consumer_tail}",
                     consumer_pid.display(),
                     marker.display()
                 ),
-            ]));
+            ]);
+            return (producer, consumer);
+        }
         #[cfg(windows)]
         {
             let marker = marker.display().to_string().replace('\'', "''");
             let producer_pid = producer_pid.display().to_string().replace('\'', "''");
             let consumer_pid = consumer_pid.display().to_string().replace('\'', "''");
+            let consumer_tail = if fail_consumer {
+                "exit 7"
+            } else {
+                "Start-Sleep -Seconds 60"
+            };
             let producer = Command::new("powershell").args([
                 "-NoLogo",
                 "-NoProfile",
@@ -2531,11 +2678,42 @@ mod tests {
                      [Console]::Error.WriteLine('pipeline-stderr-prefix'); \
                      [IO.File]::WriteAllText('{consumer_pid}', [string]$PID); \
                      [IO.File]::WriteAllText('{marker}', 'ready'); \
-                     Start-Sleep -Seconds 60"
+                     {consumer_tail}"
                 ),
             ]);
-            producer.pipe(consumer)
+            (producer, consumer)
         }
+    }
+
+    fn cancellable_marked_pipeline(
+        marker: &std::path::Path,
+        producer_pid: &std::path::Path,
+        consumer_pid: &std::path::Path,
+    ) -> Pipeline {
+        let (producer, consumer) =
+            marked_pipeline_commands(marker, producer_pid, consumer_pid, false);
+        producer.pipe(consumer)
+    }
+
+    fn stage_local_cancellable_marked_pipeline(
+        marker: &std::path::Path,
+        producer_pid: &std::path::Path,
+        consumer_pid: &std::path::Path,
+        token: crate::CancellationToken,
+    ) -> Pipeline {
+        let (producer, consumer) =
+            marked_pipeline_commands(marker, producer_pid, consumer_pid, false);
+        producer.pipe(consumer.cancel_on(token))
+    }
+
+    fn failing_marked_pipeline(
+        marker: &std::path::Path,
+        producer_pid: &std::path::Path,
+        consumer_pid: &std::path::Path,
+    ) -> Pipeline {
+        let (producer, consumer) =
+            marked_pipeline_commands(marker, producer_pid, consumer_pid, true);
+        producer.pipe(consumer)
     }
 
     fn survivor_held_output_pipeline(
@@ -2863,6 +3041,219 @@ mod tests {
         assert!(
             faults.matched(crate::sys::fault_injection::Site::ProcessGroupTeardown) >= 2,
             "one stage must confirm cancellation before its sibling teardown fails"
+        );
+        drop(faults);
+        assert_pipeline_pids_gone(&pids).await;
+        for path in [&marker, &producer_pid, &consumer_pid] {
+            let _ = std::fs::remove_file(path);
+        }
+    }
+
+    #[cfg(feature = "process-control")]
+    #[tokio::test(flavor = "current_thread")]
+    #[ignore = "spawns a real buffered pipeline for stage-local cancellation fault injection"]
+    async fn buffered_stage_local_cancellation_latches_fallback_teardown_cause() {
+        let marker = pipeline_marker("buffered_stage_cancel");
+        let producer_pid = pipeline_marker("buffered_stage_cancel_producer");
+        let consumer_pid = pipeline_marker("buffered_stage_cancel_consumer");
+        for path in [&marker, &producer_pid, &consumer_pid] {
+            let _ = std::fs::remove_file(path);
+        }
+        let token = crate::CancellationToken::new();
+        let pipeline = stage_local_cancellable_marked_pipeline(
+            &marker,
+            &producer_pid,
+            &consumer_pid,
+            token.clone(),
+        );
+        let task = tokio::spawn(async move { pipeline.output_string().await });
+        wait_for_pipeline_marker(&marker).await;
+        let pids = read_pipeline_pids(&[&producer_pid, &consumer_pid]).await;
+        let faults = crate::sys::fault_injection::Faults::new()
+            .fail_nth(
+                crate::sys::fault_injection::Site::ProcessGroupTeardown,
+                Some("hard"),
+                2,
+                5,
+            )
+            .arm();
+
+        token.cancel();
+        let error = tokio::time::timeout(Duration::from_secs(10), task)
+            .await
+            .expect("buffered stage-local cancellation must stay bounded")
+            .expect("pipeline task")
+            .expect_err("the sibling fallback failure must fail closed");
+        assert_pipeline_teardown(&error, crate::TeardownCause::Cancellation);
+        assert_eq!(
+            faults.fired(crate::sys::fault_injection::Site::ProcessGroupTeardown),
+            1,
+            "only the selected sibling fallback group kill is faulted"
+        );
+        drop(faults);
+        assert_pipeline_pids_gone(&pids).await;
+        for path in [&marker, &producer_pid, &consumer_pid] {
+            let _ = std::fs::remove_file(path);
+        }
+    }
+
+    #[cfg(feature = "process-control")]
+    #[tokio::test(flavor = "current_thread")]
+    #[ignore = "spawns a real live pipeline for stage-local cancellation fault injection"]
+    async fn live_stage_local_cancellation_latches_fallback_teardown_cause() {
+        let marker = pipeline_marker("live_stage_cancel");
+        let producer_pid = pipeline_marker("live_stage_cancel_producer");
+        let consumer_pid = pipeline_marker("live_stage_cancel_consumer");
+        for path in [&marker, &producer_pid, &consumer_pid] {
+            let _ = std::fs::remove_file(path);
+        }
+        let token = crate::CancellationToken::new();
+        let session = stage_local_cancellable_marked_pipeline(
+            &marker,
+            &producer_pid,
+            &consumer_pid,
+            token.clone(),
+        )
+        .start()
+        .await
+        .expect("start stage-local cancellable live pipeline");
+        wait_for_pipeline_marker(&marker).await;
+        let pids = read_pipeline_pids(&[&producer_pid, &consumer_pid]).await;
+        let faults = crate::sys::fault_injection::Faults::new()
+            .fail_nth(
+                crate::sys::fault_injection::Site::ProcessGroupTeardown,
+                Some("hard"),
+                2,
+                5,
+            )
+            .arm();
+
+        token.cancel();
+        tokio::time::timeout(Duration::from_secs(2), session.teardown.cancelled())
+            .await
+            .expect("the live last-stage watcher must observe stage-local cancellation");
+        assert_eq!(
+            session.teardown_cause.get(),
+            Some(&crate::TeardownCause::Cancellation),
+            "the watcher publishes cancellation before the fallback kill"
+        );
+        let error = tokio::time::timeout(Duration::from_secs(10), session.finish())
+            .await
+            .expect("live stage-local cancellation must stay bounded")
+            .expect_err("the sibling fallback failure must fail closed");
+        assert_pipeline_teardown(&error, crate::TeardownCause::Cancellation);
+        assert_eq!(
+            faults.fired(crate::sys::fault_injection::Site::ProcessGroupTeardown),
+            1,
+            "only the selected sibling fallback group kill is faulted"
+        );
+        drop(faults);
+        assert_pipeline_pids_gone(&pids).await;
+        for path in [&marker, &producer_pid, &consumer_pid] {
+            let _ = std::fs::remove_file(path);
+        }
+    }
+
+    #[cfg(feature = "process-control")]
+    #[tokio::test(flavor = "current_thread")]
+    #[ignore = "spawns a real buffered pipeline for a deterministic late-cancel race"]
+    async fn buffered_pipeline_failure_cause_survives_late_chain_cancellation() {
+        let marker = pipeline_marker("buffered_late_chain_cancel");
+        let producer_pid = pipeline_marker("buffered_late_chain_cancel_producer");
+        let consumer_pid = pipeline_marker("buffered_late_chain_cancel_consumer");
+        for path in [&marker, &producer_pid, &consumer_pid] {
+            let _ = std::fs::remove_file(path);
+        }
+        let chain_token = crate::CancellationToken::new();
+        let late_token = chain_token.clone();
+        let _hook = before_pipeline_fallback_kill(move || late_token.cancel());
+        let faults = crate::sys::fault_injection::Faults::new()
+            .fail_nth(
+                crate::sys::fault_injection::Site::ProcessGroupTeardown,
+                Some("hard"),
+                1,
+                5,
+            )
+            .arm();
+        let pipeline = failing_marked_pipeline(&marker, &producer_pid, &consumer_pid)
+            .cancel_on(chain_token.clone());
+        let task = tokio::spawn(async move { pipeline.output_string().await });
+        wait_for_pipeline_marker(&marker).await;
+        let pids = read_pipeline_pids(&[&producer_pid, &consumer_pid]).await;
+
+        let error = tokio::time::timeout(Duration::from_secs(10), task)
+            .await
+            .expect("buffered late-cancel race must stay bounded")
+            .expect("pipeline task")
+            .expect_err("the injected fallback failure must fail closed");
+        assert!(
+            chain_token.is_cancelled(),
+            "the fallback hook fired the late token"
+        );
+        assert_pipeline_teardown(&error, crate::TeardownCause::PipelineFailure);
+        assert_eq!(
+            faults.fired(crate::sys::fault_injection::Site::ProcessGroupTeardown),
+            1,
+            "the fallback group kill retains the injected OS source"
+        );
+        drop(faults);
+        assert_pipeline_pids_gone(&pids).await;
+        for path in [&marker, &producer_pid, &consumer_pid] {
+            let _ = std::fs::remove_file(path);
+        }
+    }
+
+    #[cfg(feature = "process-control")]
+    #[tokio::test(flavor = "current_thread")]
+    #[ignore = "spawns a real live pipeline for a deterministic late-cancel race"]
+    async fn live_pipeline_failure_cause_survives_late_chain_cancellation() {
+        let marker = pipeline_marker("live_late_chain_cancel");
+        let producer_pid = pipeline_marker("live_late_chain_cancel_producer");
+        let consumer_pid = pipeline_marker("live_late_chain_cancel_consumer");
+        for path in [&marker, &producer_pid, &consumer_pid] {
+            let _ = std::fs::remove_file(path);
+        }
+        let chain_token = crate::CancellationToken::new();
+        let late_token = chain_token.clone();
+        let _hook = before_pipeline_fallback_kill(move || late_token.cancel());
+        let faults = crate::sys::fault_injection::Faults::new()
+            .fail_nth(
+                crate::sys::fault_injection::Site::ProcessGroupTeardown,
+                Some("hard"),
+                1,
+                5,
+            )
+            .arm();
+        let session = failing_marked_pipeline(&marker, &producer_pid, &consumer_pid)
+            .cancel_on(chain_token.clone())
+            .start()
+            .await
+            .expect("start failing live pipeline");
+        wait_for_pipeline_marker(&marker).await;
+        let pids = read_pipeline_pids(&[&producer_pid, &consumer_pid]).await;
+
+        tokio::time::timeout(Duration::from_secs(2), session.teardown.cancelled())
+            .await
+            .expect("the live last-stage watcher must observe the checked failure");
+        assert_eq!(
+            session.teardown_cause.get(),
+            Some(&crate::TeardownCause::PipelineFailure),
+            "the checked failure publishes its cause before the late token fires"
+        );
+
+        let error = tokio::time::timeout(Duration::from_secs(10), session.finish())
+            .await
+            .expect("live late-cancel race must stay bounded")
+            .expect_err("the injected fallback failure must fail closed");
+        assert!(
+            chain_token.is_cancelled(),
+            "the fallback hook fired the late token"
+        );
+        assert_pipeline_teardown(&error, crate::TeardownCause::PipelineFailure);
+        assert_eq!(
+            faults.fired(crate::sys::fault_injection::Site::ProcessGroupTeardown),
+            1,
+            "the fallback group kill retains the injected OS source"
         );
         drop(faults);
         assert_pipeline_pids_gone(&pids).await;
@@ -3791,6 +4182,7 @@ mod tests {
     #[tokio::test]
     async fn drain_unordered_wakes_a_quiet_task_when_a_later_task_returns_a_raw_error() {
         let teardown = tokio_util::sync::CancellationToken::new();
+        let teardown_cause: PipelineTeardownCause = Arc::default();
         let mut tasks: tokio::task::JoinSet<Result<&'static str>> = tokio::task::JoinSet::new();
         // Spawned first (the "earlier, leftmost" stage in `capture`'s terms) —
         // a positional gather would await this one to completion before ever
@@ -3802,13 +4194,15 @@ mod tests {
         // wake the sibling above.
         tasks.spawn(async { Err(crate::Error::io(std::io::Error::other("downstream boom"))) });
 
-        let drained =
-            tokio::time::timeout(Duration::from_secs(5), drain_unordered(tasks, &teardown))
-                .await
-                .expect(
-                    "drain_unordered must not hang on the still-pending quiet task \
+        let drained = tokio::time::timeout(
+            Duration::from_secs(5),
+            drain_unordered(tasks, &teardown, &teardown_cause),
+        )
+        .await
+        .expect(
+            "drain_unordered must not hang on the still-pending quiet task \
              once the sibling's raw error has fired teardown",
-                );
+        );
 
         match drained.map_err(|e| e.error.into_reason()) {
             Err(crate::ErrorReason::Io(err)) => {
@@ -3820,11 +4214,17 @@ mod tests {
             teardown.is_cancelled(),
             "a raw Err must fire teardown so a quiet sibling is unblocked"
         );
+        assert_eq!(
+            teardown_cause.get(),
+            Some(&crate::TeardownCause::PipelineFailure),
+            "a raw non-cancellation error initiates pipeline-failure teardown"
+        );
     }
 
     #[tokio::test]
     async fn drain_unordered_collects_a_sibling_teardown_after_the_first_raw_error() {
         let teardown = tokio_util::sync::CancellationToken::new();
+        let teardown_cause: PipelineTeardownCause = Arc::default();
         let sibling_settled = Arc::new(std::sync::atomic::AtomicBool::new(false));
         let mut tasks: tokio::task::JoinSet<Result<&'static str>> = tokio::task::JoinSet::new();
         tasks.spawn(async {
@@ -3850,11 +4250,13 @@ mod tests {
             }
         });
 
-        let failure =
-            tokio::time::timeout(Duration::from_secs(5), drain_unordered(tasks, &teardown))
-                .await
-                .expect("terminal sibling collection must remain bounded")
-                .expect_err("the retained sibling teardown must fail the drain");
+        let failure = tokio::time::timeout(
+            Duration::from_secs(5),
+            drain_unordered(tasks, &teardown, &teardown_cause),
+        )
+        .await
+        .expect("terminal sibling collection must remain bounded")
+        .expect_err("the retained sibling teardown must fail the drain");
 
         assert!(
             sibling_settled.load(Ordering::Acquire),
@@ -3867,11 +4269,17 @@ mod tests {
             }
             other => panic!("a sibling Teardown must outrank the first raw error: {other:?}"),
         }
+        assert_eq!(
+            teardown_cause.get(),
+            Some(&crate::TeardownCause::PipelineFailure),
+            "the later sibling Teardown cannot rewrite the first raw-error trigger"
+        );
     }
 
     #[tokio::test]
     async fn drain_unordered_fires_teardown_on_a_task_panic_so_a_quiet_sibling_still_resolves() {
         let teardown = tokio_util::sync::CancellationToken::new();
+        let teardown_cause: PipelineTeardownCause = Arc::default();
         // Synchronizes the two tasks so the panic only happens once the quiet
         // task has genuinely started waiting on `teardown` — proving this is
         // a real concurrent-blocking scenario, not a fluke of scheduling
@@ -3892,13 +4300,15 @@ mod tests {
             panic!("downstream stage task panicked");
         });
 
-        let drained =
-            tokio::time::timeout(Duration::from_secs(5), drain_unordered(tasks, &teardown))
-                .await
-                .expect(
-                    "drain_unordered must not hang on the still-pending quiet task \
+        let drained = tokio::time::timeout(
+            Duration::from_secs(5),
+            drain_unordered(tasks, &teardown, &teardown_cause),
+        )
+        .await
+        .expect(
+            "drain_unordered must not hang on the still-pending quiet task \
              once the sibling's panic has fired teardown",
-                );
+        );
 
         match drained.map_err(|e| e.error.into_reason()) {
             Err(crate::ErrorReason::Io(err)) => {
@@ -3913,11 +4323,17 @@ mod tests {
             teardown.is_cancelled(),
             "a task panic must fire teardown so a quiet sibling is unblocked"
         );
+        assert_eq!(
+            teardown_cause.get(),
+            Some(&crate::TeardownCause::PipelineFailure),
+            "a task panic initiates pipeline-failure teardown"
+        );
     }
 
     #[tokio::test]
     async fn drain_unordered_returns_every_item_when_the_whole_set_finishes_clean() {
         let teardown = tokio_util::sync::CancellationToken::new();
+        let teardown_cause: PipelineTeardownCause = Arc::default();
         let mut tasks: tokio::task::JoinSet<Result<u32>> = tokio::task::JoinSet::new();
         for item in [1u32, 2, 3] {
             tasks.spawn(async move {
@@ -3926,7 +4342,7 @@ mod tests {
             });
         }
 
-        let mut drained = drain_unordered(tasks, &teardown)
+        let mut drained = drain_unordered(tasks, &teardown, &teardown_cause)
             .await
             .expect("every task succeeded");
         drained.sort_unstable();
@@ -3938,6 +4354,10 @@ mod tests {
         assert!(
             !teardown.is_cancelled(),
             "an all-clean drain must never fire teardown"
+        );
+        assert!(
+            teardown_cause.get().is_none(),
+            "an all-clean drain must never publish a teardown cause"
         );
     }
 }

@@ -2975,6 +2975,14 @@ impl RunningProcess {
         observed
     }
 
+    /// Whether the first exit observation latched an active cancellation source.
+    /// The pipeline's passive last-stage watcher calls this only after
+    /// [`exit_outcome_now`](Self::exit_outcome_now) returned `Some`, so it can fire
+    /// chain teardown with the same disposition the consuming finisher will report.
+    pub(crate) fn cancelled_at_exit(&self) -> bool {
+        self.cancel_at_exit == Some(true)
+    }
+
     /// Send a kill to the process without waiting for it to exit. The owning
     /// group still governs the rest of the tree.
     ///
