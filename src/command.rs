@@ -839,13 +839,22 @@ impl Command {
     ///
     /// A PTY has one master fd carrying the child's combined output, so in this
     /// mode **stdout and stderr are merged** and can no longer be separated. The
-    /// merged stream is delivered exactly where stdout normally is
-    /// (`output_string`, `stdout_lines`, `on_stdout_line`, `stdout_tee`, …);
+    /// merged stream is exposed as piped logical stdout (`output_string`,
+    /// `stdout_lines`, `on_stdout_line`, `stdout_tee`, …);
     /// [`on_stderr_line`](Self::on_stderr_line) is **never called** and
     /// [`stderr_tee`](Self::stderr_tee) never receives anything, because there is
     /// no separate stderr to deliver. [`ProcessResult::stderr`](crate::ProcessResult::stderr)
     /// is empty for a PTY run. If you need stdout and stderr apart, do not use
     /// PTY mode.
+    ///
+    /// That single-master shape also makes the output destination strict: both
+    /// stdout and stderr must keep their default [`StdioMode::Piped`] connection
+    /// with no file redirect. Combining `use_pty` with stdout `Inherit`/`Null`/a
+    /// `stdout_file*` redirect, or with a separate stderr `Inherit`/`Null`/
+    /// `stderr_file*` destination, returns [`ErrorReason::Unsupported`] before a
+    /// redirect file is opened or a child is spawned. A PTY cannot honor any of
+    /// those per-descriptor destinations after it has merged the descriptors;
+    /// rejecting them avoids silently draining output somewhere else.
     ///
     /// # Interactive input
     ///
@@ -1583,6 +1592,9 @@ impl Command {
     /// `events`) yield an empty stream. Use a discard verb (`wait`) to run
     /// a command whose stdout you don't want to capture. Calling this after
     /// [`stdout_file`](Self::stdout_file) restores a normal stdio mode.
+    /// With `use_pty`, only `Piped` is supported because the
+    /// merged terminal master is exposed as logical stdout; `Inherit` and `Null`
+    /// are rejected before spawn.
     pub fn stdout(mut self, mode: crate::StdioMode) -> Self {
         self.stdout_mode = mode;
         self.stdout_file = None;
@@ -1594,6 +1606,8 @@ impl Command {
     ///
     /// Same semantics as [`stdout`](Self::stdout): `Piped` captures,
     /// `Inherit` passes through, `Null` suppresses.
+    /// With `use_pty`, stderr has no independent descriptor and
+    /// must remain `Piped`; `Inherit` and `Null` are rejected before spawn.
     pub fn stderr(mut self, mode: crate::StdioMode) -> Self {
         self.stderr_mode = mode;
         self.stderr_file = None;
@@ -1607,7 +1621,9 @@ impl Command {
     /// Capture and streaming verbs require a pipe and therefore reject this
     /// configuration; use [`wait`](crate::RunningProcess::wait) or another
     /// discard verb. For a shared supervisor log across restarts, use
-    /// [`stdout_file_append`](Self::stdout_file_append).
+    /// [`stdout_file_append`](Self::stdout_file_append). PTY mode rejects this
+    /// redirect before opening or truncating the file; its single merged master
+    /// is available only as piped logical stdout.
     pub fn stdout_file(mut self, path: impl AsRef<Path>) -> Self {
         self.stdout_mode = StdioMode::Piped;
         self.stdout_file = Some(FileRedirect::truncate(path));
@@ -1617,6 +1633,7 @@ impl Command {
     /// Redirect stdout directly to `path`, creating it when absent and appending
     /// on every spawn. This is useful for a [`Supervisor`](crate::Supervisor)
     /// whose incarnations should share one log file.
+    /// PTY mode rejects this redirect before the file is opened or created.
     pub fn stdout_file_append(mut self, path: impl AsRef<Path>) -> Self {
         self.stdout_mode = StdioMode::Piped;
         self.stdout_file = Some(FileRedirect::append(path));
@@ -1632,6 +1649,8 @@ impl Command {
     /// Redirect stderr directly to `path`, creating or truncating the file at
     /// spawn time. The child owns the descriptor, so no parent-side pump or
     /// output buffer is involved.
+    /// PTY mode rejects this redirect before opening or truncating the file
+    /// because stderr is already merged into its piped logical stdout.
     pub fn stderr_file(mut self, path: impl AsRef<Path>) -> Self {
         self.stderr_mode = StdioMode::Piped;
         self.stderr_file = Some(FileRedirect::truncate(path));
@@ -1641,6 +1660,7 @@ impl Command {
     /// Redirect stderr directly to `path`, creating it when absent and appending
     /// on every spawn. See [`stdout_file_append`](Self::stdout_file_append) for
     /// the restart-log use case.
+    /// PTY mode rejects this redirect before the file is opened or created.
     pub fn stderr_file_append(mut self, path: impl AsRef<Path>) -> Self {
         self.stderr_mode = StdioMode::Piped;
         self.stderr_file = Some(FileRedirect::append(path));
@@ -2202,6 +2222,32 @@ impl Command {
         matches!(self.stderr_mode, StdioMode::Piped) && self.stderr_file.is_none()
     }
 
+    /// Reject stdio destinations a single merged PTY master cannot honor.
+    ///
+    /// Both the live/double launch boundary and [`build_tokio`](Self::build_tokio)
+    /// call this helper. Keeping the decision here matters especially for file
+    /// redirects: rejection must happen before `build_tokio` opens, creates, or
+    /// truncates a path the PTY slave would immediately replace.
+    #[cfg(feature = "pty")]
+    pub(crate) fn ensure_pty_stdio_compatible(&self) -> Result<()> {
+        if !self.use_pty {
+            return Ok(());
+        }
+        if !self.stdout_is_piped() {
+            return Err(ErrorReason::Unsupported {
+                operation: "use_pty with a non-piped stdout destination".into(),
+            }
+            .into());
+        }
+        if !self.stderr_is_piped() {
+            return Err(ErrorReason::Unsupported {
+                operation: "use_pty with a separate stderr destination".into(),
+            }
+            .into());
+        }
+        Ok(())
+    }
+
     pub(crate) fn program_name(&self) -> String {
         self.program.to_string_lossy().into_owned()
     }
@@ -2689,9 +2735,11 @@ impl Command {
     /// ([`ErrorReason::Io`]), plus
     /// [`ErrorReason::Unsupported`] for a Unix-only `arg0`/`rlimit` request on
     /// another platform, a Linux-only I/O-priority request elsewhere, affinity
-    /// on a target other than Linux/Windows, or Windows affinity (which requires
+    /// on a target other than Linux/Windows, Windows affinity (which requires
     /// the typed suspended-child launch seam and cannot be encoded in a raw
-    /// command).
+    /// command), or — with the `pty` feature — `use_pty` combined with a stdout
+    /// destination other than its merged `Piped` stream or with a separate stderr
+    /// destination.
     pub fn to_tokio_command(&self) -> Result<tokio::process::Command> {
         #[cfg(windows)]
         if self.cpu_affinity.is_some() {
@@ -2706,6 +2754,13 @@ impl Command {
     /// Build the `tokio` command with stdio wired for capture. Containment
     /// (cgroup/job/process-group) is added by the group's `spawn`.
     pub(crate) fn build_tokio(&self) -> Result<tokio::process::Command> {
+        // A PTY replaces both child output descriptors with one slave. Refuse
+        // destinations that cannot survive that replacement before file
+        // redirects are opened below (and independently of which launch
+        // consumer reached this low-level builder).
+        #[cfg(feature = "pty")]
+        self.ensure_pty_stdio_compatible()?;
+
         #[cfg(not(unix))]
         if self.arg0.is_some() {
             return Err(ErrorReason::Unsupported {
@@ -3479,7 +3534,9 @@ impl Command {
     ///   Windows `.cmd`/`.bat` that needs `cmd.exe`, …).
     /// - [`ErrorReason::Unsupported`] — a requested POSIX-only primitive (running as
     ///   another user/group, a new session via `setsid`, or a `umask`) is not
-    ///   available on this platform.
+    ///   available on this platform, or — with the `pty` feature — `use_pty` is
+    ///   combined with a stdout destination other than its merged `Piped` stream
+    ///   or with a separate stderr destination.
     /// - [`ErrorReason::Cancelled`] — the [`cancel_on`](Self::cancel_on) token was
     ///   already cancelled before the spawn.
     /// - [`ErrorReason::Io`] — the private [`ProcessGroup`](crate::ProcessGroup) backing
@@ -4290,6 +4347,8 @@ fn has_exe_extension(path: &Path) -> bool {
 mod tests {
     use super::Command;
     use crate::buffer::LineTerminator;
+    #[cfg(feature = "pty")]
+    use crate::{ErrorReason, StdioMode};
     use std::ffi::OsStr;
     use std::path::PathBuf;
 
@@ -4620,6 +4679,89 @@ mod tests {
         assert_eq!(pty.stdout_config.terminator, LineTerminator::Newline);
         let piped = Command::new("agent");
         assert_eq!(piped.stdout_config().terminator, LineTerminator::Newline);
+    }
+
+    #[cfg(feature = "pty")]
+    fn assert_pty_stdio_unsupported(command: Command, expected_operation: &str) {
+        let error = command
+            .build_tokio()
+            .expect_err("an incompatible PTY destination must fail before spawn");
+        match error.into_reason() {
+            ErrorReason::Unsupported { operation } => {
+                assert_eq!(operation, expected_operation);
+            }
+            other => panic!("expected Unsupported, got {other:?}"),
+        }
+    }
+
+    #[cfg(feature = "pty")]
+    #[test]
+    fn pty_accepts_only_the_merged_piped_output_destination() {
+        Command::new("tool")
+            .use_pty()
+            .build_tokio()
+            .expect("the default merged stdout destination is supported");
+        Command::new("tool")
+            .use_pty()
+            .stdout(StdioMode::Piped)
+            .stderr(StdioMode::Piped)
+            .build_tokio()
+            .expect("explicit Piped/Piped is the same merged destination");
+
+        for mode in [StdioMode::Inherit, StdioMode::Null] {
+            assert_pty_stdio_unsupported(
+                Command::new("tool").use_pty().stdout(mode),
+                "use_pty with a non-piped stdout destination",
+            );
+            assert_pty_stdio_unsupported(
+                Command::new("tool").use_pty().stderr(mode),
+                "use_pty with a separate stderr destination",
+            );
+        }
+    }
+
+    #[cfg(feature = "pty")]
+    #[test]
+    fn pty_file_destinations_are_rejected_before_open_or_truncate() {
+        let dir = tempfile::tempdir().expect("temp dir");
+        let stdout_truncate = dir.path().join("stdout-truncate.log");
+        let stdout_append = dir.path().join("stdout-append.log");
+        let stderr_truncate = dir.path().join("stderr-truncate.log");
+        let stderr_append = dir.path().join("stderr-append.log");
+        std::fs::write(&stdout_truncate, "stdout sentinel").expect("seed stdout sentinel");
+        std::fs::write(&stderr_truncate, "stderr sentinel").expect("seed stderr sentinel");
+
+        assert_pty_stdio_unsupported(
+            Command::new("tool").use_pty().stdout_file(&stdout_truncate),
+            "use_pty with a non-piped stdout destination",
+        );
+        assert_pty_stdio_unsupported(
+            Command::new("tool")
+                .use_pty()
+                .stdout_file_append(&stdout_append),
+            "use_pty with a non-piped stdout destination",
+        );
+        assert_pty_stdio_unsupported(
+            Command::new("tool").use_pty().stderr_file(&stderr_truncate),
+            "use_pty with a separate stderr destination",
+        );
+        assert_pty_stdio_unsupported(
+            Command::new("tool")
+                .use_pty()
+                .stderr_file_append(&stderr_append),
+            "use_pty with a separate stderr destination",
+        );
+
+        assert_eq!(
+            std::fs::read_to_string(stdout_truncate).expect("read stdout sentinel"),
+            "stdout sentinel"
+        );
+        assert_eq!(
+            std::fs::read_to_string(stderr_truncate).expect("read stderr sentinel"),
+            "stderr sentinel"
+        );
+        assert!(!stdout_append.exists(), "append target must not be created");
+        assert!(!stderr_append.exists(), "append target must not be created");
     }
 
     #[cfg(feature = "pty")]

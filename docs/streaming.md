@@ -488,6 +488,23 @@ platforms. Signal-driven terminal behavior is separate: on Unix, `use_pty`
 creates a controlling terminal so terminal signals such as the `SIGWINCH`
 raised by `resize_pty` reach the child as described below.
 
+### PTY output destination
+
+A PTY has one merged output master, exposed as **piped logical stdout**. Keep
+both output destinations at their default `StdioMode::Piped`: capture,
+`stdout_lines`, stdout handlers, and stdout tees then receive the merged bytes,
+while `ProcessResult::stderr` stays empty. There is no independent stderr
+destination after the terminal has merged the child descriptors.
+
+Accordingly, `use_pty` rejects stdout `Inherit`, `Null`,
+`stdout_file`/`stdout_file_append`, and any separate stderr `Inherit`, `Null`,
+`stderr_file`/`stderr_file_append` destination with
+`ErrorReason::Unsupported`. The check runs before opening, creating, or
+truncating a redirect file and before spawning the child on both Unix and
+Windows. This makes the unsupported combinations fail visibly instead of
+creating an unused file or secretly draining the real PTY master to a discard
+sink. Use ordinary pipe mode when those per-descriptor destinations are needed.
+
 ### PTY window size and live resize
 
 Under `use_pty` the child runs on a real pseudo-terminal, and terminal-aware

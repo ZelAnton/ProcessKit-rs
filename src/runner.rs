@@ -646,7 +646,10 @@ impl JobRunner {
     /// [`ErrorReason::Spawn`](crate::ErrorReason::Spawn) (the program could not be located or
     /// started), [`ErrorReason::Unsupported`](crate::ErrorReason::Unsupported) (a requested
     /// platform primitive — user/group switch, `setsid`, umask, or Linux I/O
-    /// priority — unavailable on this platform), [`ErrorReason::Cancelled`](crate::ErrorReason::Cancelled) (the command's
+    /// priority — unavailable on this platform, or — with the `pty` feature —
+    /// `use_pty` is combined with a stdout destination other than its merged
+    /// `Piped` stream or with a separate stderr destination),
+    /// [`ErrorReason::Cancelled`](crate::ErrorReason::Cancelled) (the command's
     /// token was already cancelled), or [`ErrorReason::Io`](crate::ErrorReason::Io) (the
     /// private [`ProcessGroup`] could not be created, or a one-shot streaming
     /// stdin source was already consumed by a previous run).
@@ -683,7 +686,9 @@ impl ProcessGroup {
     /// The launch surface: [`ErrorReason::NotFound`](crate::ErrorReason::NotFound) /
     /// [`ErrorReason::Spawn`](crate::ErrorReason::Spawn) (locate/start failure),
     /// [`ErrorReason::Unsupported`](crate::ErrorReason::Unsupported) (a requested POSIX or
-    /// Linux-only primitive unavailable on this platform),
+    /// Linux-only primitive unavailable on this platform, or — with the `pty`
+    /// feature — `use_pty` is combined with a stdout destination other than its
+    /// merged `Piped` stream or with a separate stderr destination),
     /// [`ErrorReason::Cancelled`](crate::ErrorReason::Cancelled) (a pre-cancelled token), or
     /// [`ErrorReason::Io`](crate::ErrorReason::Io) (e.g. a one-shot stdin source already
     /// consumed). Unlike [`JobRunner::start`], no new group is created here — the
@@ -736,6 +741,13 @@ impl ProcessRunner for ProcessGroup {
 pub(crate) fn take_stdin_for_run(
     command: &Command,
 ) -> Result<Option<crate::stdin::StdinReservation>> {
+    // PTY stdio compatibility is part of the same shared pre-child launch
+    // boundary as stdin reservation. Live, scripted, dry-run, and cassette
+    // record paths all route through here, so none can silently accept a
+    // destination the real single-master transport cannot honor.
+    #[cfg(feature = "pty")]
+    command.ensure_pty_stdio_compatible()?;
+
     if command.inherits_stdin() {
         // `inherit_stdin` hands the child the parent's own stdin fd, so the crate
         // neither drives nor closes stdin. That is a contradiction with either way
