@@ -3558,6 +3558,10 @@ impl Command {
     ///   ([`Stdin::from_reader`](crate::Stdin::from_reader) /
     ///   [`Stdin::from_lines`](crate::Stdin::from_lines)) was already consumed by
     ///   a previous run.
+    ///
+    /// With the `pty` feature, a zero PTY axis on all platforms, or an axis above
+    /// `i16::MAX` on Windows, returns `ErrorReason::Io(InvalidInput)` before child
+    /// spawn. `InvalidInput` is not unique to PTY geometry.
     #[cfg_attr(
         feature = "limits",
         doc = "- [`ErrorReason::ResourceLimit`] — a resource cap configured on the run's group could not be enforced."

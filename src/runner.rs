@@ -653,6 +653,10 @@ impl JobRunner {
     /// token was already cancelled), or [`ErrorReason::Io`](crate::ErrorReason::Io) (the
     /// private [`ProcessGroup`] could not be created, or a one-shot streaming
     /// stdin source was already consumed by a previous run).
+    ///
+    /// With the `pty` feature, a zero PTY axis on all platforms, or an axis above
+    /// `i16::MAX` on Windows, returns `ErrorReason::Io(InvalidInput)` before child
+    /// spawn. `InvalidInput` is not unique to PTY geometry.
     #[cfg_attr(
         feature = "limits",
         doc = "A resource cap on the new group that cannot be enforced is [`ErrorReason::ResourceLimit`](crate::ErrorReason::ResourceLimit)."
@@ -693,6 +697,10 @@ impl ProcessGroup {
     /// [`ErrorReason::Io`](crate::ErrorReason::Io) (e.g. a one-shot stdin source already
     /// consumed). Unlike [`JobRunner::start`], no new group is created here — the
     /// child joins this existing group.
+    ///
+    /// With the `pty` feature, a zero PTY axis on all platforms, or an axis above
+    /// `i16::MAX` on Windows, returns `ErrorReason::Io(InvalidInput)` before child
+    /// spawn. `InvalidInput` is not unique to PTY geometry.
     pub async fn start(&self, command: &Command) -> Result<RunningProcess> {
         launch(self, command).await
     }
