@@ -43,7 +43,7 @@ pub(crate) const DEFAULT_PTY_SIZE: (u16, u16) = (80, 24);
 /// Validate a PTY geometry before a backend creates or mutates an OS terminal.
 ///
 /// A zero axis is not a usable terminal geometry on either backend. Windows has
-/// the additional representational limit imposed by ConPTY's signed [`COORD`]
+/// the additional representational limit imposed by ConPTY's signed `COORD`
 /// fields; Unix `winsize` fields are `u16`, so every non-zero `u16` remains valid
 /// there. Public launch/resize seams and both backend entry points call this one
 /// helper so an invalid request cannot be reported as a successful, differently
