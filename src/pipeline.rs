@@ -25,7 +25,7 @@ use crate::error::Result;
 use crate::group::ProcessGroup;
 use crate::result::{Outcome, ProcessResult};
 use crate::running::{
-    Finished, LineCapture, ProcessEvents, RawCapture, RunningProcess, StdoutLines,
+    ExitObservation, Finished, LineCapture, ProcessEvents, RawCapture, RunningProcess, StdoutLines,
 };
 use crate::sync::atomic::{AtomicBool, AtomicU8, AtomicUsize, Ordering};
 
@@ -282,6 +282,7 @@ trait PipelineCapture: Send + Clone + 'static {
     type Tracker: Clone;
 
     fn prepare(process: &mut RunningProcess) -> Result<Self::Tracker>;
+    fn retained_snapshot(tracker: &Self::Tracker) -> Captured<Self>;
     fn snapshot(tracker: &Self::Tracker) -> Captured<Self>;
     fn to_diagnostic_text(captured: &Self) -> String;
     fn exact_bytes(captured: &Self) -> Option<Vec<u8>>;
@@ -292,6 +293,17 @@ impl PipelineCapture for String {
 
     fn prepare(process: &mut RunningProcess) -> Result<Self::Tracker> {
         process.prepare_line_capture()
+    }
+
+    fn retained_snapshot(tracker: &Self::Tracker) -> Captured<Self> {
+        let (stdout, stderr, truncated, total_lines, total_bytes) = tracker.retained_snapshot();
+        Captured {
+            stdout,
+            stderr,
+            truncated,
+            total_lines,
+            total_bytes,
+        }
     }
 
     fn snapshot(tracker: &Self::Tracker) -> Captured<Self> {
@@ -321,6 +333,17 @@ impl PipelineCapture for Vec<u8> {
         process.prepare_raw_capture()
     }
 
+    fn retained_snapshot(tracker: &Self::Tracker) -> Captured<Self> {
+        let (stdout, stderr, truncated, total_lines, total_bytes) = tracker.retained_snapshot();
+        Captured {
+            stdout,
+            stderr,
+            truncated,
+            total_lines,
+            total_bytes,
+        }
+    }
+
     fn snapshot(tracker: &Self::Tracker) -> Captured<Self> {
         let (stdout, stderr, truncated, total_lines, total_bytes) = tracker.snapshot();
         Captured {
@@ -341,14 +364,15 @@ impl PipelineCapture for Vec<u8> {
     }
 }
 
-/// The at-exit observer [`capture`](Pipeline::capture) hands to its `capture_last`
+/// The wait-boundary observer [`capture`](Pipeline::capture) hands to its `capture_last`
 /// closure, to be armed on the capture verb it picks
 /// (`output_string_observing_exit`/`output_bytes_observing_exit`): it latches the
-/// last stage's [`ExitDisposition`] the moment that stage is reaped, before its
-/// output has finished draining. Boxed because `capture_last` is generic over the
-/// capture shape and the observer has to be a *nameable* parameter of it; `Send`
-/// because the future it ends up inside is spawned onto the chain's `JoinSet`.
-type LastExitObserver = Box<dyn FnOnce() + Send>;
+/// last stage's [`ExitDisposition`] when its wait settles, before output finishes
+/// draining, and separately says whether terminal reap was actually proven.
+/// Boxed because `capture_last` is generic over the capture shape and the observer
+/// has to be a *nameable* parameter of it; `Send` because the future it ends up
+/// inside is spawned onto the chain's `JoinSet`.
+type LastExitObserver = Box<dyn FnOnce(ExitObservation) + Send>;
 
 fn captured_result<T>(result: ProcessResult<T>) -> Captured<T> {
     let stderr = result.stderr().to_owned();
@@ -1036,9 +1060,14 @@ impl Pipeline {
             let disposition = last_disposition.clone();
             let teardown = teardown.clone();
             let terminal = terminal.clone();
-            Box::new(move || {
-                terminal.confirm(inner_count);
-                disposition.latch(teardown.is_cancelled());
+            Box::new(move |observation| {
+                observe_pipeline_stage_exit(
+                    observation,
+                    &terminal,
+                    inner_count,
+                    &disposition,
+                    &teardown,
+                );
             })
         });
         {
@@ -1091,13 +1120,16 @@ impl Pipeline {
                 // successful kill dispatch is never mistaken for a confirmed reap.
                 if teardown.is_cancelled()
                     && !terminal.is_confirmed()
-                    && let Err(source) = terminal.wait_confirmed().await
+                    && let Err(failure) = terminal.wait_confirmed().await
                 {
+                    let cause = failure
+                        .cause
+                        .unwrap_or_else(|| latched_pipeline_teardown_cause(&collect_cause));
                     record_pipeline_failure(
                         &collect_failure,
-                        latched_pipeline_teardown_cause(&collect_cause),
+                        cause,
                         "pipeline stage terminal confirmation",
-                        source,
+                        failure.into_io(),
                     );
                     std::future::pending::<()>().await;
                 }
@@ -1177,20 +1209,41 @@ impl Pipeline {
                         // confirm that every child reached a terminal disposition.
                         let _ = teardown_cause.set(crate::TeardownCause::Timeout);
                         let cause = latched_pipeline_teardown_cause(&teardown_cause);
-                        let teardown_result = kill_all_stage_groups(&stage_groups);
-                        if teardown_result.is_ok()
-                            && let Err(source) =
-                                confirm_pipeline_terminal_dispositions(&terminal).await
-                        {
-                            let captured = completed
+                        // A stage may already be returning an unconfirmed wait
+                        // while its pumps still retain the diagnostic prefix. Peek
+                        // that prefix before the timeout's fallback kill wakes the
+                        // stage finisher and lets it drain the same sinks. This is
+                        // non-destructive: ordinary confirmed timeouts still use
+                        // the existing post-reap snapshot below.
+                        let mut pre_teardown_captured = Some(
+                            completed
                                 .lock()
                                 .expect("pipeline capture result poisoned")
-                                .take()
+                                .as_ref()
+                                .cloned()
                                 .map(captured_result)
-                                .unwrap_or_else(|| T::snapshot(&capture));
+                                .unwrap_or_else(|| T::retained_snapshot(&capture)),
+                        );
+                        let prior_terminal_failure = terminal.confirmation_failure();
+                        let teardown_result = kill_all_stage_groups(&stage_groups);
+                        let terminal_failure = if let Some(failure) = prior_terminal_failure {
+                            Some(failure)
+                        } else if teardown_result.is_ok() {
+                            confirm_pipeline_terminal_dispositions(&terminal)
+                                .await
+                                .err()
+                        } else {
+                            None
+                        };
+                        if let Some(failure) = terminal_failure {
+                            let failure_cause = failure.cause.unwrap_or(cause);
+                            let source = failure.into_io();
+                            let captured = pre_teardown_captured
+                                .take()
+                                .expect("pre-teardown capture is available once");
                             return Err(crate::Error::teardown(
                                 self.pipeline_name(),
-                                cause,
+                                failure_cause,
                                 "pipeline stage terminal confirmation",
                                 source,
                                 T::to_diagnostic_text(&captured.stdout),
@@ -1199,12 +1252,9 @@ impl Pipeline {
                             ));
                         }
                         if let Err(source) = teardown_result {
-                            let captured = completed
-                                .lock()
-                                .expect("pipeline capture result poisoned")
+                            let captured = pre_teardown_captured
                                 .take()
-                                .map(captured_result)
-                                .unwrap_or_else(|| T::snapshot(&capture));
+                                .expect("pre-teardown capture is available once");
                             return Err(crate::Error::teardown(
                                 self.pipeline_name(),
                                 cause,
@@ -1761,9 +1811,14 @@ impl PipelineSession {
                         let disposition = disposition.clone();
                         let teardown = teardown.clone();
                         let terminal = terminal.clone();
-                        move |_outcome| {
-                            terminal.confirm(last_index);
-                            disposition.latch(teardown.is_cancelled());
+                        move |observation| {
+                            observe_pipeline_stage_exit(
+                                observation,
+                                &terminal,
+                                last_index,
+                                &disposition,
+                                &teardown,
+                            );
                         }
                     })
                     .await;
@@ -1810,13 +1865,16 @@ impl PipelineSession {
                     || self.chain_state.load(Ordering::Acquire)
                         == crate::running::TS_TIMED_OUT)
                     && !terminal.is_confirmed()
-                    && let Err(source) = terminal.wait_confirmed().await
+                    && let Err(failure) = terminal.wait_confirmed().await
                 {
+                    let cause = failure
+                        .cause
+                        .unwrap_or_else(|| latched_pipeline_teardown_cause(&teardown_cause));
                     record_pipeline_failure(
                         &self.teardown_failure,
-                        latched_pipeline_teardown_cause(&teardown_cause),
+                        cause,
                         "pipeline stage terminal confirmation",
-                        source,
+                        failure.into_io(),
                     );
                     std::future::pending::<()>().await;
                 }
@@ -2102,14 +2160,16 @@ struct PipelineTerminalState {
 
 #[derive(Clone, Debug)]
 struct PipelineTerminalError {
+    cause: Option<crate::TeardownCause>,
     raw_os_error: Option<i32>,
     kind: std::io::ErrorKind,
     message: String,
 }
 
 impl PipelineTerminalError {
-    fn from_io(source: &std::io::Error) -> Self {
+    fn from_io(source: &std::io::Error, cause: Option<crate::TeardownCause>) -> Self {
         Self {
+            cause,
             raw_os_error: source.raw_os_error(),
             kind: source.kind(),
             message: source.to_string(),
@@ -2169,15 +2229,14 @@ impl PipelineTerminalState {
         }
     }
 
-    fn confirmation_failure(&self) -> Option<std::io::Error> {
+    fn confirmation_failure(&self) -> Option<PipelineTerminalError> {
         self.failure
             .lock()
             .expect("pipeline terminal confirmation failure poisoned")
             .clone()
-            .map(PipelineTerminalError::into_io)
     }
 
-    async fn wait_confirmed(&self) -> std::io::Result<()> {
+    async fn wait_confirmed(&self) -> std::result::Result<(), PipelineTerminalError> {
         loop {
             // Enable before checking the counter so a final confirmation between
             // the check and await cannot be lost (`notify_waiters` has no permit).
@@ -2197,10 +2256,37 @@ impl PipelineTerminalState {
 
 fn pipeline_terminal_error(error: &crate::Error) -> PipelineTerminalError {
     match error.reason() {
-        crate::ErrorReason::Io(source)
-        | crate::ErrorReason::Spawn { source, .. }
-        | crate::ErrorReason::Teardown { source, .. } => PipelineTerminalError::from_io(source),
-        _ => PipelineTerminalError::from_io(&std::io::Error::other(error.to_string())),
+        crate::ErrorReason::Teardown { cause, source, .. } => {
+            PipelineTerminalError::from_io(source, Some(*cause))
+        }
+        crate::ErrorReason::Io(source) | crate::ErrorReason::Spawn { source, .. } => {
+            PipelineTerminalError::from_io(source, None)
+        }
+        crate::ErrorReason::Cancelled { .. } => PipelineTerminalError::from_io(
+            &std::io::Error::other(error.to_string()),
+            Some(crate::TeardownCause::Cancellation),
+        ),
+        _ => PipelineTerminalError::from_io(&std::io::Error::other(error.to_string()), None),
+    }
+}
+
+fn observe_pipeline_stage_exit(
+    observation: ExitObservation,
+    terminal: &PipelineTerminalConfirmation,
+    index: usize,
+    disposition: &ExitDisposition,
+    teardown: &tokio_util::sync::CancellationToken,
+) {
+    // Causal attribution happens at every completed wait boundary, but terminal
+    // confirmation is reserved for a proven reap. This ordering also ensures a
+    // concurrent chain timeout observes the real stage failure before it can
+    // classify successful fan-out dispatch as an ordinary timeout.
+    disposition.latch(teardown.is_cancelled());
+    match observation {
+        ExitObservation::Reaped => terminal.confirm(index),
+        ExitObservation::Unconfirmed { cause, source } => {
+            terminal.fail(PipelineTerminalError::from_io(&source, cause));
+        }
     }
 }
 
@@ -2264,7 +2350,7 @@ fn record_pipeline_failure(
 
 async fn confirm_pipeline_terminal_dispositions(
     terminal: &PipelineTerminalConfirmation,
-) -> std::io::Result<()> {
+) -> std::result::Result<(), PipelineTerminalError> {
     match tokio::time::timeout(
         pipeline_terminal_confirmation_budget(),
         terminal.wait_confirmed(),
@@ -2272,9 +2358,12 @@ async fn confirm_pipeline_terminal_dispositions(
     .await
     {
         Ok(confirmed) => confirmed,
-        Err(_) => Err(std::io::Error::new(
-            std::io::ErrorKind::TimedOut,
-            "pipeline stages did not reach terminal disposition after group kill",
+        Err(_) => Err(PipelineTerminalError::from_io(
+            &std::io::Error::new(
+                std::io::ErrorKind::TimedOut,
+                "pipeline stages did not reach terminal disposition after group kill",
+            ),
+            None,
         )),
     }
 }
@@ -2284,8 +2373,13 @@ async fn confirm_or_record_pipeline_terminal_failure(
     slot: &PipelineTeardownFailure,
     cause: crate::TeardownCause,
 ) {
-    if let Err(source) = confirm_pipeline_terminal_dispositions(terminal).await {
-        record_pipeline_failure(slot, cause, "pipeline stage terminal confirmation", source);
+    if let Err(failure) = confirm_pipeline_terminal_dispositions(terminal).await {
+        record_pipeline_failure(
+            slot,
+            failure.cause.unwrap_or(cause),
+            "pipeline stage terminal confirmation",
+            failure.into_io(),
+        );
     }
 }
 
@@ -2595,9 +2689,8 @@ async fn finish_inner_stage(
             let disposition = disposition.clone();
             let teardown = teardown.clone();
             let terminal = terminal.clone();
-            move |_outcome| {
-                terminal.confirm(index);
-                disposition.latch(teardown.is_cancelled());
+            move |observation| {
+                observe_pipeline_stage_exit(observation, &terminal, index, &disposition, &teardown);
             }
         })
         .await;
@@ -3217,18 +3310,177 @@ mod tests {
         }
     }
 
+    fn assert_pipeline_confirmation_source(
+        error: &crate::Error,
+        expected: crate::TeardownCause,
+        raw_os_error: i32,
+    ) {
+        match error.reason() {
+            crate::ErrorReason::Teardown {
+                cause,
+                operation,
+                source,
+                ..
+            } => {
+                assert_eq!(*cause, expected);
+                assert_eq!(*operation, "pipeline stage terminal confirmation");
+                assert_eq!(source.raw_os_error(), Some(raw_os_error));
+            }
+            other => panic!("expected pipeline terminal-confirmation Teardown, got {other:?}"),
+        }
+    }
+
     #[tokio::test]
     async fn terminal_confirmation_propagates_a_stage_reap_error() {
         let terminal = PipelineTerminalState::new(2);
         terminal.confirm(0);
         terminal.fail(PipelineTerminalError::from_io(
             &std::io::Error::from_raw_os_error(5),
+            Some(crate::TeardownCause::Cancellation),
         ));
 
-        let source = confirm_pipeline_terminal_dispositions(&terminal)
+        let failure = confirm_pipeline_terminal_dispositions(&terminal)
             .await
             .expect_err("a stage reap error prevents terminal confirmation");
-        assert_eq!(source.raw_os_error(), Some(5));
+        assert_eq!(failure.cause, Some(crate::TeardownCause::Cancellation));
+        assert_eq!(failure.into_io().raw_os_error(), Some(5));
+    }
+
+    #[cfg(feature = "process-control")]
+    #[tokio::test(flavor = "current_thread")]
+    #[ignore = "spawns a real buffered pipeline for deferred teardown production wiring"]
+    async fn buffered_deferred_teardown_observer_outranks_chain_timeout() {
+        let marker = pipeline_marker("buffered_deferred_teardown");
+        let producer_pid = pipeline_marker("buffered_deferred_teardown_producer");
+        let consumer_pid = pipeline_marker("buffered_deferred_teardown_consumer");
+        for path in [&marker, &producer_pid, &consumer_pid] {
+            let _ = std::fs::remove_file(path);
+        }
+        let token = crate::CancellationToken::new();
+        let pipeline = stage_local_cancellable_marked_pipeline(
+            &marker,
+            &producer_pid,
+            &consumer_pid,
+            token.clone(),
+        )
+        .timeout(Duration::from_secs(5));
+        let task = tokio::spawn(async move { pipeline.output_string().await });
+        wait_for_pipeline_marker(&marker).await;
+        let pids = read_pipeline_pids(&[&producer_pid, &consumer_pid]).await;
+        tokio::time::sleep(Duration::from_millis(100)).await;
+        let faults = crate::sys::fault_injection::Faults::new()
+            .fail_nth(
+                crate::sys::fault_injection::Site::ProcessGroupTeardown,
+                Some("hard"),
+                1,
+                5,
+            )
+            .arm();
+
+        // Keep the failed stage's pumps inside their existing bounded salvage
+        // while the earlier chain deadline fires. The production capture observer
+        // must already have failed terminal confirmation with the cancellation
+        // source, so that later timeout cannot downgrade it to `TimedOut`.
+        tokio::time::pause();
+        token.cancel();
+        for _ in 0..1_000 {
+            if faults.fired(crate::sys::fault_injection::Site::ProcessGroupTeardown) == 1 {
+                break;
+            }
+            tokio::task::yield_now().await;
+        }
+        assert_eq!(
+            faults.fired(crate::sys::fault_injection::Site::ProcessGroupTeardown),
+            1,
+            "the stage-local hard teardown must reach its deferred failure"
+        );
+        assert!(
+            !task.is_finished(),
+            "the retained pipe pumps keep the stage future pending before the chain deadline"
+        );
+        // The readiness/prefix settle above consumes more than 100 ms of the
+        // chain's five-second budget. Advancing just under the pump's own
+        // five-second salvage bound therefore fires the older chain deadline
+        // without letting the later pump join drain the retained prefix first.
+        tokio::time::advance(Duration::from_millis(4_950)).await;
+        for _ in 0..1_000 {
+            if task.is_finished() {
+                break;
+            }
+            tokio::task::yield_now().await;
+        }
+        assert!(task.is_finished(), "the chain deadline must stay bounded");
+        tokio::time::resume();
+
+        let error = task
+            .await
+            .expect("pipeline task")
+            .expect_err("the unconfirmed stage teardown must fail closed");
+        assert_pipeline_confirmation_source(&error, crate::TeardownCause::Cancellation, 5);
+        match error.reason() {
+            crate::ErrorReason::Teardown { stdout, .. } => assert!(
+                stdout.contains("pipeline-prefix"),
+                "the timeout race retains the available last-stage prefix: {stdout:?}"
+            ),
+            _ => unreachable!(),
+        }
+        drop(faults);
+        assert_pipeline_pids_gone(&pids).await;
+        for path in [&marker, &producer_pid, &consumer_pid] {
+            let _ = std::fs::remove_file(path);
+        }
+    }
+
+    #[cfg(feature = "process-control")]
+    #[tokio::test(flavor = "current_thread")]
+    #[ignore = "spawns a real live pipeline for backend-wait production wiring"]
+    async fn live_backend_wait_error_observer_outranks_chain_timeout() {
+        let marker = pipeline_marker("live_backend_wait_error");
+        let producer_pid = pipeline_marker("live_backend_wait_error_producer");
+        let consumer_pid = pipeline_marker("live_backend_wait_error_consumer");
+        for path in [&marker, &producer_pid, &consumer_pid] {
+            let _ = std::fs::remove_file(path);
+        }
+        let wait_failure = crate::running::defer_next_backend_wait_error(6);
+        let session = cancellable_marked_pipeline(&marker, &producer_pid, &consumer_pid)
+            .timeout(Duration::from_secs(5))
+            .start()
+            .await
+            .expect("start live pipeline");
+        wait_for_pipeline_marker(&marker).await;
+        let pids = read_pipeline_pids(&[&producer_pid, &consumer_pid]).await;
+        wait_failure.wait_until_entered().await;
+        let task = tokio::spawn(async move { session.finish().await });
+
+        tokio::time::pause();
+        tokio::time::advance(Duration::from_secs(5)).await;
+        assert!(
+            !task.is_finished(),
+            "the chain deadline must await the blocked stage's terminal disposition"
+        );
+        wait_failure.release();
+        for _ in 0..1_000 {
+            if task.is_finished() {
+                break;
+            }
+            tokio::task::yield_now().await;
+        }
+        assert!(
+            task.is_finished(),
+            "the real backend-wait error must unblock terminal confirmation"
+        );
+        tokio::time::resume();
+
+        let error = task
+            .await
+            .expect("pipeline finish task")
+            .expect_err("an unconfirmed backend wait must fail closed");
+        assert_pipeline_confirmation_source(&error, crate::TeardownCause::Timeout, 6);
+        drop(wait_failure);
+        assert_pipeline_pids_gone(&pids).await;
+        for path in [&marker, &producer_pid, &consumer_pid] {
+            let _ = std::fs::remove_file(path);
+        }
     }
 
     #[tokio::test(flavor = "current_thread")]

@@ -1049,6 +1049,22 @@ impl SharedLines {
         Self::drain_locked(&mut inner)
     }
 
+    /// Clone complete retained lines without consuming the sink. Pipeline
+    /// teardown uses this immediately before a fallback kill: that kill can wake
+    /// the stage finisher and let it drain the same backlog before the chain-level
+    /// error is assembled. Partial tails remain the existing post-kill salvage's
+    /// responsibility; peeking them would risk duplicating a line the live pump
+    /// completes immediately afterwards.
+    pub(crate) fn retained_snapshot(&self) -> Vec<String> {
+        self.inner
+            .lock()
+            .expect("SharedLines poisoned")
+            .lines
+            .iter()
+            .cloned()
+            .collect()
+    }
+
     /// The locked half of [`drain`](Self::drain).
     fn drain_locked(inner: &mut Inner) -> Vec<String> {
         inner.bytes = 0;

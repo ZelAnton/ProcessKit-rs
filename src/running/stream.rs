@@ -18,7 +18,7 @@ use crate::pump::{Popped, SharedLines, pump_lines_core};
 use crate::result::Outcome;
 use crate::sys::pid_gate::{PidGate, force_kill};
 
-use super::RunningProcess;
+use super::{ExitObservation, RunningProcess};
 
 /// The outcome of a run driven via
 /// [`stdout_lines`](RunningProcess::stdout_lines) or
@@ -524,10 +524,11 @@ impl RunningProcess {
         self.finish_observing_exit(|_| ()).await
     }
 
-    /// [`finish`](Self::finish) with an observation seam at the child's **exit**:
-    /// `at_exit` runs the moment the child has been reaped and its [`Outcome`] is
-    /// known — after the deadline/cancel arbiter settled it, but *before* the
-    /// output pumps are joined. `finish` is this with a no-op observer.
+    /// [`finish`](Self::finish) with an observation seam at the child's **wait
+    /// boundary**: `at_exit` runs once the wait either proves a terminal reap or
+    /// retains an unconfirmed teardown/wait error — after the deadline/cancel
+    /// arbiter settled it, but *before* the output pumps are joined. `finish` is
+    /// this with a no-op observer.
     ///
     /// The seam exists because "the child exited" and "this run is finished" are
     /// not the same instant, and one caller has to distinguish them: a pipeline
@@ -538,11 +539,13 @@ impl RunningProcess {
     /// that disposition after the drain would blame whoever drained first instead
     /// of whoever died first; see `pipeline::ExitDisposition`.
     ///
-    /// `at_exit` is deliberately synchronous and must stay cheap: it runs on this
-    /// future's own poll, between the reap and the pump join.
+    /// The observer receives whether the wait proved a reap or retained an
+    /// unconfirmed teardown/wait error. It is deliberately synchronous and must
+    /// stay cheap: it runs on this future's own poll, between the wait and the
+    /// pump join.
     pub(crate) async fn finish_observing_exit(
         mut self,
-        at_exit: impl FnOnce(Outcome),
+        at_exit: impl FnOnce(ExitObservation),
     ) -> Result<Finished> {
         // A bare `finish()` (no prior `stdout_lines`/`events` took stdout)
         // still has to drain the leftover stdout so the child can't block on a full
@@ -578,11 +581,13 @@ impl RunningProcess {
             self.stderr_sink = Some(sink);
         }
 
-        let raw_outcome = self.drive_to_exit().await?;
-        // The exit is observable here and nowhere later that still means "when the
-        // child died": everything below waits on *output*, which a survivor of the
-        // child's own tree can stretch arbitrarily.
-        at_exit(raw_outcome);
+        let raw_outcome = self.drive_to_exit().await;
+        // Observe the wait boundary before joining output, while carrying whether
+        // it actually proved terminal reap. A deferred teardown deliberately
+        // returns its intended outcome here, so the retained failure must remain
+        // visible to the observer.
+        at_exit(self.exit_observation(&raw_outcome));
+        let raw_outcome = raw_outcome?;
         self.observe_stdin_task().await;
         let pumps: Vec<_> = [self.stdout_pump.take(), self.stderr_pump.take()]
             .into_iter()

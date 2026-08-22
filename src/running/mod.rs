@@ -46,6 +46,113 @@ use crate::sys::pid_gate::PidGate;
 /// surviving grandchild holding a pipe can't hang the run.
 pub(crate) const PUMP_TEARDOWN: Duration = Duration::from_secs(5);
 
+#[cfg(test)]
+#[derive(Debug)]
+struct DeferredBackendWaitFailure {
+    entered: AtomicBool,
+    entered_changed: tokio::sync::Notify,
+    released: AtomicBool,
+    release_changed: tokio::sync::Notify,
+    raw_os_error: i32,
+}
+
+#[cfg(test)]
+impl DeferredBackendWaitFailure {
+    async fn wait_until_entered(&self) {
+        loop {
+            let changed = self.entered_changed.notified();
+            tokio::pin!(changed);
+            changed.as_mut().enable();
+            if self.entered.load(Ordering::Acquire) {
+                return;
+            }
+            changed.await;
+        }
+    }
+
+    async fn wait_until_released(&self) {
+        loop {
+            let changed = self.release_changed.notified();
+            tokio::pin!(changed);
+            changed.as_mut().enable();
+            if self.released.load(Ordering::Acquire) {
+                return;
+            }
+            changed.await;
+        }
+    }
+
+    fn release(&self) {
+        self.released.store(true, Ordering::Release);
+        self.release_changed.notify_waiters();
+    }
+}
+
+#[cfg(test)]
+thread_local! {
+    static BACKEND_WAIT_FAILURE: std::cell::RefCell<Option<Arc<DeferredBackendWaitFailure>>> =
+        const { std::cell::RefCell::new(None) };
+}
+
+/// Test-only production-wiring seam: the next `backend_wait` reaches its normal
+/// ownership boundary, then blocks until released and returns the requested OS
+/// error. This lets pipeline tests race a genuine wait failure against their
+/// chain deadline without faking `PipelineTerminalState` calls.
+#[cfg(test)]
+pub(crate) struct BackendWaitFailureGuard {
+    failure: Arc<DeferredBackendWaitFailure>,
+}
+
+#[cfg(test)]
+impl BackendWaitFailureGuard {
+    pub(crate) async fn wait_until_entered(&self) {
+        self.failure.wait_until_entered().await;
+    }
+
+    pub(crate) fn release(&self) {
+        self.failure.release();
+    }
+}
+
+#[cfg(test)]
+impl Drop for BackendWaitFailureGuard {
+    fn drop(&mut self) {
+        self.failure.release();
+        BACKEND_WAIT_FAILURE.with(|slot| {
+            let mut slot = slot.borrow_mut();
+            if slot
+                .as_ref()
+                .is_some_and(|failure| Arc::ptr_eq(failure, &self.failure))
+            {
+                slot.take();
+            }
+        });
+    }
+}
+
+#[cfg(test)]
+pub(crate) fn defer_next_backend_wait_error(raw_os_error: i32) -> BackendWaitFailureGuard {
+    let failure = Arc::new(DeferredBackendWaitFailure {
+        entered: AtomicBool::new(false),
+        entered_changed: tokio::sync::Notify::new(),
+        released: AtomicBool::new(false),
+        release_changed: tokio::sync::Notify::new(),
+        raw_os_error,
+    });
+    BACKEND_WAIT_FAILURE.with(|slot| {
+        assert!(
+            slot.borrow_mut().replace(failure.clone()).is_none(),
+            "backend wait failure seam already armed"
+        );
+    });
+    BackendWaitFailureGuard { failure }
+}
+
+#[cfg(test)]
+fn take_backend_wait_failure() -> Option<Arc<DeferredBackendWaitFailure>> {
+    BACKEND_WAIT_FAILURE.with(|slot| slot.borrow_mut().take())
+}
+
 /// In-flight byte cap for the discard sink used by `wait`/`profile`. These verbs
 /// retain no lines, but the pump still assembles each line in memory before
 /// discarding it; without a byte cap a newline-free flood (e.g. `base64 -w0`)
@@ -88,6 +195,18 @@ enum ExitCause {
     TeardownFailed { intended: Outcome, cancelled: bool },
 }
 
+/// What the consuming finisher proved at its wait boundary. Pipeline teardown
+/// needs the distinction: reaching `drive_to_exit` is useful for causal
+/// attribution, but only the `Reaped` arm may discharge a stage's terminal
+/// confirmation obligation.
+pub(crate) enum ExitObservation {
+    Reaped,
+    Unconfirmed {
+        cause: Option<TeardownCause>,
+        source: std::io::Error,
+    },
+}
+
 /// One unconfirmed terminal teardown, shared with detached watchdogs so a
 /// consuming finisher cannot silently turn their OS failure into a timeout or
 /// cancellation disposition.
@@ -105,6 +224,13 @@ fn record_teardown_failure(slot: &SharedTeardownFailure, failure: TeardownFailur
     if guard.is_none() {
         *guard = Some(failure);
     }
+}
+
+fn clone_io_error(source: &std::io::Error) -> std::io::Error {
+    source.raw_os_error().map_or_else(
+        || std::io::Error::new(source.kind(), source.to_string()),
+        std::io::Error::from_raw_os_error,
+    )
 }
 
 fn child_start_kill(
@@ -211,6 +337,23 @@ pub(crate) struct LineCapture {
 }
 
 impl LineCapture {
+    /// Non-destructive complete-line view used just before a pipeline fallback
+    /// kill. If that kill wakes this capture's finisher, the chain error can still
+    /// retain the prefix even though the finisher drains the shared sinks first.
+    pub(crate) fn retained_snapshot(&self) -> (String, String, bool, usize, usize) {
+        let stdout = self.stdout.retained_snapshot().join("\n");
+        let stderr = self.stderr.retained_snapshot().join("\n");
+        (
+            stdout,
+            stderr,
+            self.stdout.dropped() > 0 || self.stderr.dropped() > 0,
+            self.stdout.count().saturating_add(self.stderr.count()),
+            self.stdout
+                .seen_bytes()
+                .saturating_add(self.stderr.seen_bytes()),
+        )
+    }
+
     /// The best-effort capture a chain-wide timeout salvages: each stream's
     /// still-pending partial tail folded into its backlog, and the backlog taken.
     ///
@@ -1310,13 +1453,14 @@ impl RunningProcess {
     ///   or a pipe pump ended with a read error. A prior line-oriented readiness
     ///   or streaming call is supported; only its unconsumed tail is returned.
     pub async fn output_string(self) -> Result<ProcessResult<String>> {
-        self.output_string_observing_exit(|| ()).await
+        self.output_string_observing_exit(|_| ()).await
     }
 
     /// [`output_string`](Self::output_string) with an observation seam at the
-    /// child's **exit**: `at_exit` runs the moment the child has been reaped —
-    /// after the deadline/cancel arbiter settled it, but *before* the output pumps
-    /// are joined. `output_string` is this with a no-op observer.
+    /// child's **wait boundary**: `at_exit` runs once the wait either proves a
+    /// terminal reap or retains an unconfirmed teardown/wait error — after the
+    /// deadline/cancel arbiter settled it, but *before* the output pumps are
+    /// joined. `output_string` is this with a no-op observer.
     ///
     /// The buffering counterpart of
     /// [`finish_observing_exit`](Self::finish_observing_exit), and it exists for the
@@ -1328,16 +1472,13 @@ impl RunningProcess {
     /// that disposition after the drain would blame whoever drained first instead of
     /// whoever died first; see `pipeline::ExitDisposition`.
     ///
-    /// The observer is handed **nothing**, unlike `finish_observing_exit`'s
-    /// `FnOnce(Outcome)`: the caller needs the *instant*, not the outcome (which it
-    /// reads off the returned [`ProcessResult`] once the drain is done), and this
-    /// rides on `finish_lines`' shared `on_exit` seam, which also fires on the error
-    /// path — where there is no outcome to hand over. `at_exit` is synchronous and
-    /// must stay cheap: it runs on this future's own poll, between the reap and the
-    /// pump join.
+    /// The observer receives whether that wait boundary proved a terminal reap or
+    /// retained an unconfirmed teardown/wait error. It is synchronous and must
+    /// stay cheap: it runs on this future's own poll, between the wait and the pump
+    /// join.
     pub(crate) async fn output_string_observing_exit(
         mut self,
-        at_exit: impl FnOnce(),
+        at_exit: impl FnOnce(ExitObservation),
     ) -> Result<ProcessResult<String>> {
         let finished = self
             .finish_lines(CaptureMode::Lines, /* expose_counts */ true, at_exit)
@@ -1419,12 +1560,12 @@ impl RunningProcess {
     /// which happens only if a pump task previously panicked while holding it (a
     /// crate bug), never from any caller input.
     pub async fn output_bytes(self) -> Result<ProcessResult<Vec<u8>>> {
-        self.output_bytes_observing_exit(|| ()).await
+        self.output_bytes_observing_exit(|_| ()).await
     }
 
     /// [`output_bytes`](Self::output_bytes) with the same exit-observation seam as
     /// [`output_string_observing_exit`](Self::output_string_observing_exit) — see
-    /// there for what the seam is for and why the observer is handed nothing.
+    /// there for what the seam is for and what its observation means.
     /// `output_bytes` is this with a no-op observer.
     ///
     /// # Panics
@@ -1433,7 +1574,7 @@ impl RunningProcess {
     /// internal raw-stdout buffer, i.e. a crate bug).
     pub(crate) async fn output_bytes_observing_exit(
         mut self,
-        at_exit: impl FnOnce(),
+        at_exit: impl FnOnce(ExitObservation),
     ) -> Result<ProcessResult<Vec<u8>>> {
         let capture = if let Some(capture) = self.raw_capture.take() {
             capture
@@ -1449,13 +1590,12 @@ impl RunningProcess {
             ..
         } = capture;
 
-        // Same seam placement as `finish_lines`: the exit is observable here and
-        // nowhere later that still means "when the child died" — everything below
-        // waits on *output*, which a survivor of the child's own tree can stretch
-        // arbitrarily. Fires on the error path too, for the same reason it does
-        // there: the observation is of the reap attempt, not of a successful one.
+        // Same seam placement as `finish_lines`: this wait boundary is observable
+        // here and nowhere later without first waiting on output, which a survivor
+        // can stretch arbitrarily. The explicit disposition prevents an attempted
+        // but unconfirmed reap from masquerading as terminal completion.
         let outcome = self.drive_to_exit().await;
-        at_exit();
+        at_exit(self.exit_observation(&outcome));
         let outcome = outcome?;
         self.observe_stdin_task().await;
         // Bound the stdout drain: a surviving grandchild can hold stdout open past
@@ -1582,7 +1722,7 @@ impl RunningProcess {
     /// otherwise-successful run), or [`ErrorReason::Io`] (waiting on the child failed).
     pub async fn wait(mut self) -> Result<Outcome> {
         Ok(self
-            .finish_lines(CaptureMode::Discard, /* expose_counts */ false, || {})
+            .finish_lines(CaptureMode::Discard, /* expose_counts */ false, |_| {})
             .await?
             .outcome)
     }
@@ -1635,7 +1775,7 @@ impl RunningProcess {
             .finish_lines(
                 CaptureMode::DrainBounded,
                 /* expose_counts */ false,
-                || {},
+                |_| {},
             )
             .await?
             .outcome)
@@ -1842,7 +1982,7 @@ impl RunningProcess {
         // PUMP_TEARDOWN on a leaked pipe, so a late tick can still fire — but the
         // identity gate (see the `reaped` comment above) makes any such reading harmless.
         let outcome = self
-            .finish_lines(CaptureMode::Discard, /* expose_counts */ false, || {
+            .finish_lines(CaptureMode::Discard, /* expose_counts */ false, |_| {
                 reaped.store(true, Ordering::Release);
                 if let Some(task) = &sampler {
                     task.abort();
@@ -1878,7 +2018,7 @@ impl RunningProcess {
         &mut self,
         capture: CaptureMode,
         expose_counts: bool,
-        on_exit: impl FnOnce(),
+        on_exit: impl FnOnce(ExitObservation),
     ) -> Result<FinishedLines> {
         // The capturing path needs a piped stdout; fail loudly rather than return
         // empty. The discard paths (wait/profile/drain) hand nothing back, so a
@@ -1936,7 +2076,7 @@ impl RunningProcess {
         }
 
         let outcome = self.drive_to_exit().await;
-        on_exit();
+        on_exit(self.exit_observation(&outcome));
         let outcome = outcome?;
         self.observe_stdin_task().await;
         let pumps: Vec<_> = [self.stdout_pump.take(), self.stderr_pump.take()]
@@ -2309,6 +2449,41 @@ impl RunningProcess {
         Ok(outcome)
     }
 
+    /// Convert the just-completed wait boundary into the pipeline observer's
+    /// proof signal without consuming the deferred public teardown error. A
+    /// `TeardownFailed` drive deliberately returns its intended outcome so pumps
+    /// can salvage diagnostics; the retained failure must therefore be checked
+    /// before treating any `Ok` as a successful reap.
+    fn exit_observation(&self, result: &Result<Outcome>) -> ExitObservation {
+        if let Some(failure) = self
+            .teardown_failure
+            .lock()
+            .expect("teardown failure slot poisoned")
+            .as_ref()
+        {
+            return ExitObservation::Unconfirmed {
+                cause: Some(failure.cause),
+                source: clone_io_error(&failure.source),
+            };
+        }
+
+        match result {
+            Ok(_) => ExitObservation::Reaped,
+            Err(error) => {
+                let (cause, source) = match error.reason() {
+                    ErrorReason::Teardown { cause, source, .. } => {
+                        (Some(*cause), clone_io_error(source))
+                    }
+                    ErrorReason::Io(source) | ErrorReason::Spawn { source, .. } => {
+                        (None, clone_io_error(source))
+                    }
+                    _ => (None, std::io::Error::other(error.to_string())),
+                };
+                ExitObservation::Unconfirmed { cause, source }
+            }
+        }
+    }
+
     /// A fired deadline overrides whatever `backend_wait` observed — a child that
     /// exits cleanly within the grace still timed out. Cancellation is classified
     /// later in `checked_outcome` and always wins over `TimedOut`.
@@ -2324,6 +2499,16 @@ impl RunningProcess {
     /// (captures Unix signal number when available). Scripted: resolves at the
     /// canned `exit_at`, or immediately as `Signalled` if killed.
     async fn backend_wait(&mut self) -> Result<Outcome> {
+        #[cfg(test)]
+        if let Some(failure) = take_backend_wait_failure() {
+            failure.entered.store(true, Ordering::Release);
+            failure.entered_changed.notify_waiters();
+            failure.wait_until_released().await;
+            return Err(Error::io(std::io::Error::from_raw_os_error(
+                failure.raw_os_error,
+            )));
+        }
+
         let gate = self.pid_gate.clone();
         let outcome = match &mut self.backend {
             Backend::Real(real) => {
@@ -3414,6 +3599,26 @@ pub(crate) struct RawCapture {
 }
 
 impl RawCapture {
+    /// Non-destructive counterpart of [`Self::snapshot`] for a pipeline's
+    /// pre-kill diagnostic checkpoint. Raw stdout is already mutex-framed; stderr
+    /// intentionally includes complete retained lines only, matching
+    /// [`LineCapture::retained_snapshot`].
+    pub(crate) fn retained_snapshot(&self) -> (Vec<u8>, String, bool, usize, usize) {
+        let mut stdout = self.out_buf.lock().expect("stdout buffer poisoned").clone();
+        clamp_dropoldest_tail(&mut stdout, self.stdout_cap, self.stdout_mode);
+        let stderr = self.stderr_sink.retained_snapshot().join("\n");
+        (
+            stdout,
+            stderr,
+            self.signals.truncated.load(Ordering::Relaxed) || self.stderr_sink.dropped() > 0,
+            self.stderr_sink.count(),
+            self.signals
+                .seen
+                .load(Ordering::Relaxed)
+                .saturating_add(self.stderr_sink.seen_bytes()),
+        )
+    }
+
     /// The raw analogue of [`LineCapture::snapshot`]: the stdout bytes the raw
     /// pump had appended, plus the line-oriented stderr salvage. Stdout needs no
     /// tail handling (raw bytes have no line framing, and the mutex orders every
@@ -5139,7 +5344,7 @@ mod tests {
             .start(&Command::new("tool"))
             .await
             .expect("scripted start")
-            .output_string_observing_exit(move || {
+            .output_string_observing_exit(move |_| {
                 counter.fetch_add(1, Ordering::Release);
             })
             .await
@@ -5158,7 +5363,7 @@ mod tests {
             .start(&Command::new("tool"))
             .await
             .expect("scripted start")
-            .output_bytes_observing_exit(move || {
+            .output_bytes_observing_exit(move |_| {
                 counter.fetch_add(1, Ordering::Release);
             })
             .await
