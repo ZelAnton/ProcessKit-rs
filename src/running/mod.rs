@@ -44,7 +44,7 @@ use crate::sys::pid_gate::PidGate;
 
 /// How long teardown waits for output pumps to finish before aborting them, so a
 /// surviving grandchild holding a pipe can't hang the run.
-const PUMP_TEARDOWN: Duration = Duration::from_secs(5);
+pub(crate) const PUMP_TEARDOWN: Duration = Duration::from_secs(5);
 
 /// In-flight byte cap for the discard sink used by `wait`/`profile`. These verbs
 /// retain no lines, but the pump still assembles each line in memory before

@@ -21,13 +21,17 @@ to a dated version section.
 
 - Fail closed when timeout, inactivity, cancellation, or pipeline teardown
   cannot confirm a terminal child/tree: consuming APIs now return a structured
-  `ErrorReason::Teardown` with the initiating cause, original OS error, and
-  bounded captured prefix instead of reporting `Timeout`/`Cancelled` over a
+  `ErrorReason::Teardown` with the initiating cause, original OS error (or a
+  synthetic `TimedOut` source when terminal confirmation expires), and bounded
+  captured prefix instead of reporting `Timeout`/`Cancelled` over a
   potentially-live process. Pipeline cancellation collects bounded sibling
   terminal dispositions so a sibling teardown failure cannot be hidden by the
   first ordinary `Cancelled` error, and fallback group-kill failures retain the
   first proactive cause instead of being relabelled by a later cancellation
-  token. Such errors are never retried automatically.
+  token. Buffered and live pipeline fan-out teardown now also requires every
+  stage-owned handle to confirm its child was reaped within the teardown bound;
+  kill dispatch alone is not treated as confirmation. Such errors are never
+  retried automatically.
 - Reject zero PTY dimensions on every platform and dimensions above `i16::MAX`
   on Windows before launch or live resize. ConPTY no longer silently clamps a
   large request while leaving `COLUMNS`/`LINES` at the caller's original values;

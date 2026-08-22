@@ -306,9 +306,12 @@ async fn main() -> processkit::Result<()> {
   `timed_out`. The
   result keeps best-effort stdout and stderr already captured by the final
   stage before teardown, subject to the same buffer/truncation policy as a
-  normal capture. If any group kill is rejected, the call fails closed with
-  `ErrorReason::Teardown` (`TeardownCause::Timeout`) and retains that prefix
-  instead of claiming a timed-out result over a potentially-live stage.
+  normal capture. A successful fan-out kill is followed by a bounded wait for
+  every stage-owned handle to observe and reap its child. If any group kill is
+  rejected or a stage does not reach that terminal disposition within the
+  teardown bound, the call fails closed with `ErrorReason::Teardown`
+  (`TeardownCause::Timeout`) and retains that prefix instead of claiming a
+  timed-out result over a potentially-live stage.
 - A **per-stage `Command::timeout`** kills that stage's *whole subtree* — its
   own sub-group, grandchildren of a forking `sh -c …` included, not just its
   direct child. Every stage is evaluated by the same pipefail rule (D14): a
@@ -335,6 +338,8 @@ source. A failed fallback group kill also keeps the cause latched when proactive
 teardown first fired: stage-local or chain cancellation reports
 `TeardownCause::Cancellation`, while an earlier stage failure remains
 `TeardownCause::PipelineFailure` even if a token fires during the drain grace.
+The same terminal-confirmation bound follows a successful fallback fan-out kill,
+so buffered collection cannot wait forever for an unreaped sibling.
 
 ## Streaming a live chain
 
@@ -390,8 +395,10 @@ The session mirrors `RunningProcess`:
   (no stdout — you already streamed it). A chain-wide `Pipeline::timeout` that
   elapsed reports `Outcome::TimedOut`; a `Pipeline::cancel_on` that fired while the
   chain was still running surfaces as `ErrorReason::Cancelled` — exactly as in the
-  buffering verbs. An unconfirmed timeout/cancellation/proactive group kill is
-  `ErrorReason::Teardown` and takes priority over the initiating disposition. As
+  buffering verbs. After a timeout/cancellation/proactive fan-out kill, `finish()`
+  boundedly waits for every stage-owned handle to confirm its child was reaped.
+  A rejected kill or expired confirmation is `ErrorReason::Teardown` and takes
+  priority over the initiating disposition. As
   for a single `Command::cancel_on`, that disposition is
   **first-observation-wins**: every stage is observed while the session is live
   (each inner stage by its background drain, the last stage by the session's own
