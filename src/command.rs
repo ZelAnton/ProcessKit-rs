@@ -2735,9 +2735,11 @@ impl Command {
     /// ([`ErrorReason::Io`]), plus
     /// [`ErrorReason::Unsupported`] for a Unix-only `arg0`/`rlimit` request on
     /// another platform, a Linux-only I/O-priority request elsewhere, affinity
-    /// on a target other than Linux/Windows, or Windows affinity (which requires
+    /// on a target other than Linux/Windows, Windows affinity (which requires
     /// the typed suspended-child launch seam and cannot be encoded in a raw
-    /// command).
+    /// command), or — with the `pty` feature — `use_pty` combined with a stdout
+    /// destination other than its merged `Piped` stream or with a separate stderr
+    /// destination.
     pub fn to_tokio_command(&self) -> Result<tokio::process::Command> {
         #[cfg(windows)]
         if self.cpu_affinity.is_some() {
@@ -3532,7 +3534,9 @@ impl Command {
     ///   Windows `.cmd`/`.bat` that needs `cmd.exe`, …).
     /// - [`ErrorReason::Unsupported`] — a requested POSIX-only primitive (running as
     ///   another user/group, a new session via `setsid`, or a `umask`) is not
-    ///   available on this platform.
+    ///   available on this platform, or — with the `pty` feature — `use_pty` is
+    ///   combined with a stdout destination other than its merged `Piped` stream
+    ///   or with a separate stderr destination.
     /// - [`ErrorReason::Cancelled`] — the [`cancel_on`](Self::cancel_on) token was
     ///   already cancelled before the spawn.
     /// - [`ErrorReason::Io`] — the private [`ProcessGroup`](crate::ProcessGroup) backing
