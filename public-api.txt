@@ -116,12 +116,12 @@ pub fn processkit::testing::RecordReplayRunner<R>::output_bytes<'life0, 'life1, 
 pub fn processkit::testing::RecordReplayRunner<R>::output_string<'life0, 'life1, 'async_trait>(&'life0 self, &'life1 processkit::Command) -> core::pin::Pin<alloc::boxed::Box<(dyn core::future::future::Future<Output = processkit::Result<processkit::ProcessResult<alloc::string::String>>> + core::marker::Send + 'async_trait)>> where Self: 'async_trait, 'life0: 'async_trait, 'life1: 'async_trait
 pub fn processkit::testing::RecordReplayRunner<R>::start<'life0, 'life1, 'async_trait>(&'life0 self, &'life1 processkit::Command) -> core::pin::Pin<alloc::boxed::Box<(dyn core::future::future::Future<Output = processkit::Result<processkit::RunningProcess>> + core::marker::Send + 'async_trait)>> where Self: 'async_trait, 'life0: 'async_trait, 'life1: 'async_trait
 impl<R> !core::marker::Freeze for processkit::testing::RecordReplayRunner<R>
-impl<R> core::marker::Send for processkit::testing::RecordReplayRunner<R>
-impl<R> core::marker::Sync for processkit::testing::RecordReplayRunner<R>
-impl<R> core::marker::Unpin for processkit::testing::RecordReplayRunner<R> where R: core::marker::Unpin
-impl<R> core::marker::UnsafeUnpin for processkit::testing::RecordReplayRunner<R> where R: core::marker::UnsafeUnpin
-impl<R> core::panic::unwind_safe::RefUnwindSafe for processkit::testing::RecordReplayRunner<R> where R: core::panic::unwind_safe::RefUnwindSafe
-impl<R> core::panic::unwind_safe::UnwindSafe for processkit::testing::RecordReplayRunner<R> where R: core::panic::unwind_safe::UnwindSafe
+impl<R> core::marker::Send for processkit::testing::RecordReplayRunner<R> where Mode<R>: core::marker::Send
+impl<R> core::marker::Sync for processkit::testing::RecordReplayRunner<R> where Mode<R>: core::marker::Sync
+impl<R> core::marker::Unpin for processkit::testing::RecordReplayRunner<R> where Mode<R>: core::marker::Unpin
+impl<R> core::marker::UnsafeUnpin for processkit::testing::RecordReplayRunner<R> where Mode<R>: core::marker::UnsafeUnpin
+impl<R> core::panic::unwind_safe::RefUnwindSafe for processkit::testing::RecordReplayRunner<R> where Mode<R>: core::panic::unwind_safe::RefUnwindSafe
+impl<R> core::panic::unwind_safe::UnwindSafe for processkit::testing::RecordReplayRunner<R> where Mode<R>: core::panic::unwind_safe::UnwindSafe
 pub struct processkit::testing::RecordingRunner<R: processkit::ProcessRunner>
 impl processkit::testing::RecordingRunner<processkit::testing::ScriptedRunner>
 pub fn processkit::testing::RecordingRunner<processkit::testing::ScriptedRunner>::replying(processkit::testing::Reply) -> Self
@@ -1119,11 +1119,11 @@ pub fn processkit::JsonLines<T>::fmt(&self, &mut core::fmt::Formatter<'_>) -> co
 impl<T> futures_core::stream::Stream for processkit::JsonLines<T> where T: serde_core::de::DeserializeOwned
 pub type processkit::JsonLines<T>::Item = core::result::Result<T, processkit::Error>
 pub fn processkit::JsonLines<T>::poll_next(core::pin::Pin<&mut Self>, &mut core::task::wake::Context<'_>) -> core::task::poll::Poll<core::option::Option<Self::Item>>
-impl<T> core::marker::Freeze for processkit::JsonLines<T>
-impl<T> core::marker::Send for processkit::JsonLines<T>
+impl<T> core::marker::Freeze for processkit::JsonLines<T> where core::marker::PhantomData<fn() -> T>: core::marker::Freeze
+impl<T> core::marker::Send for processkit::JsonLines<T> where core::marker::PhantomData<fn() -> T>: core::marker::Send
 impl<T> !core::marker::Sync for processkit::JsonLines<T>
-impl<T> core::marker::Unpin for processkit::JsonLines<T>
-impl<T> core::marker::UnsafeUnpin for processkit::JsonLines<T>
+impl<T> core::marker::Unpin for processkit::JsonLines<T> where core::marker::PhantomData<fn() -> T>: core::marker::Unpin
+impl<T> core::marker::UnsafeUnpin for processkit::JsonLines<T> where core::marker::PhantomData<fn() -> T>: core::marker::UnsafeUnpin
 impl<T> !core::panic::unwind_safe::RefUnwindSafe for processkit::JsonLines<T>
 impl<T> !core::panic::unwind_safe::UnwindSafe for processkit::JsonLines<T>
 #[non_exhaustive] pub struct processkit::LimitEvidence
