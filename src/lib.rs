@@ -53,8 +53,9 @@
 //!   stage spawns into its own kill-on-drop `ProcessGroup` sub-group, with
 //!   chain-wide teardown fanning the kill across every sub-group, pipefail
 //!   outcome. [`Command::cancel_on`] ties a run to a
-//!   [`CancellationToken`]: cancelling it kills the tree and every consuming
-//!   path resolves to [`ErrorReason::Cancelled`]. Spawn-time sandboxing knobs:
+//!   [`CancellationToken`]: cancelling it tears the tree down and every consuming
+//!   path resolves to [`ErrorReason::Cancelled`] once teardown is confirmed, or
+//!   [`ErrorReason::Teardown`] with the OS error when it is not. Spawn-time sandboxing knobs:
 //!   [`Command::inherit_env`] (env allow-list), [`Command::uid`] /
 //!   [`Command::gid`] (Unix privilege drop), [`Command::setsid`],
 //!   [`Command::create_no_window`], [`Command::priority`] (CPU-scheduling
@@ -388,7 +389,7 @@ pub use buffer::{
 pub use client::{CliClient, IntoCommand};
 pub use command::Command;
 pub use detached::DetachedChild;
-pub use error::{Error, ErrorKind, ErrorReason, OutputOverflow, Result};
+pub use error::{Error, ErrorKind, ErrorReason, OutputOverflow, Result, TeardownCause};
 pub use group::{ProcessGroup, ProcessGroupOptions};
 pub use io_priority::IoPriority;
 #[cfg(feature = "limits")]
@@ -445,7 +446,8 @@ use std::ffi::OsStr;
 /// The same surface as [`Command::run`]: a launch failure ([`ErrorReason::NotFound`] /
 /// [`ErrorReason::Spawn`] / [`ErrorReason::Unsupported`] / [`ErrorReason::Io`]), a non-accepted
 /// exit ([`ErrorReason::Exit`]), [`ErrorReason::Signalled`], [`ErrorReason::Timeout`], or
-/// [`ErrorReason::OutputTooLarge`] on a fail-loud truncation.
+/// [`ErrorReason::Teardown`] when terminal timeout/cancellation teardown cannot
+/// be confirmed, or [`ErrorReason::OutputTooLarge`] on a fail-loud truncation.
 pub async fn run<I, S>(program: impl AsRef<OsStr>, args: I) -> Result<String>
 where
     I: IntoIterator<Item = S>,
@@ -462,6 +464,7 @@ where
 /// The same surface as [`Command::output_string`]: a non-zero exit, a timeout,
 /// and a signal-kill are *captured* in the returned [`ProcessResult`], not
 /// raised; beyond a launch failure, only [`ErrorReason::Cancelled`],
+/// [`ErrorReason::Teardown`] (terminal teardown was not confirmed),
 /// [`ErrorReason::OutputTooLarge`], [`ErrorReason::Stdin`], and [`ErrorReason::Io`] surface.
 pub async fn output_string<I, S>(
     program: impl AsRef<OsStr>,
@@ -568,15 +571,18 @@ pub fn host_containment() -> HostContainment {
 /// that never resolves.
 ///
 /// The first finisher's result carries the same errors as a bulk verb:
-/// `ErrorReason::Cancelled` for a cancelled run, or [`ErrorReason::Stdin`] when its stdin
-/// source failed (non-broken-pipe) on an otherwise-successful exit. A non-zero
-/// exit or signal is *not* an error here — it is returned as its [`Outcome`].
+/// `ErrorReason::Cancelled` for a cancelled run, [`ErrorReason::Teardown`] when
+/// that cancellation's terminal teardown cannot be confirmed, or
+/// [`ErrorReason::Stdin`] when its stdin source failed (non-broken-pipe) on an
+/// otherwise-successful exit. A non-zero exit or signal is *not* an error here
+/// — it is returned as its [`Outcome`].
 ///
 /// # Errors
 ///
 /// [`ErrorReason::Io`] with [`InvalidInput`](std::io::ErrorKind::InvalidInput) when
 /// `processes` is empty. Otherwise the first finisher's error surfaces:
-/// [`ErrorReason::Cancelled`] (a cancelled run), [`ErrorReason::Stdin`] (a non-broken-pipe
+/// [`ErrorReason::Cancelled`] (a cancelled run), [`ErrorReason::Teardown`] (its
+/// terminal cancellation teardown could not be confirmed), [`ErrorReason::Stdin`] (a non-broken-pipe
 /// stdin-source failure on an otherwise-successful exit), or [`ErrorReason::Io`] (a
 /// failed reap). A non-zero exit or signal is returned as an [`Outcome`], not an
 /// error.
@@ -620,14 +626,17 @@ pub async fn wait_any(processes: &mut [&mut RunningProcess]) -> Result<(usize, O
 ///
 /// If a contender fails to reap (an OS I/O error), that `Err` is returned and
 /// the remaining processes stay waitable (cancel-safe). A contender's
-/// `ErrorReason::Cancelled` (cancelled run) or [`ErrorReason::Stdin`] (a non-broken-pipe
-/// stdin-source failure on its otherwise-successful exit) likewise short-circuits
-/// the join — like the bulk verbs, these surface as an `Err`, not an `Outcome`.
+/// `ErrorReason::Cancelled` (cancelled run), [`ErrorReason::Teardown`] (terminal
+/// cancellation teardown could not be confirmed), or [`ErrorReason::Stdin`] (a
+/// non-broken-pipe stdin-source failure on its otherwise-successful exit)
+/// likewise short-circuits the join — like the bulk verbs, these surface as an
+/// `Err`, not an `Outcome`.
 ///
 /// # Errors
 ///
 /// A contender's [`ErrorReason::Io`] (a failed reap), [`ErrorReason::Cancelled`] (a
-/// cancelled run), or [`ErrorReason::Stdin`] (a non-broken-pipe stdin-source failure
+/// cancelled run), [`ErrorReason::Teardown`] (terminal cancellation teardown was
+/// not confirmed), or [`ErrorReason::Stdin`] (a non-broken-pipe stdin-source failure
 /// on its otherwise-successful exit) short-circuits the join; the remaining
 /// processes stay waitable (cancel-safe). A non-zero exit or signal is returned
 /// as an [`Outcome`], not an error. An empty slice resolves to an empty `Vec`.

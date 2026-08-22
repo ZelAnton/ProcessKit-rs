@@ -175,6 +175,8 @@ trait PipelineCapture: Send + Clone + 'static {
 
     fn prepare(process: &mut RunningProcess) -> Result<Self::Tracker>;
     fn snapshot(tracker: &Self::Tracker) -> Captured<Self>;
+    fn to_diagnostic_text(captured: &Self) -> String;
+    fn exact_bytes(captured: &Self) -> Option<Vec<u8>>;
 }
 
 impl PipelineCapture for String {
@@ -194,6 +196,14 @@ impl PipelineCapture for String {
             total_bytes,
         }
     }
+
+    fn to_diagnostic_text(captured: &Self) -> String {
+        captured.clone()
+    }
+
+    fn exact_bytes(_captured: &Self) -> Option<Vec<u8>> {
+        None
+    }
 }
 
 impl PipelineCapture for Vec<u8> {
@@ -212,6 +222,14 @@ impl PipelineCapture for Vec<u8> {
             total_lines,
             total_bytes,
         }
+    }
+
+    fn to_diagnostic_text(captured: &Self) -> String {
+        String::from_utf8_lossy(captured).into_owned()
+    }
+
+    fn exact_bytes(captured: &Self) -> Option<Vec<u8>> {
+        Some(captured.clone())
     }
 }
 
@@ -332,7 +350,9 @@ impl Pipeline {
     /// Cancel the **whole chain** when `token` fires: the token reaches every
     /// stage, so each stage's run is cancelled and kills its
     /// own subtree, and the run resolves to
-    /// [`ErrorReason::Cancelled`](crate::ErrorReason::Cancelled). This is **proactive** —
+    /// [`ErrorReason::Cancelled`](crate::ErrorReason::Cancelled) once terminal
+    /// teardown is confirmed, or [`ErrorReason::Teardown`](crate::ErrorReason::Teardown)
+    /// with the first OS teardown error when it is not. This is **proactive** —
     /// firing the token cancels the stages directly, it does not wait for them to
     /// notice a closed pipe.
     ///
@@ -650,7 +670,8 @@ impl Pipeline {
         // live chain down (last stage included) even while the caller is mid-stream.
         // `Weak` handles so it never pins a group past a session drop; aborted on
         // `finish`/drop.
-        let killer = spawn_group_killer(teardown.clone(), &stage_groups);
+        let teardown_failure: PipelineTeardownFailure = Arc::default();
+        let killer = spawn_group_killer(teardown.clone(), &stage_groups, teardown_failure.clone());
 
         // The last stage is the caller's to stream, so it gets no `inner_tasks`-style
         // drain that could fire `teardown` from its failure. Without an observer its
@@ -681,10 +702,17 @@ impl Pipeline {
         let deadline_task = self.timeout.map(|limit| {
             let state = chain_state.clone();
             let groups: Vec<Weak<ProcessGroup>> = stage_groups.iter().map(Arc::downgrade).collect();
+            let teardown_failure = teardown_failure.clone();
             let anchor = tokio::time::Instant::now();
             tokio::spawn(async move {
-                if crate::running::deadline::wait_deadline_and_claim(anchor, limit, &state).await {
-                    kill_weak_stage_groups(&groups);
+                if crate::running::deadline::wait_deadline_and_claim(anchor, limit, &state).await
+                    && let Err(source) = kill_weak_stage_groups(&groups)
+                {
+                    record_pipeline_teardown_failure(
+                        &teardown_failure,
+                        crate::TeardownCause::Timeout,
+                        source,
+                    );
                 }
             })
         });
@@ -705,6 +733,7 @@ impl Pipeline {
             chain_state,
             deadline_task,
             killer: Some(killer),
+            teardown_failure,
         })
     }
 
@@ -724,6 +753,8 @@ impl Pipeline {
     /// [`ErrorReason::Spawn`](crate::ErrorReason::Spawn) /
     /// [`ErrorReason::Unsupported`](crate::ErrorReason::Unsupported)),
     /// [`ErrorReason::Cancelled`](crate::ErrorReason::Cancelled),
+    /// [`ErrorReason::Teardown`](crate::ErrorReason::Teardown) when chain-wide or
+    /// per-stage terminal teardown cannot be confirmed,
     /// [`ErrorReason::OutputTooLarge`](crate::ErrorReason::OutputTooLarge) (a fail-loud
     /// overflow of the last stage), [`ErrorReason::Stdin`](crate::ErrorReason::Stdin), or
     /// [`ErrorReason::Io`](crate::ErrorReason::Io).
@@ -787,6 +818,7 @@ impl Pipeline {
         // out (`Err(Cancelled)`) before producing a `StageOutcome`, so cancellation
         // never fires this teardown and the cancel path is unchanged.
         let teardown = tokio_util::sync::CancellationToken::new();
+        let teardown_failure: PipelineTeardownFailure = Arc::default();
 
         // Drain concurrently: a stderr-chatty inner stage must not block on a full pipe.
         let (mut last, last_unchecked) = running.pop().expect("a pipeline has at least two stages");
@@ -803,8 +835,8 @@ impl Pipeline {
         let completed: Arc<std::sync::Mutex<Option<ProcessResult<T>>>> =
             Arc::new(std::sync::Mutex::new(None));
         // Drive every stage's task through one `JoinSet`, drained by
-        // `drain_unordered` below: a stage's raw `Err` (`Cancelled` / `Stdin` /
-        // `Io` / `OutputTooLarge`) or a task panic never reaches the
+        // `drain_unordered` below: a stage's raw `Err` (`Cancelled` / `Teardown` /
+        // `Stdin` / `Io` / `OutputTooLarge`) or a task panic never reaches the
         // `is_checked_failure` check, so it can't fire `teardown` itself the
         // way a checked failure does — `drain_unordered` fires it centrally
         // for *every* bad completion, in true completion order rather than
@@ -870,6 +902,7 @@ impl Pipeline {
             });
         }
 
+        let collect_failure = teardown_failure.clone();
         let collect = async {
             // On a bad completion `drain_unordered` fires `teardown` itself; the
             // killer arm below wakes and tears every stage's sub-group down,
@@ -907,22 +940,40 @@ impl Pipeline {
                 () = async {
                     teardown.cancelled().await;
                     tokio::time::sleep(TEARDOWN_DRAIN_GRACE).await;
-                    kill_all_stage_groups(&stage_groups);
+                    if let Err(source) = kill_all_stage_groups(&stage_groups) {
+                        record_pipeline_teardown_failure(
+                            &collect_failure,
+                            crate::TeardownCause::PipelineFailure,
+                            source,
+                        );
+                    }
                     std::future::pending::<()>().await
                 } => unreachable!("the teardown killer pends forever after firing"),
             }
         };
 
-        let (mut stages, last_result, last_torn_down) = match self.timeout {
-            None => collect.await?,
-            Some(limit) => match tokio::time::timeout(limit, collect).await {
-                Ok(collected) => collected?,
+        // A failed proactive group kill can leave every stage live, so `collect`
+        // cannot be the only completion signal: it would wait forever for the
+        // processes the failed kill did not terminate. The first-failure slot also
+        // notifies this race; dropping `collect` drops its JoinSet, and the retained
+        // capture tracker below still yields the prefix read before teardown.
+        let collect_or_teardown_failure = async {
+            tokio::select! {
+                biased;
+                () = wait_pipeline_teardown_failure(&teardown_failure) => None,
+                collected = collect => Some(collected),
+            }
+        };
+        let collected = match self.timeout {
+            None => collect_or_teardown_failure.await,
+            Some(limit) => match tokio::time::timeout(limit, collect_or_teardown_failure).await {
+                Ok(collected) => collected,
                 Err(_elapsed) => {
                     // `collect` was dropped with the timeout future, so the
                     // `JoinSet` aborted the capture tasks. The last stage's
                     // tracker is deliberately outside that task frame and still
                     // contains the best-effort data read before cancellation.
-                    kill_all_stage_groups(&stage_groups);
+                    let teardown_result = kill_all_stage_groups(&stage_groups);
                     let captured = completed
                         .lock()
                         .expect("pipeline capture result poisoned")
@@ -936,6 +987,17 @@ impl Pipeline {
                         total_lines,
                         total_bytes,
                     } = captured;
+                    if let Err(source) = teardown_result {
+                        return Err(crate::Error::teardown(
+                            self.pipeline_name(),
+                            crate::TeardownCause::Timeout,
+                            "pipeline process-group hard kill",
+                            source,
+                            T::to_diagnostic_text(&stdout),
+                            stderr,
+                            T::exact_bytes(&stdout),
+                        ));
+                    }
                     return Ok(ProcessResult::new(
                         self.pipeline_name(),
                         stdout,
@@ -949,6 +1011,26 @@ impl Pipeline {
                 }
             },
         };
+
+        if let Some(failure) = take_pipeline_teardown_failure(&teardown_failure) {
+            let captured = completed
+                .lock()
+                .expect("pipeline capture result poisoned")
+                .take()
+                .map(captured_result)
+                .unwrap_or_else(|| T::snapshot(&capture));
+            return Err(crate::Error::teardown(
+                self.pipeline_name(),
+                failure.cause,
+                "pipeline process-group hard kill",
+                failure.source,
+                T::to_diagnostic_text(&captured.stdout),
+                captured.stderr,
+                T::exact_bytes(&captured.stdout),
+            ));
+        }
+        let (mut stages, last_result, last_torn_down) =
+            collected.expect("the notified pipeline teardown failure was consumed above")?;
 
         // `pipefail` rebuilds via `ProcessResult::new` (which defaults `truncated=false`);
         // re-stamp truncation so the `parse`/`try_parse` guard fires correctly. The
@@ -1003,6 +1085,8 @@ impl Pipeline {
     /// [`ErrorReason::Timeout`](crate::ErrorReason::Timeout) (the whole-chain
     /// [`timeout`](Self::timeout) or any stage's own — the attributed stage's
     /// deadline is reported), [`ErrorReason::Cancelled`](crate::ErrorReason::Cancelled),
+    /// [`ErrorReason::Teardown`](crate::ErrorReason::Teardown) (terminal teardown
+    /// could not be confirmed),
     /// [`ErrorReason::OutputTooLarge`](crate::ErrorReason::OutputTooLarge) (a fail-loud
     /// truncation of the last stage), plus any launch failure or
     /// [`ErrorReason::Stdin`](crate::ErrorReason::Stdin).
@@ -1024,7 +1108,8 @@ impl Pipeline {
     /// [`ErrorReason::Exit`](crate::ErrorReason::Exit) /
     /// [`ErrorReason::Signalled`](crate::ErrorReason::Signalled) /
     /// [`ErrorReason::Timeout`](crate::ErrorReason::Timeout) /
-    /// [`ErrorReason::Cancelled`](crate::ErrorReason::Cancelled), plus launch failures and
+    /// [`ErrorReason::Cancelled`](crate::ErrorReason::Cancelled) /
+    /// [`ErrorReason::Teardown`](crate::ErrorReason::Teardown), plus launch failures and
     /// [`ErrorReason::Stdin`](crate::ErrorReason::Stdin) — but, as the lenient building block,
     /// it does not fail loud on a bounded-buffer truncation.
     pub async fn checked(&self) -> Result<ProcessResult<String>> {
@@ -1053,7 +1138,8 @@ impl Pipeline {
     /// A chain that produced no code errors as
     /// [`ErrorReason::Timeout`](crate::ErrorReason::Timeout) (whole-chain or stage),
     /// [`ErrorReason::Signalled`](crate::ErrorReason::Signalled), or
-    /// [`ErrorReason::Cancelled`](crate::ErrorReason::Cancelled), atop any launch failure. A
+    /// [`ErrorReason::Cancelled`](crate::ErrorReason::Cancelled), or
+    /// [`ErrorReason::Teardown`](crate::ErrorReason::Teardown), atop any launch failure. A
     /// non-zero pipefail code is returned, not raised.
     pub async fn exit_code(&self) -> Result<i32> {
         self.output_string().await?.require_code()
@@ -1080,7 +1166,8 @@ impl Pipeline {
     /// [`ErrorReason::Exit`](crate::ErrorReason::Exit); a chain with no code errors as
     /// [`ErrorReason::Timeout`](crate::ErrorReason::Timeout),
     /// [`ErrorReason::Signalled`](crate::ErrorReason::Signalled), or
-    /// [`ErrorReason::Cancelled`](crate::ErrorReason::Cancelled), atop any launch failure.
+    /// [`ErrorReason::Cancelled`](crate::ErrorReason::Cancelled), or
+    /// [`ErrorReason::Teardown`](crate::ErrorReason::Teardown), atop any launch failure.
     pub async fn probe(&self) -> Result<bool> {
         let result = self.output_string().await?;
         result.probe_bool()
@@ -1101,6 +1188,7 @@ impl Pipeline {
     /// [`ErrorReason::Signalled`](crate::ErrorReason::Signalled) /
     /// [`ErrorReason::Timeout`](crate::ErrorReason::Timeout) /
     /// [`ErrorReason::Cancelled`](crate::ErrorReason::Cancelled) /
+    /// [`ErrorReason::Teardown`](crate::ErrorReason::Teardown) /
     /// [`ErrorReason::Stdin`](crate::ErrorReason::Stdin)), plus
     /// [`ErrorReason::OutputTooLarge`](crate::ErrorReason::OutputTooLarge) when a fail-loud
     /// buffer truncated the last stage's stdout. The `parse` closure is
@@ -1235,6 +1323,8 @@ pub struct PipelineSession {
     deadline_task: Option<JoinHandle<()>>,
     /// The standing teardown killer, aborted on `finish`/drop.
     killer: Option<JoinHandle<()>>,
+    /// First chain-wide group-kill failure from the deadline or proactive killer.
+    teardown_failure: PipelineTeardownFailure,
 }
 
 impl std::fmt::Debug for PipelineSession {
@@ -1319,19 +1409,28 @@ impl PipelineSession {
     }
 
     /// Stop the **whole chain** now: fan a hard kill across every stage's sub-group.
-    /// Idempotent and best-effort (a per-group error is swallowed), mirroring
+    /// Idempotent; every stage is attempted even when one group rejects its kill.
     /// [`RunningProcess::start_kill`](crate::RunningProcess::start_kill) at chain
     /// scope. After it, the last stage's stream ends and [`finish`](Self::finish)
     /// reports the killed outcome via the usual pipefail fold.
     ///
     /// # Errors
     ///
-    /// Currently infallible — returns `Ok(())`; the `Result` mirrors
-    /// [`RunningProcess::start_kill`](crate::RunningProcess::start_kill) and leaves
-    /// room for a future backend that can report a kill failure.
+    /// [`ErrorReason::Teardown`](crate::ErrorReason::Teardown) when a stage group
+    /// rejects the kill. The source error is retained and the session remains
+    /// finishable; kill-on-drop still backstops every group.
     pub fn start_kill(&mut self) -> Result<()> {
-        kill_all_stage_groups(&self.stage_groups);
-        Ok(())
+        kill_all_stage_groups(&self.stage_groups).map_err(|source| {
+            crate::Error::teardown(
+                self.last_program.clone(),
+                crate::TeardownCause::ExplicitKill,
+                "pipeline process-group hard kill",
+                source,
+                String::new(),
+                String::new(),
+                None,
+            )
+        })
     }
 
     /// Finish the live chain and fold the **pipefail** outcome, the streaming
@@ -1356,6 +1455,9 @@ impl PipelineSession {
     /// buffering verbs' non-outcome failures:
     /// [`ErrorReason::Cancelled`](crate::ErrorReason::Cancelled) (the chain-wide
     /// [`cancel_on`](Pipeline::cancel_on) token fired, or a stage carried one),
+    /// [`ErrorReason::Teardown`](crate::ErrorReason::Teardown) (a chain-wide or
+    /// per-stage terminal kill could not be confirmed; this outranks the initiating
+    /// timeout/cancellation/pipeline failure),
     /// [`ErrorReason::OutputTooLarge`](crate::ErrorReason::OutputTooLarge) (a fail-loud buffer
     /// overflowed on a stage), [`ErrorReason::Stdin`](crate::ErrorReason::Stdin), or
     /// [`ErrorReason::Io`](crate::ErrorReason::Io).
@@ -1421,17 +1523,60 @@ impl PipelineSession {
                 (result, torn_down)
             }
         };
-        let ((last_res, last_torn_down), inner_res) =
-            tokio::join!(last_fut, drain_unordered(inner_tasks, &teardown));
+        // A failed background group kill may leave all stages live. Race their
+        // normal drains with the first-failure notification so `finish` never
+        // waits for the very processes teardown failed to terminate.
+        let settled = tokio::select! {
+            biased;
+            () = wait_pipeline_teardown_failure(&self.teardown_failure) => None,
+            settled = async {
+                tokio::join!(last_fut, drain_unordered(inner_tasks, &teardown))
+            } => Some(settled),
+        };
 
         // Both sides settled — stop the background watchdogs.
         self.abort_background();
+
+        let chain_timed_out = self.chain_timed_out();
+        if let Some(failure) = take_pipeline_teardown_failure(&self.teardown_failure) {
+            let stderr = settled
+                .map(|((last_res, last_torn_down), inner_res)| {
+                    timeout_finished(
+                        inner_res,
+                        last_res,
+                        &self.last_program,
+                        &self.last_ok_codes,
+                        self.last_unchecked,
+                        self.last_timeout,
+                        last_torn_down,
+                    )
+                    .stderr
+                })
+                .unwrap_or_default();
+            return Err(crate::Error::teardown(
+                self.last_program.clone(),
+                failure.cause,
+                "pipeline process-group hard kill",
+                failure.source,
+                String::new(),
+                stderr,
+                None,
+            ));
+        }
+        let ((last_res, last_torn_down), inner_res) = match settled {
+            Some(settled) => settled,
+            None => {
+                return Err(crate::Error::io(std::io::Error::other(
+                    "pipeline teardown notification had no retained failure",
+                )));
+            }
+        };
 
         // Chain-wide timeout wins over the stages' own (hard-killed) outcomes, just
         // like the buffering path's `tokio::time::timeout` branch. Claiming the
         // arbiter is race-free against the watchdog: whichever of `Exited`/`TimedOut`
         // CASes from `PENDING` first decides.
-        if self.chain_timed_out() {
+        if chain_timed_out {
             return Ok(timeout_finished(
                 inner_res,
                 last_res,
@@ -1443,7 +1588,8 @@ impl PipelineSession {
             ));
         }
 
-        // Surface a raw `Err` from either side (Cancelled / OutputTooLarge / Stdin / Io).
+        // Surface a raw `Err` from either side (Cancelled / Teardown /
+        // OutputTooLarge / Stdin / Io).
         let last_finished = last_res?;
         let mut inner = inner_res.map_err(|failure| failure.error)?;
 
@@ -1619,8 +1765,8 @@ impl Drop for LastBorrow<'_> {
 /// Fan a hard kill across every stage's sub-group — the chain-wide backstop when
 /// a [`Pipeline::timeout`] elapses or a stage's failure triggers proactive
 /// teardown, now that each stage owns its own kill-on-drop group rather than
-/// sharing one. Best-effort: a per-group error is swallowed, exactly as the old
-/// single-group `kill_all()` was.
+/// sharing one. Every group is still attempted; the first non-routine error is
+/// returned so a caller never reports a confirmed chain teardown over a survivor.
 ///
 /// Called synchronously from a spawned async task (both the timeout branch and
 /// the cancellation killer above), so on a cgroup backend it is one of the four
@@ -1629,10 +1775,72 @@ impl Drop for LastBorrow<'_> {
 /// restricted-cgroup tradeoff. That ~100 ms is the ceiling for every backend:
 /// FreeBSD's reaper keeps its post-kill corpse drain in `Drop` alone (see
 /// `DRAIN_BUDGET`, `src/sys/freebsd.rs`), so this path does not block there.
-fn kill_all_stage_groups(groups: &[Arc<ProcessGroup>]) {
-    for group in groups {
-        let _ = group.kill_all();
+#[derive(Debug)]
+struct PipelineKillFailure {
+    cause: crate::TeardownCause,
+    source: std::io::Error,
+}
+
+#[derive(Debug, Default)]
+struct PipelineTeardownState {
+    first: std::sync::Mutex<Option<PipelineKillFailure>>,
+    changed: tokio::sync::Notify,
+}
+
+type PipelineTeardownFailure = Arc<PipelineTeardownState>;
+
+fn record_pipeline_teardown_failure(
+    slot: &PipelineTeardownFailure,
+    cause: crate::TeardownCause,
+    source: std::io::Error,
+) {
+    let mut guard = slot
+        .first
+        .lock()
+        .expect("pipeline teardown failure slot poisoned");
+    if guard.is_none() {
+        *guard = Some(PipelineKillFailure { cause, source });
+        drop(guard);
+        slot.changed.notify_waiters();
     }
+}
+
+async fn wait_pipeline_teardown_failure(slot: &PipelineTeardownFailure) {
+    loop {
+        // Enable before checking the slot so a writer between the check and the
+        // await cannot be lost (`notify_waiters` stores no broadcast permit).
+        let changed = slot.changed.notified();
+        tokio::pin!(changed);
+        changed.as_mut().enable();
+        if slot
+            .first
+            .lock()
+            .expect("pipeline teardown failure slot poisoned")
+            .is_some()
+        {
+            return;
+        }
+        changed.await;
+    }
+}
+
+fn take_pipeline_teardown_failure(slot: &PipelineTeardownFailure) -> Option<PipelineKillFailure> {
+    slot.first
+        .lock()
+        .expect("pipeline teardown failure slot poisoned")
+        .take()
+}
+
+fn kill_all_stage_groups(groups: &[Arc<ProcessGroup>]) -> std::io::Result<()> {
+    let mut first_error = None;
+    for group in groups {
+        if let Err(error) = crate::running::group_hard_kill(group)
+            && first_error.is_none()
+        {
+            first_error = Some(error);
+        }
+    }
+    first_error.map_or(Ok(()), Err)
 }
 
 /// The [`Weak`] analogue of [`kill_all_stage_groups`], for the detached watchdog
@@ -1640,12 +1848,17 @@ fn kill_all_stage_groups(groups: &[Arc<ProcessGroup>]) {
 /// task can never keep a stage's sub-group (and its kill-on-drop backstop) alive
 /// past a session drop — a dropped-away group simply fails to upgrade and is
 /// skipped. Best-effort per group, exactly like the strong-handle version.
-fn kill_weak_stage_groups(groups: &[Weak<ProcessGroup>]) {
+fn kill_weak_stage_groups(groups: &[Weak<ProcessGroup>]) -> std::io::Result<()> {
+    let mut first_error = None;
     for group in groups {
-        if let Some(group) = group.upgrade() {
-            let _ = group.kill_all();
+        if let Some(group) = group.upgrade()
+            && let Err(error) = crate::running::group_hard_kill(&group)
+            && first_error.is_none()
+        {
+            first_error = Some(error);
         }
     }
+    first_error.map_or(Ok(()), Err)
 }
 
 /// Spawn the standing teardown killer for [`Pipeline::start`]'s live session: it
@@ -1656,12 +1869,19 @@ fn kill_weak_stage_groups(groups: &[Weak<ProcessGroup>]) {
 fn spawn_group_killer(
     teardown: tokio_util::sync::CancellationToken,
     stage_groups: &[Arc<ProcessGroup>],
+    teardown_failure: PipelineTeardownFailure,
 ) -> JoinHandle<()> {
     let groups: Vec<Weak<ProcessGroup>> = stage_groups.iter().map(Arc::downgrade).collect();
     tokio::spawn(async move {
         teardown.cancelled().await;
         tokio::time::sleep(TEARDOWN_DRAIN_GRACE).await;
-        kill_weak_stage_groups(&groups);
+        if let Err(source) = kill_weak_stage_groups(&groups) {
+            record_pipeline_teardown_failure(
+                &teardown_failure,
+                crate::TeardownCause::PipelineFailure,
+                source,
+            );
+        }
     })
 }
 
@@ -2079,6 +2299,7 @@ type InnerDrain = std::result::Result<Vec<InnerStage>, PartialDrainError<InnerSt
 /// (`JoinSet::join_next`, not a left-to-right positional await), firing
 /// `teardown` the instant *any* task ends badly — a raw `Err` (a stage's own
 /// [`ErrorReason::Cancelled`](crate::ErrorReason::Cancelled) /
+/// [`ErrorReason::Teardown`](crate::ErrorReason::Teardown) /
 /// [`ErrorReason::Stdin`](crate::ErrorReason::Stdin) / [`ErrorReason::Io`](crate::ErrorReason::Io) /
 /// [`ErrorReason::OutputTooLarge`](crate::ErrorReason::OutputTooLarge)) or a task panic
 /// (surfaced here as a `JoinError`).
@@ -2135,6 +2356,220 @@ async fn drain_unordered<Item: 'static>(
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    fn long_pipeline() -> Pipeline {
+        #[cfg(unix)]
+        return Command::new("sh")
+            .args(["-c", "sleep 60"])
+            .pipe(Command::new("sh").args(["-c", "cat >/dev/null"]));
+        #[cfg(windows)]
+        {
+            let producer = Command::new("powershell").args([
+                "-NoLogo",
+                "-NoProfile",
+                "-NonInteractive",
+                "-Command",
+                "Start-Sleep -Seconds 60",
+            ]);
+            let consumer = Command::new("powershell").args([
+                "-NoLogo",
+                "-NoProfile",
+                "-NonInteractive",
+                "-Command",
+                "$input | Out-Null; Start-Sleep -Seconds 60",
+            ]);
+            producer.pipe(consumer)
+        }
+    }
+
+    fn pipeline_marker(tag: &str) -> std::path::PathBuf {
+        static NEXT: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+        std::env::temp_dir().join(format!(
+            "processkit_pipeline_teardown_{tag}_{}_{}",
+            std::process::id(),
+            NEXT.fetch_add(1, Ordering::Relaxed)
+        ))
+    }
+
+    fn marked_long_pipeline(marker: &std::path::Path) -> Pipeline {
+        #[cfg(unix)]
+        return Command::new("sh")
+            .args(["-c", "sleep 60"])
+            .pipe(Command::new("sh").args([
+                "-c",
+                &format!(
+                    "printf 'pipeline-prefix\\n'; : > '{}'; sleep 60",
+                    marker.display()
+                ),
+            ]));
+        #[cfg(windows)]
+        {
+            let marker = marker.display().to_string().replace('\'', "''");
+            let producer = Command::new("powershell").args([
+                "-NoLogo",
+                "-NoProfile",
+                "-NonInteractive",
+                "-Command",
+                "Start-Sleep -Seconds 60",
+            ]);
+            let consumer = Command::new("powershell").args([
+                "-NoLogo",
+                "-NoProfile",
+                "-NonInteractive",
+                "-Command",
+                &format!(
+                    "[Console]::Out.WriteLine('pipeline-prefix'); \
+                     [IO.File]::WriteAllText('{marker}', 'ready'); \
+                     Start-Sleep -Seconds 60"
+                ),
+            ]);
+            producer.pipe(consumer)
+        }
+    }
+
+    async fn wait_for_pipeline_marker(marker: &std::path::Path) {
+        for _ in 0..500 {
+            if marker.exists() {
+                return;
+            }
+            tokio::time::sleep(Duration::from_millis(10)).await;
+        }
+        panic!(
+            "pipeline stage did not publish readiness marker: {}",
+            marker.display()
+        );
+    }
+
+    fn assert_pipeline_teardown(error: &crate::Error, expected: crate::TeardownCause) {
+        match error.reason() {
+            crate::ErrorReason::Teardown {
+                cause,
+                operation,
+                source,
+                ..
+            } => {
+                assert_eq!(*cause, expected);
+                assert_eq!(*operation, "pipeline process-group hard kill");
+                assert_eq!(source.raw_os_error(), Some(5));
+            }
+            other => panic!("expected pipeline Teardown, got {other:?}"),
+        }
+    }
+
+    #[tokio::test(flavor = "current_thread")]
+    #[ignore = "spawns a real pipeline for deterministic group-kill fault injection"]
+    async fn pipeline_start_kill_surfaces_the_first_group_teardown_failure() {
+        let mut session = long_pipeline().start().await.expect("start live pipeline");
+        let faults = crate::sys::fault_injection::Faults::new()
+            .fail_every(
+                crate::sys::fault_injection::Site::ProcessGroupTeardown,
+                Some("hard"),
+                5,
+            )
+            .arm();
+
+        let error = session
+            .start_kill()
+            .expect_err("pipeline kill failure must not be swallowed");
+        match error.reason() {
+            crate::ErrorReason::Teardown {
+                cause,
+                operation,
+                source,
+                ..
+            } => {
+                assert_eq!(*cause, crate::TeardownCause::ExplicitKill);
+                assert_eq!(*operation, "pipeline process-group hard kill");
+                assert_eq!(source.raw_os_error(), Some(5));
+            }
+            other => panic!("expected pipeline Teardown, got {other:?}"),
+        }
+        assert_eq!(
+            faults.fired(crate::sys::fault_injection::Site::ProcessGroupTeardown),
+            2,
+            "every stage group is attempted even after the first error"
+        );
+        drop(faults);
+        session.start_kill().expect("cleanup kill");
+    }
+
+    #[tokio::test(flavor = "current_thread")]
+    #[ignore = "spawns a real buffered pipeline for deterministic timeout fault injection"]
+    async fn buffered_pipeline_timeout_keeps_prefix_and_surfaces_group_failure() {
+        let marker = pipeline_marker("buffered_timeout");
+        let _ = std::fs::remove_file(&marker);
+        let pipeline = marked_long_pipeline(&marker).timeout(Duration::from_secs(5));
+        let task = tokio::spawn(async move { pipeline.output_string().await });
+        wait_for_pipeline_marker(&marker).await;
+        let faults = crate::sys::fault_injection::Faults::new()
+            .fail_every(
+                crate::sys::fault_injection::Site::ProcessGroupTeardown,
+                Some("hard"),
+                5,
+            )
+            .arm();
+
+        let error = task
+            .await
+            .expect("pipeline task")
+            .expect_err("an unconfirmed chain timeout must fail closed");
+        assert_pipeline_teardown(&error, crate::TeardownCause::Timeout);
+        match error.reason() {
+            crate::ErrorReason::Teardown { stdout, .. } => assert!(
+                stdout.contains("pipeline-prefix"),
+                "the timeout error retains the buffered pipeline prefix: {stdout:?}"
+            ),
+            _ => unreachable!(),
+        }
+        assert_eq!(
+            faults.fired(crate::sys::fault_injection::Site::ProcessGroupTeardown),
+            2,
+            "the chain timeout attempts every stage group"
+        );
+        let _ = std::fs::remove_file(marker);
+    }
+
+    #[tokio::test(flavor = "current_thread")]
+    #[ignore = "spawns a real streaming pipeline for deterministic timeout fault injection"]
+    async fn pipeline_session_timeout_failure_finishes_without_waiting_for_live_stages() {
+        let marker = pipeline_marker("session_timeout");
+        let _ = std::fs::remove_file(&marker);
+        let session = marked_long_pipeline(&marker)
+            .timeout(Duration::from_secs(30))
+            .start()
+            .await
+            .expect("start live pipeline");
+        wait_for_pipeline_marker(&marker).await;
+        let faults = crate::sys::fault_injection::Faults::new()
+            .fail_every(
+                crate::sys::fault_injection::Site::ProcessGroupTeardown,
+                Some("hard"),
+                5,
+            )
+            .arm();
+
+        let source = kill_all_stage_groups(&session.stage_groups)
+            .expect_err("the injected session group kill fails");
+        record_pipeline_teardown_failure(
+            &session.teardown_failure,
+            crate::TeardownCause::Timeout,
+            source,
+        );
+        session
+            .chain_state
+            .store(crate::running::TS_TIMED_OUT, Ordering::Release);
+        let error = tokio::time::timeout(Duration::from_secs(5), session.finish())
+            .await
+            .expect("teardown failure must bound pipeline finish")
+            .expect_err("an unconfirmed live-chain timeout must fail closed");
+        assert_pipeline_teardown(&error, crate::TeardownCause::Timeout);
+        assert_eq!(
+            faults.fired(crate::sys::fault_injection::Site::ProcessGroupTeardown),
+            2,
+            "the live-session timeout attempts every stage group"
+        );
+        let _ = std::fs::remove_file(marker);
+    }
 
     /// Compile-time proof that sharing the last stage's handle with the standing
     /// watcher did not cost the session any auto trait: a [`PipelineSession`] is

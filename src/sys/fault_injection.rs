@@ -77,6 +77,11 @@
 //!   `dup`, a reactor registration); the target label names the owner of the fd
 //!   (`reader`, `writer`, `resize`). This is what makes the post-spawn rollback
 //!   path — otherwise reachable only on an fd-exhausted host — testable.
+//! - `running` / `pipeline` terminal teardown wrappers — the owned child's
+//!   `start_kill` and the process group's hard/graceful teardown calls. Targets
+//!   distinguish `real` / `pty` children and `hard` / `graceful` groups. Async
+//!   tests arming these sites use a current-thread runtime so the thread-local
+//!   scope remains deterministic across awaits.
 //!
 //! A faulted call never reaches the OS at all, which is also what makes a test able
 //! to name a signal it must not actually send.
@@ -91,6 +96,12 @@ use std::io;
 /// unreachable variant can never be armed by mistake.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub(crate) enum Site {
+    /// Run lifecycle: one direct owned-child `start_kill` call. Target label:
+    /// `real` or `pty`.
+    DirectChildKill,
+    /// Run/pipeline lifecycle: one process-group teardown call. Target label:
+    /// `hard` or `graceful`.
+    ProcessGroupTeardown,
     /// Linux: one `write(2)` to a cgroup v2 interface file, through
     /// `sys::linux::cgroup_write`. Target label: the file name.
     #[cfg(target_os = "linux")]

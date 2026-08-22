@@ -559,6 +559,7 @@ impl RunningProcess {
             stdout_pump: None,
             stderr_pump: None,
             stdin_error: None,
+            teardown_failure: Arc::new(std::sync::Mutex::new(None)),
             #[cfg(test)]
             test_stdin_task: None,
             stdout_piped: command.stdout_is_piped(),

@@ -53,12 +53,18 @@ async fn main() -> processkit::Result<()> {
 
 Where each verb lands:
 
+Every row below assumes the terminal kill/escalation/reap was confirmed. If the
+OS rejects that teardown, the consuming path fails closed with
+`ErrorReason::Teardown { cause, operation, source, .. }` instead of reporting a
+successful timeout disposition over a potentially-live child/tree. Captured
+stdout/stderr remains attached as a bounded best-effort prefix.
+
 | Verb | Deadline expiry becomes |
 |---|---|
 | `output_string()` / `output_bytes()` | `Ok` result with `timed_out() == true`, `code() == None`, partial output kept |
 | `run()` / `exit_code()` / `probe()` / `checked()` | `ErrorReason::Timeout { program, timeout, inactivity, stdout, stderr, .. }` — the partial output captured before the kill is attached (`err.diagnostic()` surfaces a hung tool's last words) |
 | `first_line(pred)` | `ErrorReason::Timeout` (the line never arrived in time) |
-| `start()` + streaming | the stream **ends** at the deadline (tree killed, pipes closed); `finish` then reports the kill (`outcome == Outcome::TimedOut`) |
+| `start()` + streaming | after confirmed teardown the stream **ends** at the deadline (tree killed, pipes closed); `finish` reports `outcome == Outcome::TimedOut`; an unconfirmed teardown is `ErrorReason::Teardown` |
 | `ensure_success()` on a captured result | `ErrorReason::Timeout`, checked *before* the exit code |
 | [`Pipeline`](pipelines.md#timeouts) | chain deadline → `timed_out` result; per-stage deadlines fold into pipefail |
 
@@ -92,8 +98,10 @@ The first watchdog to fire wins. Both use the same whole-tree teardown and honor
 `Outcome::TimedOut` means the absolute runtime expired;
 `Outcome::InactivityTimedOut` means the output went quiet. `timed_out()` is true
 for either; `inactivity_timed_out()` identifies the latter. Checking verbs turn
-both into `ErrorReason::Timeout`; its `inactivity` field carries the distinction
-and its `timeout` field is the window that fired.
+both into `ErrorReason::Timeout` after confirmed teardown; its `inactivity` field
+carries the distinction and its `timeout` field is the window that fired. A
+failed kill/escalation/reap is `ErrorReason::Teardown` with
+`TeardownCause::InactivityTimeout` or `TeardownCause::Timeout` instead.
 
 This first iteration applies to individual command runs, including capture,
 streaming, first-line consumption, and PTY mode. Readiness probes drain output
@@ -210,8 +218,9 @@ Ground rules:
   stdin source if a stdin-bearing command must retry. (A one-shot source re-run
   *outside* the retry loop — a `Supervisor` incarnation, a pipeline re-run —
   instead fails loud with an `ErrorReason::Io` (`InvalidInput`) at launch.)
-- A `Cancelled` error is **never retried**, classifier or not — the token
-  stays cancelled forever, so another attempt could only fail the same way.
+- `Cancelled` and `Teardown` errors are **never retried**, classifier or not. A
+  cancelled token stays cancelled; an unconfirmed teardown may have left the
+  failed attempt live, so another attempt could duplicate it.
 
 For "keep it alive" (restart a *service* whenever it exits) rather than
 "replay this one operation", use a [`Supervisor`](supervision.md) — same
@@ -220,8 +229,10 @@ backoff shape, different loop condition.
 ## Cancellation
 
 Hand any command a `CancellationToken` (re-exported at the crate root);
-cancelling the token kills the run's tree and makes every consuming path
-report `ErrorReason::Cancelled`:
+cancelling the token tears the run's tree down and makes every consuming path
+report `ErrorReason::Cancelled` once terminal teardown is confirmed. If the OS
+rejects a required kill/escalation/reap, the path reports
+`ErrorReason::Teardown` with `TeardownCause::Cancellation` instead:
 
 ```rust,no_run
 use processkit::{CancellationToken, Command};
@@ -253,8 +264,8 @@ The contract, path by path:
 
 | Situation | Behavior |
 |---|---|
-| Cancel during `run` / `output_string` / `output_bytes` / `wait` / `profile` / `exit_code` / `probe` | tree killed, `ErrorReason::Cancelled { program }` |
-| Cancel during streaming (`stdout_lines`) | the stream **ends**; the following `finish` reports `ErrorReason::Cancelled` |
+| Cancel during `run` / `output_string` / `output_bytes` / `wait` / `profile` / `exit_code` / `probe` | confirmed tree teardown → `ErrorReason::Cancelled { program }`; refused/unconfirmed teardown → `ErrorReason::Teardown` |
+| Cancel during streaming (`stdout_lines`) | after confirmed teardown the stream **ends** and `finish` reports `ErrorReason::Cancelled`; an unconfirmed teardown is `ErrorReason::Teardown` |
 | Token already cancelled before the run | short-circuits **before spawning** — no process is ever created |
 | Cancel on a shared-`ProcessGroup` handle | kills the child itself, leaves the group's siblings alone (same scope as a timeout) |
 | A `Pipeline` stage's token cancels | that stage dies; the cancellation errors the whole pipeline and the private group reaps the other stages |
@@ -264,7 +275,7 @@ The contract, path by path:
 | Under a [`Supervisor`](supervision.md) | terminal — supervision returns `Err(Cancelled)` instead of restarting into a still-cancelled token |
 | `wait_any` mid-run | surfaces `Err(Cancelled)` — each racer's wait path resolves to `Cancelled` when its token fires, the same as a bulk verb (a *pre-cancelled* token still hits the pre-spawn short-circuit) |
 | `first_line` mid-run | surfaces `ErrorReason::Cancelled` once the token fires — a cancelled stream that closes without a match is reported as cancellation, not `Ok(None)` |
-| Teardown manner | hard kill by default; SIGTERM → grace → SIGKILL with [`cancel_grace`](#graceful-cancellation) (the outcome is `Cancelled` either way) |
+| Teardown manner | hard kill by default; SIGTERM → grace → SIGKILL with [`cancel_grace`](#graceful-cancellation) (the ordinary outcome is `Cancelled` either way; an unconfirmed terminal step is `Teardown`) |
 
 ### Graceful cancellation
 
@@ -320,10 +331,10 @@ Ground rules:
 - **Opt-in, and inert by default.** Without `cancel_grace` every cancellation
   path behaves exactly as it always has (immediate hard kill). It also does
   nothing without a token.
-- **The outcome never changes.** Whether the child exited on the soft signal or
-  was killed after the grace, every consuming path still reports
-  `ErrorReason::Cancelled` — cancellation is still an abandonment, still never
-  retried, still terminal under `Supervisor`.
+- **The confirmed outcome never changes.** Whether the child exited on the soft
+  signal or was killed after the grace, every consuming path reports
+  `ErrorReason::Cancelled`. A refused escalation/reap is not confirmation and
+  reports `ErrorReason::Teardown` instead. Both are terminal under retry.
 - **Independent of the timeout knobs.** `cancel_grace`/`cancel_signal` do not
   read (and are not filled in by) `timeout_grace`/`timeout_signal`, so a command
   can say farewell differently for "the caller changed its mind" than for "the
@@ -395,6 +406,14 @@ async fn main() -> processkit::Result<()> {
     Ok(())
 }
 ```
+
+**Teardown failure vs. every initiating disposition.** The timeout/cancellation
+ordering above applies only after terminal teardown is confirmed. A non-routine
+kill, graceful escalation, or reap failure takes priority over timeout,
+inactivity timeout, cancellation, pipeline failure, stdin failure, and pump
+failure. `ErrorReason::Teardown` preserves the initiating `TeardownCause`, the
+original `io::Error`, and any prefix the bounded output drain already captured;
+callers must assume the child/tree may still be live.
 
 **Which knob for which job:**
 

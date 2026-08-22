@@ -35,13 +35,14 @@ which variant fires from where, how to classify it, and what to do about it.
 | `ErrorReason::NotFound { program, searched }` | The program could not be located at all — not installed, not on `PATH`, or a path that doesn't resolve | `is_not_found()` is `true`; surface a "is it installed?" hint. `searched` (`Some(dirs)` for a bare-name `PATH` lookup, `None` otherwise) is for a diagnostic only — never log it, it echoes the `PATH` value. |
 | `ErrorReason::CassetteMiss { program }` (`record` feature) | A cassette replay found no recording matching the invocation — a stale or incomplete cassette, not a missing program | Fix or re-record the cassette. **Not** `is_not_found()` — do not let an "optional dependency" wrapper swallow this as "tool not installed". |
 | `ErrorReason::Exit { program, code, stdout, stderr, stdout_bytes }` | The process ran to completion but exited non-zero | Branch on `code()`; `diagnostic()` for the best one-line human message (stderr, else stdout — `git`/`jj` put decisive text on stdout). |
-| `ErrorReason::Timeout { program, timeout, stdout, stderr, stdout_bytes }` | `Command::timeout` elapsed and the tree was killed, on a **checking** verb | `is_timeout()`. Whatever was captured before the kill is attached — `diagnostic()` often explains the hang. Consider composing into a retry classifier: `e.is_timeout() \|\| e.is_transient()`. |
+| `ErrorReason::Timeout { program, timeout, stdout, stderr, stdout_bytes }` | `Command::timeout` elapsed and terminal teardown was confirmed, on a **checking** verb | `is_timeout()`. Whatever was captured before teardown is attached — `diagnostic()` often explains the hang. Consider composing into a retry classifier: `e.is_timeout() \|\| e.is_transient()`. |
+| `ErrorReason::Teardown { program, cause, operation, source, stdout, stderr, stdout_bytes }` | A timeout, inactivity window, cancellation, explicit pipeline kill, or pipeline-stage failure required terminal teardown, but the OS rejected a kill/escalation/reap and the crate could not confirm that the child or tree is gone | `is_teardown()`. Treat the process as potentially live. Inspect `cause` and `operation`, retain `source` for OS diagnostics, and use `diagnostic()` / `stdout_bytes()` for the bounded prefix captured before the failure. This is terminal under retry even when a classifier accepts it. |
 | `ErrorReason::NotReady { program, timeout }` | A [readiness probe](streaming.md#readiness-probes) (`wait_for_line` / `wait_for_port` / `wait_for`) did not pass within its own deadline | Not a run failure — the child is still running (a probe deadline never kills it). Decide whether to keep waiting, `shutdown()` the handle, or surface the failure. |
 | `ErrorReason::Parse { program, message }` | The run succeeded but `try_parse`, a typed JSON/NDJSON verb, or a caller's own parser feeding `Error::parse` could not make sense of the output | Generic `message` values are caller-built and retained in full; JSON helpers store only bounded, control-escaped error detail and raw fragments. `Display`/`Debug` apply an additional preview cap. |
 | `ErrorReason::OutputTooLarge { program, max_lines, max_bytes, total_lines, total_bytes }` | A `fail_loud` capture ceiling (`OutputBufferPolicy::max_lines`/`max_bytes`) was exceeded; the run itself may have succeeded | Raise the ceiling, switch to a lossy/streaming policy, or treat as a genuine failure — the pipe was fully drained either way, so the child never blocked. |
 | `ErrorReason::ResourceLimit { kind, reason, detail }` (`limits` feature) | A requested cap on `ProcessGroupOptions` couldn't be enforced — no whole-tree container on this platform, or the OS rejected it | Read `limit_kind()` / `limit_reason()` rather than parsing `detail`; an unenforced limit is no protection, so treat this as a hard stop, not a warning. Admission-time only: whether a cap that *was* applied later fired is a separate, post-run question — see [below](#variants-that-look-alike-but-arent). |
 | `ErrorReason::Unsupported { operation }` | An operation isn't supported by the active containment mechanism on this platform (e.g. any `Signal` but `Kill` on Windows Job Objects) | Branch on platform ahead of time (see [Platform support](platform-support.md)), or catch and degrade. |
-| `ErrorReason::Cancelled { program }` | The run's `CancellationToken` fired and its tree was killed | `is_cancelled()`. This is an *abandonment*, not a failure to diagnose — the caller already knows why. Never retried (see [Errors and retries](#errors-and-retries)); terminal under a `Supervisor` too. |
+| `ErrorReason::Cancelled { program }` | The run's `CancellationToken` fired and terminal teardown was confirmed | `is_cancelled()`. This is an *abandonment*, not a failure to diagnose — the caller already knows why. Never retried (see [Errors and retries](#errors-and-retries)); terminal under a `Supervisor` too. A refused teardown is `Teardown`, not a false `Cancelled`. |
 | `ErrorReason::Signalled { program, signal, stdout, stderr, stdout_bytes }` | The process was killed by a signal (**Unix only**; a `ScriptedRunner`/cassette replay can also report `Signalled(None)`) | `is_signalled()`. No exit code to check — always a failure. `diagnostic()` surfaces whatever was captured before the crash. |
 | `ErrorReason::Stdin { program, source }` | Feeding the child's stdin failed for a reason other than a routine broken pipe, on an **otherwise-successful** run | A diagnostic of a silently-truncated input the child may have already acted on. The io-level classifiers (`is_transient`, `is_not_found`, `is_permission_denied`) deliberately return `false` here — the run already succeeded, so a blanket retry would just re-run a command that worked. |
 | `ErrorReason::Io(source)` | A low-level IO error from the crate's own machinery — driving a child, controlling a process group, validating PTY geometry, reading/writing a cassette file | Never an arbitrary foreign `io::Error` (there is deliberately no blanket `From<std::io::Error>`); every `Io` here was raised at a known site inside the crate. PTY geometry validation also uses `InvalidInput` for a zero axis on every platform or a Windows ConPTY axis above `i16::MAX`; other input-validation failures use the same error kind, so it does not uniquely identify PTY geometry. |
@@ -55,6 +56,12 @@ which variant fires from where, how to classify it, and what to do about it.
   included, because it's a deliberate caller action, not run data. When a run
   both hits its deadline and gets cancelled, cancellation wins (checked
   first). See [Precedence and interactions](timeouts-and-cancellation.md#precedence-and-interactions).
+- **`Teardown` outranks the disposition that requested it.** `Timeout`, inactivity
+  timeout, and `Cancelled` are reported only after terminal teardown is confirmed
+  (or an already-exited race is confirmed by reap). If a kill/escalation/reap fails,
+  `Teardown` carries the initiating `TeardownCause`, original `io::Error`, and the
+  bounded output prefix instead of claiming a potentially-live tree was handled.
+  It also outranks stdin and pump errors from the same finalization window.
 - **`NotReady` is not `Timeout`.** `Command::timeout` is the run's own
   contract and kills the tree; a readiness probe's `within` deadline is a
   *separate* clock layered on top of an already-running child, and giving up
@@ -109,6 +116,7 @@ which variant fires from where, how to classify it, and what to do about it.
 | `is_not_found()` | `NotFound` only | The "is the program installed?" check. `false` for `Spawn`, `CassetteMiss`, and everything else. |
 | `is_timeout()` | `Timeout` only | The `Error` twin of `ProcessResult::timed_out()`. `false` for `NotReady`. |
 | `is_cancelled()` | `Cancelled` only | A caller that initiated the stop can swallow this rather than log/retry it as a real failure. |
+| `is_teardown()` | `Teardown` only | Fail closed: the child/tree may still be live. Never retry automatically. |
 | `is_signalled()` | `Signalled` only | `true` even when the kernel reported no signal number (`signal()` is then `None`) — the reliable "died by a signal?" check. |
 | `is_permission_denied()` | `Spawn` / `Io` carrying `PermissionDenied` | IO/spawn-level only. |
 | `is_transient()` | `Spawn` / `Io` carrying an interrupted/would-block/busy/lock condition | IO/spawn-level only, **never** exit codes or timeouts by design; compose explicitly: `e.is_transient() \|\| e.is_timeout()`. |
@@ -116,7 +124,7 @@ which variant fires from where, how to classify it, and what to do about it.
 | `signal()` | `Signalled` with a known number | `None` for every other variant, and for a `Signalled` where the kernel reported no number. |
 | `program()` | Every variant that names one | `None` only for `Unsupported`, `Io`, and (`limits` feature) `ResourceLimit` — the ones with no single program to attribute. |
 | `limit_kind()` / `limit_reason()` (`limits` feature) | `ResourceLimit` only | Read structured fields instead of parsing `detail`'s English text. |
-| `diagnostic()` | `Exit` / `Timeout` / `Signalled` (`Some`) | Stderr if it carries text, else stdout (`git`/`jj` put decisive output there), else `None`. |
+| `diagnostic()` | `Exit` / `Timeout` / `Teardown` / `Signalled` (`Some`) | Stderr if it carries text, else stdout (`git`/`jj` put decisive output there), else `None`. |
 | `timeout_duration()` | `Timeout` (`Some(dur)`) | The run deadline that elapsed. `None` everywhere else — including `NotReady`, whose probe deadline is a separate clock (matching `is_timeout()`'s scoping). |
 | `output_overflow()` | `OutputTooLarge` (`Some(OutputOverflow)`) | The overflow counters as one snapshot — `total_lines()` / `total_bytes()` / `max_lines()` / `max_bytes()` — instead of destructuring the `#[non_exhaustive]` variant. `None` for every other error. |
 | `unsupported_operation()` | `Unsupported` (`Some(&str)`) | The operation description (`"signal(Hup)"`, `"suspend"`). `None` for every other variant. |
@@ -143,6 +151,7 @@ future — through an exhaustive `match` inside the crate.
 | `Unsupported` | `Unsupported` | `unsupported` |
 | `Timeout` | `Timeout` | `timeout` |
 | `Cancelled` | `Cancelled` | `cancelled` |
+| `Teardown` | `Teardown` | `teardown` |
 | `Exit` | `Exit` | `exit` |
 | `Signalled` | `Signalled` | `signalled` |
 | `Other` | `CassetteMiss`, `Parse`, `NotReady`, `OutputTooLarge`, `Stdin`, and a non-`PermissionDenied` `Io` | `other` |
@@ -152,7 +161,8 @@ future — through an exhaustive `match` inside the crate.
 you need the details (the exit code, the captured streams, the timeout duration,
 which limit failed). It stays consistent with the point classifiers:
 `is_not_found()` ⇔ `kind() == NotFound`, `is_permission_denied()` ⇔
-`PermissionDenied`, `is_timeout()` ⇔ `Timeout`, and so on.
+`PermissionDenied`, `is_timeout()` ⇔ `Timeout`, `is_teardown()` ⇔ `Teardown`,
+and so on.
 
 `ErrorKind` mirrors [`std::io::ErrorKind`]: it is `#[non_exhaustive]` and carries
 an `Other` bucket, so a downstream `match` needs a catch-all arm — which is
@@ -198,7 +208,7 @@ change together.
 
 | Method | On | Direction |
 |---|---|---|
-| `name() -> &'static str` | `Mechanism`, `Outcome`, `ErrorKind`, `ParentDeathCleanup`, `SoftStopScope`, `SoftSignal`, `StopReason`, `LimitKind`, `LimitReason`, `LimitVerdict`, `StdioMode`, `LineTerminator`, `OverflowMode`, `OutputStream`, `Priority`, `RestartPolicy`, `RlimitResource`, `ProcessEvent`, `SupervisionEvent` | A short, lowercase `snake_case` identifier for the variant. |
+| `name() -> &'static str` | `Mechanism`, `Outcome`, `ErrorKind`, `TeardownCause`, `ParentDeathCleanup`, `SoftStopScope`, `SoftSignal`, `StopReason`, `LimitKind`, `LimitReason`, `LimitVerdict`, `StdioMode`, `LineTerminator`, `OverflowMode`, `OutputStream`, `Priority`, `RestartPolicy`, `RlimitResource`, `ProcessEvent`, `SupervisionEvent` | A short, lowercase `snake_case` identifier for the variant. |
 | `name() -> Option<&'static str>` | `Signal` | `Some(id)` for a curated signal; `None` for the raw-number `Signal::Other` (render its `i32` instead). |
 | `from_name(&str) -> Option<Self>` | every enum above **except** `Outcome`, `ErrorKind`, `ProcessEvent`, `SupervisionEvent`, and `SoftSignal` — `LimitVerdict` included, so a recorded `tripped` / `not_tripped` / `unknown` parses back | Parse an identifier back into the value; `None` — not a default — for an unrecognized name. |
 
@@ -289,6 +299,9 @@ async fn main() -> processkit::Result<()> {
         ErrorReason::NotFound { .. } => eprintln!("is it installed?"),
         ErrorReason::Timeout { .. } => eprintln!("hit its deadline"),
         ErrorReason::Cancelled { .. } => { /* caller-initiated, nothing to log */ }
+        ErrorReason::Teardown { cause, operation, .. } => {
+            eprintln!("{cause:?} teardown failed during {operation}")
+        }
         ErrorReason::Exit { code, .. } => eprintln!("exited with {code}"),
         // #[non_exhaustive]: a future variant (or a today's variant behind a
         // feature this build doesn't enable, e.g. ResourceLimit) falls here.
@@ -327,10 +340,11 @@ async fn main() -> processkit::Result<()> {
 }
 ```
 
-`ErrorReason::Cancelled` is **never** retried, whatever the classifier says — the
-token stays cancelled forever, so another attempt could only fail the same
-way. See [Retries](timeouts-and-cancellation.md#retries) for the full ground
-rules (stdin re-use, which verbs retry at all).
+`ErrorReason::Cancelled` and `ErrorReason::Teardown` are **never** retried,
+whatever the classifier says. A cancelled token stays cancelled; an unconfirmed
+teardown may have left the failed attempt live, so launching another copy would
+compound it. See [Retries](timeouts-and-cancellation.md#retries) for the full
+ground rules (stdin re-use, which verbs retry at all).
 
 ## Errors and supervision
 

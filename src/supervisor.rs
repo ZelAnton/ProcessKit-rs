@@ -2144,6 +2144,13 @@ impl<R: ProcessRunner> Supervisor<R> {
                         }
                         return Err(err);
                     }
+                    // A failed terminal teardown may have left the child or its
+                    // descendants alive. Starting another incarnation would
+                    // violate both the one-at-a-time guarantee and the caller's
+                    // terminal timeout/cancellation disposition.
+                    if err.is_teardown() {
+                        return Err(err);
+                    }
                     // A stop was requested but this attempt produced no result to
                     // report — surface the honest terminal error (same shape as an
                     // exhausted budget on this path).
@@ -4206,6 +4213,29 @@ mod tests {
             "got {err:?}"
         );
         assert_eq!(start.elapsed(), Duration::ZERO, "no storm pause was taken");
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn unconfirmed_teardown_is_terminal_before_restart_policy_or_classifiers() {
+        let start = tokio::time::Instant::now();
+        let err = supervise(SeqRunner::new(vec![Err(crate::Error::teardown(
+            "fake",
+            crate::TeardownCause::Timeout,
+            "process-group hard kill",
+            std::io::Error::other("kill refused"),
+            String::new(),
+            String::new(),
+            None,
+        ))]))
+        .restart(RestartPolicy::Always)
+        .storm_pause(Duration::from_secs(60))
+        .failure_threshold(0.0)
+        .give_up_when(|_| panic!("terminal teardown must bypass give_up_when"))
+        .run()
+        .await
+        .expect_err("unconfirmed teardown is terminal");
+        assert!(err.is_teardown(), "got {err:?}");
+        assert_eq!(start.elapsed(), Duration::ZERO, "no backoff or storm pause");
     }
 
     #[tokio::test(start_paused = true)]

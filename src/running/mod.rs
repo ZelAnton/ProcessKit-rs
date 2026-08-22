@@ -35,7 +35,7 @@ use tokio::task::JoinHandle;
 
 use crate::buffer::{OutputBufferPolicy, OverflowMode, clamp_dropoldest_tail, push_capped_bytes};
 use crate::error::Result;
-use crate::error::{Error, ErrorReason};
+use crate::error::{Error, ErrorReason, TeardownCause};
 use crate::group::ProcessGroup;
 use crate::pump::{OutputActivity, SharedLines, StreamConfig, pump_lines_core};
 use crate::result::{Outcome, ProcessResult};
@@ -80,8 +80,93 @@ pub(crate) const TS_INACTIVITY_TIMED_OUT: u8 = 3;
 enum ExitCause {
     /// Child exited on its own (or deadline fired). Cancellation did not win.
     Exited(Outcome),
-    /// Cancel arm won: token fired, tree killed. Becomes `Err(Cancelled)`.
+    /// Cancel arm won and terminal teardown was confirmed. Becomes `Err(Cancelled)`.
     Cancelled,
+    /// The initiating terminal condition won, but teardown was not confirmed.
+    /// The original OS error is retained in `teardown_failure` until the pumps
+    /// finish and the consuming surface can attach their captured prefix.
+    TeardownFailed { intended: Outcome, cancelled: bool },
+}
+
+/// One unconfirmed terminal teardown, shared with detached watchdogs so a
+/// consuming finisher cannot silently turn their OS failure into a timeout or
+/// cancellation disposition.
+#[derive(Debug)]
+struct TeardownFailure {
+    cause: TeardownCause,
+    operation: &'static str,
+    source: std::io::Error,
+}
+
+type SharedTeardownFailure = Arc<std::sync::Mutex<Option<TeardownFailure>>>;
+
+fn record_teardown_failure(slot: &SharedTeardownFailure, failure: TeardownFailure) {
+    let mut guard = slot.lock().expect("teardown failure slot poisoned");
+    if guard.is_none() {
+        *guard = Some(failure);
+    }
+}
+
+fn child_start_kill(
+    target: &'static str,
+    kill: impl FnOnce() -> std::io::Result<()>,
+) -> std::io::Result<()> {
+    #[cfg(test)]
+    if let Some(injected) = crate::sys::fault_injection::check(
+        crate::sys::fault_injection::Site::DirectChildKill,
+        target,
+    ) {
+        return Err(injected);
+    }
+    #[cfg(not(test))]
+    let _ = target;
+    match kill() {
+        Ok(()) => Ok(()),
+        // Tokio treats an already-reaped child as a no-op today. Preserve that
+        // routine race explicitly if its implementation ever returns this kind.
+        Err(error) if error.kind() == std::io::ErrorKind::InvalidInput => Ok(()),
+        Err(error) => Err(error),
+    }
+}
+
+pub(crate) fn group_hard_kill(group: &ProcessGroup) -> std::io::Result<()> {
+    #[cfg(test)]
+    if let Some(injected) = crate::sys::fault_injection::check(
+        crate::sys::fault_injection::Site::ProcessGroupTeardown,
+        "hard",
+    ) {
+        return Err(injected);
+    }
+    group.kill_all_io()
+}
+
+async fn group_graceful_kill(
+    group: &ProcessGroup,
+    grace: Duration,
+    signal: i32,
+) -> std::io::Result<()> {
+    #[cfg(test)]
+    if let Some(injected) = crate::sys::fault_injection::check(
+        crate::sys::fault_injection::Site::ProcessGroupTeardown,
+        "graceful",
+    ) {
+        return Err(injected);
+    }
+    group.graceful_terminate_io(grace, signal).await
+}
+
+async fn confirm_reap<T>(
+    budget: Duration,
+    wait: impl std::future::Future<Output = std::io::Result<T>>,
+) -> std::io::Result<()> {
+    match tokio::time::timeout(budget, wait).await {
+        Ok(Ok(_)) => Ok(()),
+        Ok(Err(error)) => Err(error),
+        Err(_) => Err(std::io::Error::new(
+            std::io::ErrorKind::TimedOut,
+            "child did not reach a confirmed terminal state during teardown",
+        )),
+    }
 }
 
 /// Wait until either of the two independent cancellation sources fires.
@@ -290,6 +375,9 @@ pub struct RunningProcess {
     // Non-broken-pipe stdin failure stashed by `observe_stdin_task`; surfaced as
     // `ErrorReason::Stdin` by `checked_outcome` only when the run otherwise succeeded.
     stdin_error: Option<std::io::Error>,
+    // First terminal teardown error, preserved until the bounded pump drain can
+    // attach its already-read prefix to `ErrorReason::Teardown`.
+    teardown_failure: SharedTeardownFailure,
     // Test-only seam for delayed stdin-writer completion on a hermetic scripted
     // handle. Real and PTY handles keep the task in their backend-specific slot.
     #[cfg(test)]
@@ -560,6 +648,7 @@ impl RunningProcess {
             stdout_pump: None,
             stderr_pump: None,
             stdin_error: None,
+            teardown_failure: Arc::new(std::sync::Mutex::new(None)),
             #[cfg(test)]
             test_stdin_task: None,
             stdout_piped: s.stdout_piped,
@@ -621,6 +710,7 @@ impl RunningProcess {
             stdout_pump: None,
             stderr_pump: None,
             stdin_error: None,
+            teardown_failure: Arc::new(std::sync::Mutex::new(None)),
             #[cfg(test)]
             test_stdin_task: None,
             stdout_piped: s.stdout_piped,
@@ -744,6 +834,7 @@ impl RunningProcess {
         let gate = self.pid_gate.clone();
         let grace = self.cancel_grace;
         let signal = self.cancel_signal;
+        let teardown_failure = self.teardown_failure.clone();
         self.cancel_task = Some(tokio::spawn(async move {
             cancelled.await;
             // Stand down if a `Child`-owning finisher has taken over teardown:
@@ -766,13 +857,33 @@ impl RunningProcess {
                     // owns the `Child` reaps it.
                     Some(grace) => match group.upgrade() {
                         Some(group) => {
-                            let _ = group.graceful_terminate(grace, signal).await;
+                            if let Err(source) = group_graceful_kill(&group, grace, signal).await {
+                                record_teardown_failure(
+                                    &teardown_failure,
+                                    TeardownFailure {
+                                        cause: TeardownCause::Cancellation,
+                                        operation: "process-group graceful escalation",
+                                        source,
+                                    },
+                                );
+                            }
                         }
                         None => crate::sys::pid_gate::force_kill(&gate), // group gone
                     },
                     // The unchanged default: `kill_all` on a still-reachable
                     // group, then the gated raw kill of the direct child.
-                    None => stream::kill_via_weak(&group, &gate),
+                    None => {
+                        if let Err(source) = stream::kill_via_weak(&group, &gate) {
+                            record_teardown_failure(
+                                &teardown_failure,
+                                TeardownFailure {
+                                    cause: TeardownCause::Cancellation,
+                                    operation: "process-group hard kill",
+                                    source,
+                                },
+                            );
+                        }
+                    }
                 },
                 // Shared group: pid-only teardown (a forking child's
                 // grandchildren are the documented shared-group teardown gap).
@@ -1185,6 +1296,10 @@ impl RunningProcess {
     /// - [`ErrorReason::Cancelled`] — the run was cancelled via
     ///   [`Command::cancel_on`](crate::Command::cancel_on). Unlike a timeout,
     ///   cancellation is *always* raised (and discards any captured output).
+    /// - [`ErrorReason::Teardown`] — the timeout/cancellation required a terminal
+    ///   kill, escalation, or reap that the OS did not confirm. This takes
+    ///   precedence over the initiating disposition and retains the original IO
+    ///   error plus the best-effort output prefix captured before teardown.
     /// - [`ErrorReason::OutputTooLarge`] — the
     ///   [`OutputBufferPolicy`] is fail-loud
     ///   ([`OverflowMode::Error`](crate::OverflowMode)) and the captured output
@@ -1293,9 +1408,10 @@ impl RunningProcess {
     /// started the decoded-line pump (the raw bytes cannot be reconstructed). Returns
     /// [`ErrorReason::OutputTooLarge`] if the byte ceiling is set to
     /// [`OverflowMode::Error`](crate::OverflowMode) and the raw stdout exceeds it.
-    /// (A cancelled run is [`ErrorReason::Cancelled`]; a non-zero exit, a timeout, or a
-    /// signal-kill is *captured* in the returned [`ProcessResult`]'s
-    /// [`outcome`](ProcessResult::outcome), not raised.)
+    /// (A cancelled run is [`ErrorReason::Cancelled`]; an unconfirmed terminal
+    /// teardown is [`ErrorReason::Teardown`] with the exact stdout prefix attached;
+    /// a non-zero exit, a confirmed timeout, or a signal-kill is *captured* in the
+    /// returned [`ProcessResult`]'s [`outcome`](ProcessResult::outcome), not raised.)
     ///
     /// # Panics
     ///
@@ -1363,6 +1479,19 @@ impl RunningProcess {
         // Re-observe stdin after the pumps drained: a writer that failed inside
         // the teardown window is only visible now (see `finalize_stdin_task`).
         self.finalize_stdin_task().await;
+        let stderr_lines = stderr_sink.drain();
+        if self
+            .teardown_failure
+            .lock()
+            .expect("teardown failure slot poisoned")
+            .is_some()
+        {
+            let stdout_text = String::from_utf8_lossy(&stdout).into_owned();
+            let error = self
+                .take_teardown_error(stdout_text, stderr_lines.join("\n"), Some(stdout))
+                .expect("teardown failure was observed under the same slot lock");
+            return Err(error);
+        }
         let outcome = self.checked_outcome(outcome)?;
 
         // A raw-stdout fail-loud (Error mode) byte overflow surfaces first, like
@@ -1408,7 +1537,6 @@ impl RunningProcess {
             return Err(Error::io(source));
         }
 
-        let stderr_lines = stderr_sink.drain();
         let truncated = signals.truncated.load(Ordering::Relaxed) || stderr_sink.dropped() > 0;
         let duration = self.started.elapsed();
         let timeout = if outcome.inactivity_timed_out() {
@@ -1440,13 +1568,16 @@ impl RunningProcess {
     ///
     /// Reports the raw outcome — timeout and signals are not raised as errors
     /// here. Exception: cancellation via `Command::cancel_on` always errors with
-    /// `ErrorReason::Cancelled`.
+    /// `ErrorReason::Cancelled` once teardown is confirmed; an unconfirmed
+    /// terminal timeout/cancellation teardown is `ErrorReason::Teardown`.
     ///
     /// # Errors
     ///
     /// A timeout or signal-kill is *captured* in the returned [`Outcome`], not
     /// raised. The `Err` cases are [`ErrorReason::Cancelled`] (the run was cancelled
     /// via [`Command::cancel_on`](crate::Command::cancel_on) — always raised),
+    /// [`ErrorReason::Teardown`] (terminal timeout/cancellation teardown could not
+    /// be confirmed and therefore outranks the ordinary outcome),
     /// [`ErrorReason::Stdin`] (a non-broken-pipe stdin-source failure on an
     /// otherwise-successful run), or [`ErrorReason::Io`] (waiting on the child failed).
     pub async fn wait(mut self) -> Result<Outcome> {
@@ -1492,6 +1623,8 @@ impl RunningProcess {
     /// *captured* in the returned [`Outcome`], not raised. The `Err` cases are
     /// [`ErrorReason::Cancelled`] (the run was cancelled via
     /// [`Command::cancel_on`](crate::Command::cancel_on) — always raised),
+    /// [`ErrorReason::Teardown`] (terminal timeout/cancellation teardown could not
+    /// be confirmed and therefore outranks the ordinary outcome),
     /// [`ErrorReason::Stdin`] (a non-broken-pipe stdin-source failure on an
     /// otherwise-successful run), or [`ErrorReason::Io`] (waiting on the child, or a
     /// pipe read, failed). A [`fail_loud`](crate::OutputBufferPolicy::fail_loud)
@@ -1527,6 +1660,8 @@ impl RunningProcess {
     ///   or [`start_kill`](Self::start_kill) instead.
     /// - [`ErrorReason::Cancelled`] — the run was cancelled via
     ///   [`Command::cancel_on`](crate::Command::cancel_on).
+    /// - [`ErrorReason::Teardown`] — terminal cancellation teardown could not be
+    ///   confirmed; the initiating cancellation is not reported as complete.
     /// - [`ErrorReason::Stdin`] — a non-broken-pipe stdin-source failure on an
     ///   otherwise-successful run.
     /// - [`ErrorReason::Io`] — the graceful teardown or the exit wait failed.
@@ -1611,19 +1746,41 @@ impl RunningProcess {
                     // `wait_any`/`wait_all` honor `cancel_grace` too instead of
                     // silently hard-killing a run that opted into a graceful
                     // goodbye. Unset (the default) → the unchanged `kill_tree`.
-                    self.teardown_on_cancel().await;
-                    ExitCause::Cancelled
+                    match self.teardown_on_cancel().await {
+                        Ok(()) => ExitCause::Cancelled,
+                        Err(failure) => {
+                            record_teardown_failure(&self.teardown_failure, failure);
+                            ExitCause::TeardownFailed {
+                                intended: Outcome::Signalled(None),
+                                cancelled: true,
+                            }
+                        }
+                    }
                 }
                 outcome = self.backend_wait() => ExitCause::Exited(outcome?),
             }
         };
-        let outcome = self.on_reaped(cause);
+        let outcome = match cause {
+            ExitCause::TeardownFailed {
+                intended,
+                cancelled,
+            } => {
+                if self.cancel_at_exit.is_none() {
+                    self.cancel_at_exit = Some(cancelled);
+                }
+                intended
+            }
+            reaped => self.on_reaped(reaped),
+        };
         // Borrowed waits have no pump-drain window to give a still-running
         // source a chance to finish. Finalize the writer after the child reap,
         // bounded like the consuming paths, so a delayed source error cannot be
         // mistaken for a clean successful exit while a hung source cannot park
         // wait_any/wait_all forever.
         self.finalize_stdin_task().await;
+        if let Some(error) = self.take_teardown_error(String::new(), String::new(), None) {
+            return Err(error);
+        }
         self.checked_outcome(outcome)
     }
 
@@ -1637,7 +1794,9 @@ impl RunningProcess {
     /// The same surface as [`wait`](Self::wait): a timeout or signal-kill is
     /// *captured* in the returned [`RunProfile`](crate::stats::RunProfile)'s
     /// outcome, not raised. The `Err` cases are [`ErrorReason::Cancelled`] (cancelled
-    /// via [`Command::cancel_on`](crate::Command::cancel_on)), [`ErrorReason::Stdin`]
+    /// via [`Command::cancel_on`](crate::Command::cancel_on)),
+    /// [`ErrorReason::Teardown`] (the terminal timeout/cancellation teardown could
+    /// not be confirmed), [`ErrorReason::Stdin`]
     /// (a non-broken-pipe stdin-source failure on an otherwise-successful run),
     /// or [`ErrorReason::Io`] (waiting on the child failed).
     #[cfg(feature = "stats")]
@@ -1788,6 +1947,16 @@ impl RunningProcess {
         // Re-observe stdin after the pumps drained: a writer that failed inside
         // the teardown window is only visible now (see `finalize_stdin_task`).
         self.finalize_stdin_task().await;
+
+        let (stdout_lines, stderr_lines) = match capture {
+            CaptureMode::Lines => (stdout_sink.drain(), stderr_sink.drain()),
+            CaptureMode::Discard | CaptureMode::DrainBounded => (Vec::new(), Vec::new()),
+        };
+        if let Some(error) =
+            self.take_teardown_error(stdout_lines.join("\n"), stderr_lines.join("\n"), None)
+        {
+            return Err(error);
+        }
         let outcome = self.checked_outcome(outcome)?;
 
         if matches!(capture, CaptureMode::Lines) {
@@ -1819,10 +1988,6 @@ impl RunningProcess {
             }
         }
 
-        let (stdout_lines, stderr_lines) = match capture {
-            CaptureMode::Lines => (stdout_sink.drain(), stderr_sink.drain()),
-            CaptureMode::Discard | CaptureMode::DrainBounded => (Vec::new(), Vec::new()),
-        };
         Ok(FinishedLines {
             outcome,
             stdout_lines,
@@ -1849,10 +2014,10 @@ impl RunningProcess {
         }
     }
 
-    /// Post-exit checkpoint every consuming path passes after pumps settle:
-    /// cancellation always wins (returns `Err(Cancelled)`), then a non-broken-
-    /// pipe stdin failure surfaces as `Err(Stdin)` only on an otherwise-
-    /// successful run.
+    /// Post-exit checkpoint every consuming path passes after pumps settle and
+    /// after any retained terminal teardown failure has taken precedence:
+    /// cancellation wins next (returns `Err(Cancelled)`), then a non-broken-pipe
+    /// stdin failure surfaces as `Err(Stdin)` only on an otherwise-successful run.
     fn checked_outcome(&mut self, outcome: Outcome) -> Result<Outcome> {
         // Pre-pump snapshot: prevents a cancel firing during `join_pumps` from
         // discarding real output. `unwrap_or(false)` — `None` is not yet
@@ -1872,6 +2037,30 @@ impl RunningProcess {
             .into());
         }
         Ok(outcome)
+    }
+
+    /// Convert the first unconfirmed teardown into its public structured error
+    /// only after the caller's existing bounded pump drain has salvaged output.
+    fn take_teardown_error(
+        &mut self,
+        stdout: String,
+        stderr: String,
+        stdout_bytes: Option<Vec<u8>>,
+    ) -> Option<Error> {
+        let failure = self
+            .teardown_failure
+            .lock()
+            .expect("teardown failure slot poisoned")
+            .take()?;
+        Some(Error::teardown(
+            self.program.clone(),
+            failure.cause,
+            failure.operation,
+            failure.source,
+            stdout,
+            stderr,
+            stdout_bytes,
+        ))
     }
 
     /// Non-blocking pre-pump peek at the stdin writer: stash a non-broken-pipe
@@ -2042,6 +2231,9 @@ impl RunningProcess {
             ExitCause::Exited(outcome) => outcome,
             // Moot — `checked_outcome` maps the cancel snapshot to `Err(Cancelled)`.
             ExitCause::Cancelled => Outcome::Signalled(None),
+            ExitCause::TeardownFailed { .. } => {
+                unreachable!("an unconfirmed teardown is not a reap")
+            }
         };
         let outcome = self.classify_watchdog_timeout(outcome);
         // Feed a live `events()` lifecycle stream its terminal
@@ -2078,7 +2270,20 @@ impl RunningProcess {
         } else {
             self.drive_to_exit_inner().await?
         };
-        let outcome = self.on_reaped(cause);
+        let outcome = match cause {
+            ExitCause::TeardownFailed {
+                intended,
+                cancelled,
+            } => {
+                if self.cancel_at_exit.is_none() {
+                    self.cancel_at_exit = Some(cancelled);
+                }
+                // No exit event or exit metric: the point of the deferred error is
+                // that the child/tree has not been confirmed terminal.
+                return Ok(intended);
+            }
+            reaped => self.on_reaped(reaped),
+        };
         // One elapsed read off the existing `started` anchor, shared by both
         // observability seams — metrics add no third clock (K-007).
         #[cfg(any(feature = "tracing", feature = "metrics"))]
@@ -2183,7 +2388,8 @@ impl RunningProcess {
     ///   cancellation to be graceful, and making the goodbye hinge on whether the
     ///   deadline happened to land in the same poll would be a scheduling-dependent
     ///   surprise (and would hard-kill even a run that set *both* graces). The
-    ///   outcome remains `ErrorReason::Cancelled` either way.
+    ///   outcome remains `ErrorReason::Cancelled` either way when teardown is
+    ///   confirmed; an unconfirmed teardown becomes `ErrorReason::Teardown`.
     async fn drive_to_exit_inner(&mut self) -> Result<ExitCause> {
         // Reclaim teardown from the streaming deadline watchdog before reaping.
         // This future owns the `Child` and drives BOTH kills through it — the
@@ -2205,6 +2411,24 @@ impl RunningProcess {
         }
         if let Some(task) = self.inactivity_task.take() {
             task.abort();
+        }
+        if let Some(failure) = self
+            .teardown_failure
+            .lock()
+            .expect("teardown failure slot poisoned")
+            .as_ref()
+        {
+            let (intended, cancelled) = match failure.cause {
+                TeardownCause::Timeout => (Outcome::TimedOut, false),
+                TeardownCause::InactivityTimeout => (Outcome::InactivityTimedOut, false),
+                TeardownCause::Cancellation => (Outcome::Signalled(None), true),
+                TeardownCause::ExplicitKill => (Outcome::Signalled(None), false),
+                TeardownCause::PipelineFailure => (Outcome::Signalled(None), false),
+            };
+            return Ok(ExitCause::TeardownFailed {
+                intended,
+                cancelled,
+            });
         }
         // Own the knobs so the helper futures borrow nothing from `self` —
         // only `self.backend_wait()` does, keeping the select! borrows disjoint.
@@ -2255,8 +2479,16 @@ impl RunningProcess {
                 );
                 // `cancel_grace` unset (the default) → the unchanged immediate hard
                 // kill; set → the same graceful ladder the deadline arm drives.
-                self.teardown_on_cancel().await;
-                Ok(ExitCause::Cancelled)
+                match self.teardown_on_cancel().await {
+                    Ok(()) => Ok(ExitCause::Cancelled),
+                    Err(failure) => {
+                        record_teardown_failure(&self.teardown_failure, failure);
+                        Ok(ExitCause::TeardownFailed {
+                            intended: Outcome::Signalled(None),
+                            cancelled: true,
+                        })
+                    }
+                }
             }
             outcome = self.backend_wait() => outcome.map(ExitCause::Exited),
             _won = deadline => {
@@ -2267,8 +2499,16 @@ impl RunningProcess {
                     timeout_ms = limit.map(|l| l.as_millis() as u64).unwrap_or(0),
                     "timeout elapsed; killing the tree"
                 );
-                self.teardown_on_timeout().await;
-                Ok(ExitCause::Exited(Outcome::TimedOut))
+                match self.teardown_on_timeout(TeardownCause::Timeout).await {
+                    Ok(()) => Ok(ExitCause::Exited(Outcome::TimedOut)),
+                    Err(failure) => {
+                        record_teardown_failure(&self.teardown_failure, failure);
+                        Ok(ExitCause::TeardownFailed {
+                            intended: Outcome::TimedOut,
+                            cancelled: false,
+                        })
+                    }
+                }
             }
             _won = inactivity => {
                 #[cfg(feature = "tracing")]
@@ -2278,24 +2518,35 @@ impl RunningProcess {
                     inactivity_ms = inactivity_limit.map(|l| l.as_millis() as u64).unwrap_or(0),
                     "output inactivity elapsed; killing the tree"
                 );
-                self.teardown_on_timeout().await;
-                Ok(ExitCause::Exited(Outcome::InactivityTimedOut))
+                match self.teardown_on_timeout(TeardownCause::InactivityTimeout).await {
+                    Ok(()) => Ok(ExitCause::Exited(Outcome::InactivityTimedOut)),
+                    Err(failure) => {
+                        record_teardown_failure(&self.teardown_failure, failure);
+                        Ok(ExitCause::TeardownFailed {
+                            intended: Outcome::InactivityTimedOut,
+                            cancelled: false,
+                        })
+                    }
+                }
             }
         }
     }
 
     /// Hard-kill the child and its tree (for a private group), then reap.
-    async fn kill_tree(&mut self) {
+    async fn kill_tree(
+        &mut self,
+        cause: TeardownCause,
+    ) -> std::result::Result<(), TeardownFailure> {
         let gate = self.pid_gate.clone();
         match &mut self.backend {
             Backend::Real(real) => {
-                let _ = real.child_mut().start_kill();
+                let child_error = child_start_kill("real", || real.child_mut().start_kill()).err();
                 // The child is being torn down through the owned `Child`; retire
                 // the gate (before the reap below frees the pid) so the
                 // cancel/deadline watchdogs stand down rather than racing that reap
                 // with a raw `kill(pid)` that could land on a recycled pid.
                 gate.retire();
-                if let Some(group) = &real.own_group {
+                let group_error = if let Some(group) = &real.own_group {
                     // On Linux + legacy/restricted cgroup this can synchronously
                     // block this worker thread up to ~100ms — accepted, not
                     // routed through `spawn_blocking`; see the sweep loop in
@@ -2304,35 +2555,82 @@ impl RunningProcess {
                     // keeps its post-kill corpse drain in `Drop` alone (see
                     // `DRAIN_BUDGET`, src/sys/freebsd.rs), so this call does not
                     // block there at all.
-                    let _ = group.kill_all();
-                }
+                    group_hard_kill(group).err()
+                } else {
+                    None
+                };
                 // Bound the reap: a D-state child can ignore SIGKILL until I/O
                 // unblocks, and an unbounded wait hangs shared-group handles.
-                let _ = tokio::time::timeout(PUMP_TEARDOWN, real.child_mut().wait()).await;
+                let reap = confirm_reap(PUMP_TEARDOWN, real.child_mut().wait()).await;
+                if let Some(source) = group_error {
+                    return Err(TeardownFailure {
+                        cause,
+                        operation: "process-group hard kill",
+                        source,
+                    });
+                }
+                if let Err(source) = reap {
+                    return Err(TeardownFailure {
+                        cause,
+                        operation: if child_error.is_some() {
+                            "direct child hard kill"
+                        } else {
+                            "child terminal reap"
+                        },
+                        source: child_error.unwrap_or(source),
+                    });
+                }
             }
             // The PTY child tears down exactly like `Real`: kill through the owned
             // handle, retire the gate before the group kill, then bound the reap.
             #[cfg(feature = "pty")]
             Backend::Pty(pty) => {
-                let _ = pty.child_mut().start_kill();
+                let child_error = child_start_kill("pty", || pty.child_mut().start_kill()).err();
                 gate.retire();
-                if let Some(group) = &pty.own_group {
-                    let _ = group.kill_all();
+                let group_error = if let Some(group) = &pty.own_group {
+                    group_hard_kill(group).err()
+                } else {
+                    None
+                };
+                let reap = confirm_reap(PUMP_TEARDOWN, pty.child_mut().wait()).await;
+                if let Some(source) = group_error {
+                    return Err(TeardownFailure {
+                        cause,
+                        operation: "process-group hard kill",
+                        source,
+                    });
                 }
-                let _ = tokio::time::timeout(PUMP_TEARDOWN, pty.child_mut().wait()).await;
+                if let Err(source) = reap {
+                    return Err(TeardownFailure {
+                        cause,
+                        operation: if child_error.is_some() {
+                            "direct child hard kill"
+                        } else {
+                            "child terminal reap"
+                        },
+                        source: child_error.unwrap_or(source),
+                    });
+                }
             }
             Backend::Scripted(s) => s.kill(),
         }
+        Ok(())
     }
 
     /// Teardown when the deadline elapses. With `timeout_grace`: signal → wait up
     /// to grace → SIGKILL, so a signal-handling child ends the grace early. Without
     /// grace: hard `kill_tree`. Windows has no signal tier; graceful degrades to
     /// the atomic kill.
-    async fn teardown_on_timeout(&mut self) {
+    async fn teardown_on_timeout(
+        &mut self,
+        cause: TeardownCause,
+    ) -> std::result::Result<(), TeardownFailure> {
         match self.timeout_grace {
-            Some(grace) => self.graceful_teardown(grace, self.timeout_signal).await,
-            None => self.kill_tree().await,
+            Some(grace) => {
+                self.graceful_teardown(grace, self.timeout_signal, cause)
+                    .await
+            }
+            None => self.kill_tree(cause).await,
         }
     }
 
@@ -2344,13 +2642,17 @@ impl RunningProcess {
     /// driver); without it — the default — it is the unchanged immediate
     /// `kill_tree`, so a run that never opts in behaves exactly as before.
     ///
-    /// The *outcome* is unaffected: the caller still reports `ExitCause::Cancelled`
-    /// (and so `ErrorReason::Cancelled`) whichever branch ran — cancellation remains
-    /// an error, only the manner of the teardown changes.
-    async fn teardown_on_cancel(&mut self) {
+    /// The *ordinary* outcome is unaffected: after confirmed teardown the caller
+    /// still reports `ExitCause::Cancelled` (and so `ErrorReason::Cancelled`)
+    /// whichever branch ran. An OS failure that leaves teardown unconfirmed is
+    /// retained separately and surfaces as `ErrorReason::Teardown`.
+    async fn teardown_on_cancel(&mut self) -> std::result::Result<(), TeardownFailure> {
         match self.cancel_grace {
-            Some(grace) => self.graceful_teardown(grace, self.cancel_signal).await,
-            None => self.kill_tree().await,
+            Some(grace) => {
+                self.graceful_teardown(grace, self.cancel_signal, TeardownCause::Cancellation)
+                    .await
+            }
+            None => self.kill_tree(TeardownCause::Cancellation).await,
         }
     }
 
@@ -2363,7 +2665,12 @@ impl RunningProcess {
     /// [`ProcessGroup::graceful_terminate`](crate::ProcessGroup::graceful_terminate)
     /// (and so to the crate's single `sys::graceful::run` escalation driver); a
     /// shared-group handle owns no group and so reaches only its own direct child.
-    async fn graceful_teardown(&mut self, grace: Duration, signal: i32) {
+    async fn graceful_teardown(
+        &mut self,
+        grace: Duration,
+        signal: i32,
+        cause: TeardownCause,
+    ) -> std::result::Result<(), TeardownFailure> {
         let gate = self.pid_gate.clone();
         match &mut self.backend {
             Backend::Real(real) => match real.own_group.clone() {
@@ -2372,12 +2679,10 @@ impl RunningProcess {
                 // concurrently so a signal-handling child that exits ends the grace
                 // early instead of eating a pointless `SIGKILL`.
                 Some(group) => {
-                    let teardown = async move {
-                        let _ = group.graceful_terminate(grace, signal).await;
-                    };
+                    let teardown = async move { group_graceful_kill(&group, grace, signal).await };
                     // Bound the reap: a D-state child can ignore the final SIGKILL.
                     let reap = async {
-                        let r = tokio::time::timeout(
+                        let r = confirm_reap(
                             grace.saturating_add(PUMP_TEARDOWN),
                             real.child_mut().wait(),
                         )
@@ -2388,7 +2693,21 @@ impl RunningProcess {
                         gate.retire();
                         r
                     };
-                    let _ = tokio::join!(teardown, reap);
+                    let (teardown, reap) = tokio::join!(teardown, reap);
+                    if let Err(source) = teardown {
+                        return Err(TeardownFailure {
+                            cause,
+                            operation: "process-group graceful escalation",
+                            source,
+                        });
+                    }
+                    if let Err(source) = reap {
+                        return Err(TeardownFailure {
+                            cause,
+                            operation: "child terminal reap",
+                            source,
+                        });
+                    }
                 }
                 // Shared group: we own no group, so we reach only the direct child.
                 // Escalate the hard kill through the OWNED `Child` (`start_kill`)
@@ -2437,14 +2756,23 @@ impl RunningProcess {
                         // (or a rare wait error) escalate through the owned `Child`,
                         // whose `start_kill` is a harmless no-op if it turns out the
                         // child was already reaped.
-                        let reaped_cleanly = matches!(
-                            tokio::time::timeout(grace, real.child_mut().wait()).await,
-                            Ok(Ok(_))
-                        );
+                        let reaped_cleanly =
+                            confirm_reap(grace, real.child_mut().wait()).await.is_ok();
                         if !reaped_cleanly {
-                            let _ = real.child_mut().start_kill();
-                            let _ =
-                                tokio::time::timeout(PUMP_TEARDOWN, real.child_mut().wait()).await;
+                            let child_error =
+                                child_start_kill("real", || real.child_mut().start_kill()).err();
+                            let reap = confirm_reap(PUMP_TEARDOWN, real.child_mut().wait()).await;
+                            if let Err(source) = reap {
+                                return Err(TeardownFailure {
+                                    cause,
+                                    operation: if child_error.is_some() {
+                                        "direct child hard-kill escalation"
+                                    } else {
+                                        "child terminal reap"
+                                    },
+                                    source: child_error.unwrap_or(source),
+                                });
+                            }
                         }
                     }
                     #[cfg(not(unix))]
@@ -2452,8 +2780,20 @@ impl RunningProcess {
                         // Windows has no graceful tier: hard-kill immediately
                         // through the owned Child and reap.
                         let _ = signal;
-                        let _ = real.child_mut().start_kill();
-                        let _ = tokio::time::timeout(PUMP_TEARDOWN, real.child_mut().wait()).await;
+                        let child_error =
+                            child_start_kill("real", || real.child_mut().start_kill()).err();
+                        let reap = confirm_reap(PUMP_TEARDOWN, real.child_mut().wait()).await;
+                        if let Err(source) = reap {
+                            return Err(TeardownFailure {
+                                cause,
+                                operation: if child_error.is_some() {
+                                    "direct child hard kill"
+                                } else {
+                                    "child terminal reap"
+                                },
+                                source: child_error.unwrap_or(source),
+                            });
+                        }
                     }
                     // Reaped (pid freed); retire so any lingering external watchdog
                     // stands down. `drive_to_exit_inner` already retired before
@@ -2468,11 +2808,9 @@ impl RunningProcess {
             #[cfg(feature = "pty")]
             Backend::Pty(pty) => match pty.own_group.clone() {
                 Some(group) => {
-                    let teardown = async move {
-                        let _ = group.graceful_terminate(grace, signal).await;
-                    };
+                    let teardown = async move { group_graceful_kill(&group, grace, signal).await };
                     let reap = async {
-                        let r = tokio::time::timeout(
+                        let r = confirm_reap(
                             grace.saturating_add(PUMP_TEARDOWN),
                             pty.child_mut().wait(),
                         )
@@ -2480,7 +2818,21 @@ impl RunningProcess {
                         gate.retire();
                         r
                     };
-                    let _ = tokio::join!(teardown, reap);
+                    let (teardown, reap) = tokio::join!(teardown, reap);
+                    if let Err(source) = teardown {
+                        return Err(TeardownFailure {
+                            cause,
+                            operation: "process-group graceful escalation",
+                            source,
+                        });
+                    }
+                    if let Err(source) = reap {
+                        return Err(TeardownFailure {
+                            cause,
+                            operation: "PTY child terminal reap",
+                            source,
+                        });
+                    }
                 }
                 None => {
                     // Same caller contract as the `Real` shared-group branch above,
@@ -2493,27 +2845,49 @@ impl RunningProcess {
                     #[cfg(unix)]
                     {
                         stream::signal_direct_child(pty.child_mut().id(), signal);
-                        let reaped_cleanly = matches!(
-                            tokio::time::timeout(grace, pty.child_mut().wait()).await,
-                            Ok(Ok(_))
-                        );
+                        let reaped_cleanly =
+                            confirm_reap(grace, pty.child_mut().wait()).await.is_ok();
                         if !reaped_cleanly {
-                            let _ = pty.child_mut().start_kill();
-                            let _ =
-                                tokio::time::timeout(PUMP_TEARDOWN, pty.child_mut().wait()).await;
+                            let child_error =
+                                child_start_kill("pty", || pty.child_mut().start_kill()).err();
+                            let reap = confirm_reap(PUMP_TEARDOWN, pty.child_mut().wait()).await;
+                            if let Err(source) = reap {
+                                return Err(TeardownFailure {
+                                    cause,
+                                    operation: if child_error.is_some() {
+                                        "PTY child hard-kill escalation"
+                                    } else {
+                                        "PTY child terminal reap"
+                                    },
+                                    source: child_error.unwrap_or(source),
+                                });
+                            }
                         }
                     }
                     #[cfg(not(unix))]
                     {
                         let _ = signal;
-                        let _ = pty.child_mut().start_kill();
-                        let _ = tokio::time::timeout(PUMP_TEARDOWN, pty.child_mut().wait()).await;
+                        let child_error =
+                            child_start_kill("pty", || pty.child_mut().start_kill()).err();
+                        let reap = confirm_reap(PUMP_TEARDOWN, pty.child_mut().wait()).await;
+                        if let Err(source) = reap {
+                            return Err(TeardownFailure {
+                                cause,
+                                operation: if child_error.is_some() {
+                                    "PTY child hard kill"
+                                } else {
+                                    "PTY child terminal reap"
+                                },
+                                source: child_error.unwrap_or(source),
+                            });
+                        }
                     }
                     gate.retire();
                 }
             },
             Backend::Scripted(s) => s.kill(),
         }
+        Ok(())
     }
 
     /// Whether the child has already exited, polled without blocking — the
@@ -3159,6 +3533,414 @@ mod tests {
     use crate::command::Command;
     use crate::doubles::{Reply, ScriptedRunner};
     use crate::runner::ProcessRunner;
+
+    fn marker_path(label: &str) -> std::path::PathBuf {
+        let nonce = SystemTime::now()
+            .duration_since(SystemTime::UNIX_EPOCH)
+            .expect("system clock after epoch")
+            .as_nanos();
+        std::env::temp_dir().join(format!(
+            "processkit_teardown_{label}_{}_{nonce}.ready",
+            std::process::id()
+        ))
+    }
+
+    fn live_command(marker: &std::path::Path, use_pty: bool) -> Command {
+        #[cfg(unix)]
+        let command = Command::new("sh").args([
+            "-c",
+            &format!(
+                "printf 'teardown-prefix\\n'; : > '{}'; sleep 60",
+                marker.display()
+            ),
+        ]);
+        #[cfg(windows)]
+        let command = {
+            let marker = marker.display().to_string().replace('\'', "''");
+            Command::new("powershell").args([
+                "-NoLogo",
+                "-NoProfile",
+                "-NonInteractive",
+                "-Command",
+                &format!(
+                    "[Console]::Out.WriteLine('teardown-prefix'); \
+                     [IO.File]::WriteAllText('{marker}', 'ready'); Start-Sleep -Seconds 60"
+                ),
+            ])
+        };
+        #[cfg(feature = "pty")]
+        if use_pty {
+            return command.use_pty();
+        }
+        #[cfg(not(feature = "pty"))]
+        let _ = use_pty;
+        command
+    }
+
+    fn completed_command(marker: &std::path::Path) -> Command {
+        #[cfg(unix)]
+        return Command::new("sh").args([
+            "-c",
+            &format!("printf 'teardown-prefix\\n'; : > '{}'", marker.display()),
+        ]);
+        #[cfg(windows)]
+        {
+            let marker = marker.display().to_string().replace('\'', "''");
+            Command::new("powershell").args([
+                "-NoLogo",
+                "-NoProfile",
+                "-NonInteractive",
+                "-Command",
+                &format!(
+                    "[Console]::Out.WriteLine('teardown-prefix'); \
+                     [IO.File]::WriteAllText('{marker}', 'ready')"
+                ),
+            ])
+        }
+    }
+
+    async fn wait_for_marker(marker: &std::path::Path) {
+        for _ in 0..500 {
+            if marker.exists() {
+                return;
+            }
+            tokio::time::sleep(Duration::from_millis(10)).await;
+        }
+        panic!(
+            "child did not publish readiness marker: {}",
+            marker.display()
+        );
+    }
+
+    fn assert_teardown_error(error: &Error, expected: TeardownCause, expected_operation: &str) {
+        match error.reason() {
+            ErrorReason::Teardown {
+                cause,
+                operation,
+                source,
+                stdout,
+                ..
+            } => {
+                assert_eq!(*cause, expected);
+                assert_eq!(*operation, expected_operation);
+                assert_eq!(source.raw_os_error(), Some(5));
+                assert!(
+                    stdout.contains("teardown-prefix"),
+                    "the bounded drain must retain the prefix: {stdout:?}"
+                );
+            }
+            other => panic!("expected Teardown, got {other:?}"),
+        }
+    }
+
+    #[cfg(feature = "process-control")]
+    #[tokio::test(flavor = "current_thread")]
+    #[ignore = "spawns a real shared-group child for deterministic kill fault injection"]
+    async fn shared_real_child_kill_failure_is_not_reported_as_cancelled() {
+        let marker = marker_path("real_child_kill");
+        let group = ProcessGroup::new().expect("group");
+        let mut run = group
+            .start(&live_command(&marker, false))
+            .await
+            .expect("start shared child");
+        wait_for_marker(&marker).await;
+        let faults = crate::sys::fault_injection::Faults::new()
+            .fail_every(
+                crate::sys::fault_injection::Site::DirectChildKill,
+                Some("real"),
+                5,
+            )
+            .arm();
+
+        tokio::time::pause();
+        let failure = run
+            .teardown_on_cancel()
+            .await
+            .expect_err("the injected direct-child kill fails");
+        record_teardown_failure(&run.teardown_failure, failure);
+        assert_eq!(
+            faults.fired(crate::sys::fault_injection::Site::DirectChildKill),
+            1
+        );
+        assert!(
+            !group.members().expect("members").is_empty(),
+            "the injected child kill really left a live group member"
+        );
+        let error = run
+            .take_teardown_error("teardown-prefix\n".into(), String::new(), None)
+            .expect("an unconfirmed child kill must fail closed");
+        assert_teardown_error(
+            &error,
+            TeardownCause::Cancellation,
+            "direct child hard kill",
+        );
+        drop(faults);
+        run.start_kill().expect("direct-child cleanup kill");
+        run.backend_wait().await.expect("cleanup reap");
+        let _ = std::fs::remove_file(marker);
+    }
+
+    #[tokio::test(flavor = "current_thread")]
+    #[ignore = "spawns a real short-lived child for the already-exited kill race"]
+    async fn already_exited_child_keeps_the_routine_cancelled_classification() {
+        let marker = marker_path("already_exited");
+        let group = ProcessGroup::new().expect("group");
+        let token = crate::CancellationToken::new();
+        let run = group
+            .start(&completed_command(&marker).cancel_on(token.clone()))
+            .await
+            .expect("start short-lived child");
+        wait_for_marker(&marker).await;
+        // The marker is the child's final operation. Give the OS process a small
+        // wall-clock window to exit without observing/reaping it through the API.
+        std::thread::sleep(Duration::from_millis(100));
+        tokio::time::pause();
+        let faults = crate::sys::fault_injection::Faults::new()
+            .fail_every(
+                crate::sys::fault_injection::Site::DirectChildKill,
+                Some("real"),
+                5,
+            )
+            .arm();
+
+        token.cancel();
+        let error = run
+            .output_string()
+            .await
+            .expect_err("cancellation remains an error on the unobserved-exit race");
+        assert!(
+            matches!(error.reason(), ErrorReason::Cancelled { .. }),
+            "a confirmed reap makes the failed kill a benign already-exited race: {error:?}"
+        );
+        assert_eq!(
+            faults.fired(crate::sys::fault_injection::Site::DirectChildKill),
+            1
+        );
+        let _ = std::fs::remove_file(marker);
+    }
+
+    #[tokio::test(flavor = "current_thread")]
+    #[ignore = "spawns a real owned-group child for deterministic kill fault injection"]
+    async fn whole_group_hard_kill_failure_outranks_cancellation() {
+        let marker = marker_path("group_hard_kill");
+        let token = crate::CancellationToken::new();
+        let run = live_command(&marker, false)
+            .cancel_on(token.clone())
+            .start()
+            .await
+            .expect("start owned-group child");
+        wait_for_marker(&marker).await;
+        tokio::time::pause();
+        let faults = crate::sys::fault_injection::Faults::new()
+            .fail_every(
+                crate::sys::fault_injection::Site::ProcessGroupTeardown,
+                Some("hard"),
+                5,
+            )
+            .arm();
+
+        token.cancel();
+        let error = run
+            .output_string()
+            .await
+            .expect_err("an unconfirmed group kill must fail closed");
+        assert_teardown_error(
+            &error,
+            TeardownCause::Cancellation,
+            "process-group hard kill",
+        );
+        assert_eq!(
+            faults.fired(crate::sys::fault_injection::Site::ProcessGroupTeardown),
+            1
+        );
+        let _ = std::fs::remove_file(marker);
+    }
+
+    #[tokio::test(flavor = "current_thread")]
+    #[ignore = "spawns a real owned-group child for deterministic timeout fault injection"]
+    async fn whole_group_hard_kill_failure_outranks_timeout() {
+        let marker = marker_path("group_timeout");
+        let mut run = live_command(&marker, false)
+            .start()
+            .await
+            .expect("start deadline-bound child");
+        wait_for_marker(&marker).await;
+        tokio::time::pause();
+        let faults = crate::sys::fault_injection::Faults::new()
+            .fail_every(
+                crate::sys::fault_injection::Site::ProcessGroupTeardown,
+                Some("hard"),
+                5,
+            )
+            .arm();
+
+        let failure = run
+            .teardown_on_timeout(TeardownCause::Timeout)
+            .await
+            .expect_err("the injected group kill fails");
+        record_teardown_failure(&run.teardown_failure, failure);
+        let error = run
+            .output_string()
+            .await
+            .expect_err("an unconfirmed deadline teardown must fail closed");
+        assert_teardown_error(&error, TeardownCause::Timeout, "process-group hard kill");
+        assert_eq!(
+            faults.fired(crate::sys::fault_injection::Site::ProcessGroupTeardown),
+            1
+        );
+        let _ = std::fs::remove_file(marker);
+    }
+
+    #[tokio::test(flavor = "current_thread")]
+    #[ignore = "spawns a real owned-group child for deterministic inactivity fault injection"]
+    async fn whole_group_hard_kill_failure_outranks_inactivity_timeout() {
+        let marker = marker_path("group_inactivity");
+        let mut run = live_command(&marker, false)
+            .start()
+            .await
+            .expect("start inactivity-bound child");
+        wait_for_marker(&marker).await;
+        tokio::time::pause();
+        let faults = crate::sys::fault_injection::Faults::new()
+            .fail_every(
+                crate::sys::fault_injection::Site::ProcessGroupTeardown,
+                Some("hard"),
+                5,
+            )
+            .arm();
+
+        let failure = run
+            .teardown_on_timeout(TeardownCause::InactivityTimeout)
+            .await
+            .expect_err("the injected group kill fails");
+        record_teardown_failure(&run.teardown_failure, failure);
+        let error = run
+            .output_string()
+            .await
+            .expect_err("an unconfirmed inactivity teardown must fail closed");
+        assert_teardown_error(
+            &error,
+            TeardownCause::InactivityTimeout,
+            "process-group hard kill",
+        );
+        assert_eq!(
+            faults.fired(crate::sys::fault_injection::Site::ProcessGroupTeardown),
+            1
+        );
+        let _ = std::fs::remove_file(marker);
+    }
+
+    #[tokio::test(flavor = "current_thread")]
+    #[ignore = "spawns a real owned-group child for deterministic graceful fault injection"]
+    async fn graceful_group_failure_outranks_cancellation() {
+        let marker = marker_path("group_graceful");
+        let token = crate::CancellationToken::new();
+        let run = live_command(&marker, false)
+            .cancel_on(token.clone())
+            .cancel_grace(Duration::from_secs(1))
+            .start()
+            .await
+            .expect("start graceful child");
+        wait_for_marker(&marker).await;
+        let faults = crate::sys::fault_injection::Faults::new()
+            .fail_every(
+                crate::sys::fault_injection::Site::ProcessGroupTeardown,
+                Some("graceful"),
+                5,
+            )
+            .arm();
+
+        token.cancel();
+        let error = run
+            .output_string()
+            .await
+            .expect_err("an unconfirmed graceful escalation must fail closed");
+        assert_teardown_error(
+            &error,
+            TeardownCause::Cancellation,
+            "process-group graceful escalation",
+        );
+        assert_eq!(
+            faults.fired(crate::sys::fault_injection::Site::ProcessGroupTeardown),
+            1
+        );
+        let _ = std::fs::remove_file(marker);
+    }
+
+    #[cfg(all(feature = "pty", feature = "process-control"))]
+    #[tokio::test(flavor = "current_thread")]
+    #[ignore = "spawns a real shared-group PTY child for deterministic kill fault injection"]
+    async fn shared_pty_child_kill_failure_is_not_reported_as_cancelled() {
+        let marker = marker_path("pty_child_kill");
+        let group = ProcessGroup::new().expect("group");
+        let mut run = group
+            .start(&live_command(&marker, true))
+            .await
+            .expect("start shared PTY child");
+        wait_for_marker(&marker).await;
+        let faults = crate::sys::fault_injection::Faults::new()
+            .fail_every(
+                crate::sys::fault_injection::Site::DirectChildKill,
+                Some("pty"),
+                5,
+            )
+            .arm();
+
+        let failure = run
+            .teardown_on_cancel()
+            .await
+            .expect_err("the injected PTY child kill fails");
+        record_teardown_failure(&run.teardown_failure, failure);
+        assert!(
+            !group.members().expect("members").is_empty(),
+            "the injected PTY child kill really left a live group member"
+        );
+        assert_eq!(
+            faults.fired(crate::sys::fault_injection::Site::DirectChildKill),
+            1
+        );
+        let error = run
+            .take_teardown_error("teardown-prefix\n".into(), String::new(), None)
+            .expect("an unconfirmed PTY kill must fail closed");
+        assert_teardown_error(
+            &error,
+            TeardownCause::Cancellation,
+            "direct child hard kill",
+        );
+        drop(faults);
+        run.start_kill().expect("PTY cleanup kill");
+        run.backend_wait().await.expect("cleanup reap");
+        let _ = std::fs::remove_file(marker);
+    }
+
+    #[tokio::test]
+    async fn teardown_failure_outranks_cancel_stdin_and_pump_errors() {
+        let mut run = scripted_handle(&[0]).await;
+        let stdout = SharedLines::new(&OutputBufferPolicy::unbounded());
+        stdout.push("teardown-prefix".into());
+        stdout.set_read_error(std::io::Error::other("pump failed"));
+        run.stdout_sink = Some(stdout);
+        run.stdin_error = Some(std::io::Error::other("stdin failed"));
+        record_teardown_failure(
+            &run.teardown_failure,
+            TeardownFailure {
+                cause: TeardownCause::Cancellation,
+                operation: "process-group hard kill",
+                source: std::io::Error::from_raw_os_error(5),
+            },
+        );
+
+        let error = run
+            .output_string()
+            .await
+            .expect_err("terminal teardown failure has the highest priority");
+        assert_teardown_error(
+            &error,
+            TeardownCause::Cancellation,
+            "process-group hard kill",
+        );
+        assert_eq!(error.kind(), crate::ErrorKind::Teardown);
+    }
 
     /// A scripted (hermetic) handle for `tool`, with the given `ok_codes`.
     async fn scripted_handle(ok_codes: &[i32]) -> RunningProcess {

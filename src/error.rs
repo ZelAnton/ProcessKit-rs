@@ -3,6 +3,52 @@
 use std::fmt;
 use std::time::Duration;
 
+/// The terminal condition that required a process teardown which the OS did not
+/// confirm.
+///
+/// A [`Teardown`](ErrorReason::Teardown) carries this value separately from the
+/// failing primitive so callers can distinguish a deadline, inactivity window,
+/// cancellation, or pipeline failure without parsing an error message.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
+#[non_exhaustive]
+pub enum TeardownCause {
+    /// [`Command::timeout`](crate::Command::timeout) elapsed.
+    Timeout,
+    /// [`Command::inactivity_timeout`](crate::Command::inactivity_timeout) elapsed.
+    InactivityTimeout,
+    /// A [`CancellationToken`](crate::CancellationToken) fired.
+    Cancellation,
+    /// An explicit hard-kill API was called.
+    ExplicitKill,
+    /// A pipeline stage failed and chain-wide teardown was required.
+    PipelineFailure,
+}
+
+impl TeardownCause {
+    /// This cause's stable machine identifier.
+    pub fn name(&self) -> &'static str {
+        match self {
+            Self::Timeout => "timeout",
+            Self::InactivityTimeout => "inactivity_timeout",
+            Self::Cancellation => "cancellation",
+            Self::ExplicitKill => "explicit_kill",
+            Self::PipelineFailure => "pipeline_failure",
+        }
+    }
+
+    /// Parse a stable machine identifier returned by [`name`](Self::name).
+    pub fn from_name(name: &str) -> Option<Self> {
+        match name {
+            "timeout" => Some(Self::Timeout),
+            "inactivity_timeout" => Some(Self::InactivityTimeout),
+            "cancellation" => Some(Self::Cancellation),
+            "explicit_kill" => Some(Self::ExplicitKill),
+            "pipeline_failure" => Some(Self::PipelineFailure),
+            _ => None,
+        }
+    }
+}
+
 /// The boxed error a **fallible control predicate** may return — a
 /// [`Supervisor`](crate::Supervisor)'s `try_*` twin
 /// ([`try_stop_when`](crate::Supervisor::try_stop_when),
@@ -318,11 +364,13 @@ pub enum ErrorReason {
 
     /// The run was cancelled via its `CancellationToken`
     /// ([`Command::cancel_on`](crate::Command::cancel_on)) and its process
-    /// tree was killed.
+    /// tree reached a confirmed terminal state.
     ///
     /// Asymmetric with [`Timeout`](ErrorReason::Timeout) by design: a timeout is
     /// *captured* (`ProcessResult::timed_out`) on the non-checking paths,
-    /// whereas a cancellation is **always** raised on every consuming path.
+    /// whereas a confirmed cancellation is **always** raised on every consuming
+    /// path. A kill/escalation/reap failure that leaves terminal state
+    /// unconfirmed is [`Teardown`](ErrorReason::Teardown) instead.
     /// When a run both times out and is cancelled, cancellation wins (it is
     /// checked first).
     ///
@@ -337,6 +385,35 @@ pub enum ErrorReason {
     Cancelled {
         /// The program that was cancelled.
         program: String,
+    },
+
+    /// The run needed terminal teardown, but an OS kill/escalation/reap operation
+    /// failed and the crate therefore could not confirm that the child or process
+    /// tree was gone.
+    ///
+    /// This failure takes precedence over the initiating timeout, inactivity
+    /// timeout, cancellation, pipeline failure, stdin failure, or pump failure:
+    /// reporting one of those ordinary dispositions would falsely imply that a
+    /// potentially-live process had been dealt with. Output already captured before
+    /// the failed teardown remains attached as a best-effort diagnostic prefix.
+    #[error("`{program}` teardown after {cause:?} failed during {operation}: {source}")]
+    #[non_exhaustive]
+    Teardown {
+        /// The program or pipeline whose teardown was not confirmed.
+        program: String,
+        /// The terminal condition that initiated teardown.
+        cause: TeardownCause,
+        /// Stable description of the failed teardown step.
+        operation: &'static str,
+        /// The original OS error from that step.
+        #[source]
+        source: std::io::Error,
+        /// Standard output captured before teardown failed, in full.
+        stdout: String,
+        /// Standard error captured before teardown failed, in full.
+        stderr: String,
+        /// Exact captured stdout bytes for a raw-byte consumer, when available.
+        stdout_bytes: Option<Vec<u8>>,
     },
 
     /// The process was terminated by a signal (**Unix only**) without producing an
@@ -522,6 +599,10 @@ pub enum ErrorKind {
     /// [`ErrorReason::Cancelled`]. The twin of [`Error::is_cancelled`]; a
     /// caller-initiated stop, never retried.
     Cancelled,
+    /// Terminal process teardown could not be confirmed — from
+    /// [`ErrorReason::Teardown`]. The original OS error and initiating condition
+    /// remain on the reason. The twin of [`Error::is_teardown`].
+    Teardown,
     /// A fallible control predicate returned an error — from
     /// [`ErrorReason::Predicate`]. Its own routing bucket, distinct from
     /// [`Other`](ErrorKind::Other): the failure originated in the caller's own
@@ -583,6 +664,7 @@ impl ErrorKind {
             ErrorKind::Unsupported => "unsupported",
             ErrorKind::Timeout => "timeout",
             ErrorKind::Cancelled => "cancelled",
+            ErrorKind::Teardown => "teardown",
             ErrorKind::Predicate => "predicate",
             ErrorKind::Exit => "exit",
             ErrorKind::Signalled => "signalled",
@@ -724,6 +806,7 @@ impl ErrorReason {
             }
             ErrorReason::Timeout { .. } => ErrorKind::Timeout,
             ErrorReason::Cancelled { .. } => ErrorKind::Cancelled,
+            ErrorReason::Teardown { .. } => ErrorKind::Teardown,
             ErrorReason::Predicate { .. } => ErrorKind::Predicate,
             ErrorReason::Exit { .. } => ErrorKind::Exit,
             ErrorReason::Signalled { .. } => ErrorKind::Signalled,
@@ -743,7 +826,8 @@ impl ErrorReason {
     /// captured standard output (where `git` puts `CONFLICT …` and `git commit`
     /// puts `nothing to commit`). Covers the variants that capture streams — a
     /// non-zero [`Exit`](ErrorReason::Exit), a [`Timeout`](ErrorReason::Timeout) (the partial
-    /// output of a hung-then-killed tool), and a [`Signalled`](ErrorReason::Signalled)
+    /// output of a hung-then-killed tool), an unconfirmed
+    /// [`Teardown`](ErrorReason::Teardown), and a [`Signalled`](ErrorReason::Signalled)
     /// crash. Returns `None` when there is no captured output to show — a silent
     /// run (both streams blank) or a variant that carries none
     /// ([`Spawn`](ErrorReason::Spawn), [`Cancelled`](ErrorReason::Cancelled),
@@ -757,6 +841,7 @@ impl ErrorReason {
         match self {
             ErrorReason::Exit { stdout, stderr, .. }
             | ErrorReason::Timeout { stdout, stderr, .. }
+            | ErrorReason::Teardown { stdout, stderr, .. }
             | ErrorReason::Signalled { stdout, stderr, .. } => exit_diagnostic(stdout, stderr),
             ErrorReason::Spawn { .. }
             | ErrorReason::NotFound { .. }
@@ -776,7 +861,8 @@ impl ErrorReason {
 
     /// The captured standard output, for the variants that carry a stream — a
     /// non-zero [`Exit`](ErrorReason::Exit), a [`Timeout`](ErrorReason::Timeout) (partial
-    /// output before the kill), or a [`Signalled`](ErrorReason::Signalled) crash —
+    /// output before the kill), an unconfirmed [`Teardown`](ErrorReason::Teardown),
+    /// or a [`Signalled`](ErrorReason::Signalled) crash —
     /// `None` for every other variant. The raw stream in full (untrimmed); for
     /// the best one-line message use [`diagnostic`](Self::diagnostic), for both
     /// streams joined [`combined`](Self::combined). Reads the stream off the error
@@ -793,7 +879,7 @@ impl ErrorReason {
 
     /// The **exact** captured stdout bytes, when available — `Some` only for a
     /// stream-bearing variant ([`Exit`](ErrorReason::Exit) / [`Timeout`](ErrorReason::Timeout)
-    /// / [`Signalled`](ErrorReason::Signalled)) produced by a checking verb built over
+    /// / [`Teardown`](ErrorReason::Teardown) / [`Signalled`](ErrorReason::Signalled)) produced by a checking verb built over
     /// [`output_bytes`](crate::Command::output_bytes) (e.g.
     /// `output_bytes().await?.ensure_success()?`); `None` for every other
     /// variant, and for a stream-bearing variant produced on the text path
@@ -807,6 +893,7 @@ impl ErrorReason {
         match self {
             ErrorReason::Exit { stdout_bytes, .. }
             | ErrorReason::Timeout { stdout_bytes, .. }
+            | ErrorReason::Teardown { stdout_bytes, .. }
             | ErrorReason::Signalled { stdout_bytes, .. } => stdout_bytes.as_deref(),
             ErrorReason::Spawn { .. }
             | ErrorReason::NotFound { .. }
@@ -838,7 +925,8 @@ impl ErrorReason {
 
     /// The captured `(stdout, stderr)` for the stream-bearing variants
     /// ([`Exit`](ErrorReason::Exit) / [`Timeout`](ErrorReason::Timeout) /
-    /// [`Signalled`](ErrorReason::Signalled)), `None` for the rest — the single
+    /// [`Teardown`](ErrorReason::Teardown) / [`Signalled`](ErrorReason::Signalled)),
+    /// `None` for the rest — the single
     /// exhaustive match the public stream accessors above derive from.
     fn streams(&self) -> Option<(&str, &str)> {
         // Exhaustive on purpose (like `diagnostic`/`io_source`): a future
@@ -846,6 +934,7 @@ impl ErrorReason {
         match self {
             ErrorReason::Exit { stdout, stderr, .. }
             | ErrorReason::Timeout { stdout, stderr, .. }
+            | ErrorReason::Teardown { stdout, stderr, .. }
             | ErrorReason::Signalled { stdout, stderr, .. } => Some((stdout, stderr)),
             ErrorReason::Spawn { .. }
             | ErrorReason::NotFound { .. }
@@ -883,6 +972,7 @@ impl ErrorReason {
             | ErrorReason::NotReady { program, .. }
             | ErrorReason::Parse { program, .. }
             | ErrorReason::Cancelled { program }
+            | ErrorReason::Teardown { program, .. }
             | ErrorReason::Signalled { program, .. }
             | ErrorReason::Stdin { program, .. } => Some(program),
             ErrorReason::Unsupported { .. }
@@ -959,6 +1049,7 @@ impl ErrorReason {
             | ErrorReason::Parse { .. }
             | ErrorReason::Unsupported { .. }
             | ErrorReason::Cancelled { .. }
+            | ErrorReason::Teardown { .. }
             | ErrorReason::Signalled { .. }
             | ErrorReason::Stdin { .. }
             | ErrorReason::Predicate { .. }
@@ -989,6 +1080,7 @@ impl ErrorReason {
             | ErrorReason::Parse { .. }
             | ErrorReason::Unsupported { .. }
             | ErrorReason::Cancelled { .. }
+            | ErrorReason::Teardown { .. }
             | ErrorReason::Stdin { .. }
             | ErrorReason::Predicate { .. }
             | ErrorReason::Io(_) => None,
@@ -1022,6 +1114,7 @@ impl ErrorReason {
             | ErrorReason::Parse { .. }
             | ErrorReason::Unsupported { .. }
             | ErrorReason::Cancelled { .. }
+            | ErrorReason::Teardown { .. }
             | ErrorReason::Signalled { .. }
             | ErrorReason::Stdin { .. }
             | ErrorReason::Predicate { .. }
@@ -1061,6 +1154,7 @@ impl ErrorReason {
             | ErrorReason::Parse { .. }
             | ErrorReason::Unsupported { .. }
             | ErrorReason::Cancelled { .. }
+            | ErrorReason::Teardown { .. }
             | ErrorReason::Signalled { .. }
             | ErrorReason::Stdin { .. }
             | ErrorReason::Predicate { .. }
@@ -1089,6 +1183,7 @@ impl ErrorReason {
             | ErrorReason::NotReady { .. }
             | ErrorReason::Parse { .. }
             | ErrorReason::Cancelled { .. }
+            | ErrorReason::Teardown { .. }
             | ErrorReason::Signalled { .. }
             | ErrorReason::Stdin { .. }
             | ErrorReason::Predicate { .. }
@@ -1117,6 +1212,7 @@ impl ErrorReason {
             | ErrorReason::Parse { .. }
             | ErrorReason::Unsupported { .. }
             | ErrorReason::Cancelled { .. }
+            | ErrorReason::Teardown { .. }
             | ErrorReason::Signalled { .. }
             | ErrorReason::Stdin { .. }
             | ErrorReason::Predicate { .. }
@@ -1143,6 +1239,7 @@ impl ErrorReason {
             | ErrorReason::Parse { .. }
             | ErrorReason::Unsupported { .. }
             | ErrorReason::Cancelled { .. }
+            | ErrorReason::Teardown { .. }
             | ErrorReason::Signalled { .. }
             | ErrorReason::Stdin { .. }
             | ErrorReason::Predicate { .. }
@@ -1170,6 +1267,13 @@ impl ErrorReason {
     /// destructuring the variant.
     pub fn is_cancelled(&self) -> bool {
         matches!(self, ErrorReason::Cancelled { .. })
+    }
+
+    /// Whether terminal teardown could not be confirmed. This is the fail-closed
+    /// predicate for [`Teardown`](ErrorReason::Teardown): callers must assume the
+    /// child or tree may still be live and must not automatically retry the work.
+    pub fn is_teardown(&self) -> bool {
+        matches!(self, ErrorReason::Teardown { .. })
     }
 
     /// Whether the run was killed by a signal — i.e. this is a
@@ -1202,6 +1306,7 @@ impl ErrorReason {
             | ErrorReason::Parse { .. }
             | ErrorReason::Unsupported { .. }
             | ErrorReason::Cancelled { .. }
+            | ErrorReason::Teardown { .. }
             | ErrorReason::Signalled { .. }
             | ErrorReason::Stdin { .. }
             | ErrorReason::Predicate { .. } => None,
@@ -1380,6 +1485,12 @@ impl Error {
         self.reason.is_cancelled()
     }
 
+    /// Whether terminal teardown could not be confirmed — see
+    /// [`ErrorReason::is_teardown`].
+    pub fn is_teardown(&self) -> bool {
+        self.reason.is_teardown()
+    }
+
     /// Whether the run was killed by a signal — see
     /// [`ErrorReason::is_signalled`].
     pub fn is_signalled(&self) -> bool {
@@ -1532,6 +1643,29 @@ impl Error {
         ErrorReason::Io(source).into()
     }
 
+    /// Build the fail-closed terminal-teardown error after bounded output drain.
+    #[allow(clippy::too_many_arguments)]
+    pub(crate) fn teardown(
+        program: impl Into<String>,
+        cause: TeardownCause,
+        operation: &'static str,
+        source: std::io::Error,
+        stdout: String,
+        stderr: String,
+        stdout_bytes: Option<Vec<u8>>,
+    ) -> Self {
+        ErrorReason::Teardown {
+            program: program.into(),
+            cause,
+            operation,
+            source,
+            stdout,
+            stderr,
+            stdout_bytes,
+        }
+        .into()
+    }
+
     /// Wrap the error a fallible control predicate returned as an
     /// [`ErrorReason::Predicate`], tagged with a stable `predicate` identifier
     /// (`"stop_when"`, `"give_up_when"`, `"health_check"`, `"when"`).
@@ -1657,6 +1791,24 @@ impl fmt::Debug for ErrorReason {
             ErrorReason::Cancelled { program } => f
                 .debug_struct("Cancelled")
                 .field("program", program)
+                .finish(),
+            ErrorReason::Teardown {
+                program,
+                cause,
+                operation,
+                source,
+                stdout,
+                stderr,
+                stdout_bytes,
+            } => f
+                .debug_struct("Teardown")
+                .field("program", program)
+                .field("cause", cause)
+                .field("operation", operation)
+                .field("source", source)
+                .field("stdout", &StreamPreview(stdout))
+                .field("stderr", &StreamPreview(stderr))
+                .field("stdout_bytes", &BytesPreview(stdout_bytes.as_deref()))
                 .finish(),
             ErrorReason::Signalled {
                 program,
@@ -2951,6 +3103,19 @@ mod tests {
             ErrorKind::Cancelled
         );
         assert_eq!(
+            Error::teardown(
+                "job",
+                TeardownCause::Cancellation,
+                "process-group hard kill",
+                std::io::Error::from_raw_os_error(5),
+                "prefix".into(),
+                "diagnostic".into(),
+                None,
+            )
+            .kind(),
+            ErrorKind::Teardown
+        );
+        assert_eq!(
             Error::signalled("git", Some(9), "", "").kind(),
             ErrorKind::Signalled
         );
@@ -2980,6 +3145,19 @@ mod tests {
         assert_eq!(
             Error::timeout("git", Duration::from_secs(3), "o", "e").kind(),
             ErrorKind::Timeout
+        );
+        assert_eq!(
+            Error::teardown(
+                "git",
+                TeardownCause::Timeout,
+                "process-group hard kill",
+                std::io::Error::other("refused"),
+                "o".into(),
+                "e".into(),
+                None,
+            )
+            .kind(),
+            ErrorKind::Teardown
         );
         assert_eq!(
             Error::signalled("git", None, "o", "e").kind(),
@@ -3021,7 +3199,7 @@ mod tests {
 
         // The new total kind must agree with the existing point classifiers — a
         // regression that drifts one from the other is caught here.
-        let cases: [Error; 6] = [
+        let cases: [Error; 7] = [
             Error::not_found("x", None),
             spawn(IoKind::PermissionDenied),
             Error::timeout("x", Duration::from_secs(1), "", ""),
@@ -3031,6 +3209,15 @@ mod tests {
             .into(),
             Error::signalled("x", None, "", ""),
             Error::exit("x", 1, "", ""),
+            Error::teardown(
+                "x",
+                TeardownCause::Timeout,
+                "child terminal reap",
+                std::io::Error::other("still live"),
+                String::new(),
+                String::new(),
+                None,
+            ),
         ];
         for err in &cases {
             assert_eq!(err.is_not_found(), err.kind() == ErrorKind::NotFound);
@@ -3040,6 +3227,7 @@ mod tests {
             );
             assert_eq!(err.is_timeout(), err.kind() == ErrorKind::Timeout);
             assert_eq!(err.is_cancelled(), err.kind() == ErrorKind::Cancelled);
+            assert_eq!(err.is_teardown(), err.kind() == ErrorKind::Teardown);
             assert_eq!(err.is_signalled(), err.kind() == ErrorKind::Signalled);
         }
     }
@@ -3052,11 +3240,27 @@ mod tests {
         assert_eq!(ErrorKind::Unsupported.name(), "unsupported");
         assert_eq!(ErrorKind::Timeout.name(), "timeout");
         assert_eq!(ErrorKind::Cancelled.name(), "cancelled");
+        assert_eq!(ErrorKind::Teardown.name(), "teardown");
         assert_eq!(ErrorKind::Exit.name(), "exit");
         assert_eq!(ErrorKind::Signalled.name(), "signalled");
         assert_eq!(ErrorKind::Other.name(), "other");
         #[cfg(feature = "limits")]
         assert_eq!(ErrorKind::ResourceLimit.name(), "resource_limit");
+    }
+
+    #[test]
+    fn teardown_cause_identifiers_round_trip() {
+        for (cause, name) in [
+            (TeardownCause::Timeout, "timeout"),
+            (TeardownCause::InactivityTimeout, "inactivity_timeout"),
+            (TeardownCause::Cancellation, "cancellation"),
+            (TeardownCause::ExplicitKill, "explicit_kill"),
+            (TeardownCause::PipelineFailure, "pipeline_failure"),
+        ] {
+            assert_eq!(cause.name(), name);
+            assert_eq!(TeardownCause::from_name(name), Some(cause));
+        }
+        assert_eq!(TeardownCause::from_name("future_cause"), None);
     }
 
     #[test]

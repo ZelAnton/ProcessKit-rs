@@ -202,6 +202,7 @@ pub processkit::ErrorKind::Predicate
 pub processkit::ErrorKind::ResourceLimit
 pub processkit::ErrorKind::Signalled
 pub processkit::ErrorKind::Spawn
+pub processkit::ErrorKind::Teardown
 pub processkit::ErrorKind::Timeout
 pub processkit::ErrorKind::Unsupported
 impl processkit::ErrorKind
@@ -270,6 +271,14 @@ pub processkit::ErrorReason::Spawn::source: core::io::error::Error
 #[non_exhaustive] pub processkit::ErrorReason::Stdin
 pub processkit::ErrorReason::Stdin::program: alloc::string::String
 pub processkit::ErrorReason::Stdin::source: core::io::error::Error
+#[non_exhaustive] pub processkit::ErrorReason::Teardown
+pub processkit::ErrorReason::Teardown::cause: processkit::TeardownCause
+pub processkit::ErrorReason::Teardown::operation: &'static str
+pub processkit::ErrorReason::Teardown::program: alloc::string::String
+pub processkit::ErrorReason::Teardown::source: core::io::error::Error
+pub processkit::ErrorReason::Teardown::stderr: alloc::string::String
+pub processkit::ErrorReason::Teardown::stdout: alloc::string::String
+pub processkit::ErrorReason::Teardown::stdout_bytes: core::option::Option<alloc::vec::Vec<u8>>
 #[non_exhaustive] pub processkit::ErrorReason::Timeout
 pub processkit::ErrorReason::Timeout::inactivity: bool
 pub processkit::ErrorReason::Timeout::program: alloc::string::String
@@ -287,6 +296,7 @@ pub fn processkit::ErrorReason::is_cancelled(&self) -> bool
 pub fn processkit::ErrorReason::is_not_found(&self) -> bool
 pub fn processkit::ErrorReason::is_permission_denied(&self) -> bool
 pub fn processkit::ErrorReason::is_signalled(&self) -> bool
+pub fn processkit::ErrorReason::is_teardown(&self) -> bool
 pub fn processkit::ErrorReason::is_timeout(&self) -> bool
 pub fn processkit::ErrorReason::is_transient(&self) -> bool
 pub fn processkit::ErrorReason::kind(&self) -> processkit::ErrorKind
@@ -845,6 +855,33 @@ impl core::marker::Unpin for processkit::SupervisionEvent
 impl core::marker::UnsafeUnpin for processkit::SupervisionEvent
 impl core::panic::unwind_safe::RefUnwindSafe for processkit::SupervisionEvent
 impl core::panic::unwind_safe::UnwindSafe for processkit::SupervisionEvent
+#[non_exhaustive] pub enum processkit::TeardownCause
+pub processkit::TeardownCause::Cancellation
+pub processkit::TeardownCause::ExplicitKill
+pub processkit::TeardownCause::InactivityTimeout
+pub processkit::TeardownCause::PipelineFailure
+pub processkit::TeardownCause::Timeout
+impl processkit::TeardownCause
+pub fn processkit::TeardownCause::from_name(&str) -> core::option::Option<Self>
+pub fn processkit::TeardownCause::name(&self) -> &'static str
+impl core::clone::Clone for processkit::TeardownCause
+pub fn processkit::TeardownCause::clone(&self) -> processkit::TeardownCause
+impl core::cmp::Eq for processkit::TeardownCause
+impl core::cmp::PartialEq for processkit::TeardownCause
+pub fn processkit::TeardownCause::eq(&self, &processkit::TeardownCause) -> bool
+impl core::fmt::Debug for processkit::TeardownCause
+pub fn processkit::TeardownCause::fmt(&self, &mut core::fmt::Formatter<'_>) -> core::fmt::Result
+impl core::hash::Hash for processkit::TeardownCause
+pub fn processkit::TeardownCause::hash<__H: core::hash::Hasher>(&self, &mut __H)
+impl core::marker::Copy for processkit::TeardownCause
+impl core::marker::StructuralPartialEq for processkit::TeardownCause
+impl core::marker::Freeze for processkit::TeardownCause
+impl core::marker::Send for processkit::TeardownCause
+impl core::marker::Sync for processkit::TeardownCause
+impl core::marker::Unpin for processkit::TeardownCause
+impl core::marker::UnsafeUnpin for processkit::TeardownCause
+impl core::panic::unwind_safe::RefUnwindSafe for processkit::TeardownCause
+impl core::panic::unwind_safe::UnwindSafe for processkit::TeardownCause
 pub struct processkit::CliClient<R: processkit::ProcessRunner>
 impl processkit::CliClient<processkit::JobRunner>
 pub fn processkit::CliClient<processkit::JobRunner>::new(impl core::convert::AsRef<std::ffi::os_str::OsStr>) -> Self
@@ -1021,6 +1058,7 @@ pub fn processkit::Error::is_cancelled(&self) -> bool
 pub fn processkit::Error::is_not_found(&self) -> bool
 pub fn processkit::Error::is_permission_denied(&self) -> bool
 pub fn processkit::Error::is_signalled(&self) -> bool
+pub fn processkit::Error::is_teardown(&self) -> bool
 pub fn processkit::Error::is_timeout(&self) -> bool
 pub fn processkit::Error::is_transient(&self) -> bool
 pub fn processkit::Error::kind(&self) -> processkit::ErrorKind

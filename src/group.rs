@@ -686,8 +686,15 @@ impl ProcessGroup {
             mechanism = ?self.mechanism(),
             "hard-killing every process in the group"
         );
-        self.job.kill_all().map_err(Error::io)?;
+        self.kill_all_io().map_err(Error::io)?;
         Ok(())
+    }
+
+    /// Crate-internal IO form used by consuming run/pipeline teardown, which must
+    /// retain the original source while it drains output before constructing the
+    /// richer public teardown error.
+    pub(crate) fn kill_all_io(&self) -> std::io::Result<()> {
+        self.job.kill_all()
     }
 
     /// Broadcast `sig` to every process in the group.
@@ -1206,11 +1213,21 @@ impl ProcessGroup {
     /// the signal/grace are ignored (atomic job kill). Best-effort: the caller
     /// reaps the child and the group's `Drop` backstops any straggler.
     pub(crate) async fn graceful_terminate(&self, grace: Duration, signal: i32) -> Result<()> {
-        self.job
-            .graceful_shutdown(signal, grace, true)
+        self.graceful_terminate_io(grace, signal)
             .await
             .map_err(Error::io)?;
         Ok(())
+    }
+
+    pub(crate) async fn graceful_terminate_io(
+        &self,
+        grace: Duration,
+        signal: i32,
+    ) -> std::io::Result<()> {
+        self.job
+            .graceful_shutdown(signal, grace, true)
+            .await
+            .map(|_| ())
     }
 
     /// Snapshot the group's resource usage (active process count and, where the
