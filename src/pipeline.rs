@@ -381,7 +381,10 @@ impl Pipeline {
     ///
     /// Like [`Command::cancel_on`], a cancelled run is terminal: it is not
     /// retried, and the chain cannot be re-run through a token that stays
-    /// cancelled.
+    /// cancelled. Finalization collects every stage's bounded terminal
+    /// disposition: a sibling [`ErrorReason::Teardown`](crate::ErrorReason::Teardown)
+    /// outranks ordinary `Cancelled`, stdin, or pump errors, so the chain never
+    /// claims confirmed cancellation while another stage may still be live.
     pub fn cancel_on(mut self, token: tokio_util::sync::CancellationToken) -> Self {
         self.cancel_token = Some(token);
         self
@@ -671,7 +674,12 @@ impl Pipeline {
         // `Weak` handles so it never pins a group past a session drop; aborted on
         // `finish`/drop.
         let teardown_failure: PipelineTeardownFailure = Arc::default();
-        let killer = spawn_group_killer(teardown.clone(), &stage_groups, teardown_failure.clone());
+        let killer = spawn_group_killer(
+            teardown.clone(),
+            &stage_groups,
+            teardown_failure.clone(),
+            self.cancel_token.clone(),
+        );
 
         // The last stage is the caller's to stream, so it gets no `inner_tasks`-style
         // drain that could fire `teardown` from its failure. Without an observer its
@@ -941,9 +949,18 @@ impl Pipeline {
                     teardown.cancelled().await;
                     tokio::time::sleep(TEARDOWN_DRAIN_GRACE).await;
                     if let Err(source) = kill_all_stage_groups(&stage_groups) {
+                        let cause = if self
+                            .cancel_token
+                            .as_ref()
+                            .is_some_and(tokio_util::sync::CancellationToken::is_cancelled)
+                        {
+                            crate::TeardownCause::Cancellation
+                        } else {
+                            crate::TeardownCause::PipelineFailure
+                        };
                         record_pipeline_teardown_failure(
                             &collect_failure,
-                            crate::TeardownCause::PipelineFailure,
+                            cause,
                             source,
                         );
                     }
@@ -1589,9 +1606,17 @@ impl PipelineSession {
         }
 
         // Surface a raw `Err` from either side (Cancelled / Teardown /
-        // OutputTooLarge / Stdin / Io).
-        let last_finished = last_res?;
-        let mut inner = inner_res.map_err(|failure| failure.error)?;
+        // OutputTooLarge / Stdin / Io). Both sides have already reached a terminal
+        // disposition, so inspect them together: an inner-stage Teardown must not
+        // be hidden by the last stage winning this lexical `?` with Cancelled.
+        let (last_finished, mut inner) = match (last_res, inner_res) {
+            (Ok(last), Ok(inner)) => (last, inner),
+            (Err(last), Err(inner)) => {
+                return Err(prefer_pipeline_terminal_error(last, inner.error));
+            }
+            (Err(error), Ok(_)) => return Err(error),
+            (Ok(_), Err(failure)) => return Err(failure.error),
+        };
 
         // Rebuild the inner stages in left-to-right order (a clean drain returns all
         // `inner_count` items, each tagged with its unique launch index), then append
@@ -1870,17 +1895,22 @@ fn spawn_group_killer(
     teardown: tokio_util::sync::CancellationToken,
     stage_groups: &[Arc<ProcessGroup>],
     teardown_failure: PipelineTeardownFailure,
+    chain_cancel: Option<tokio_util::sync::CancellationToken>,
 ) -> JoinHandle<()> {
     let groups: Vec<Weak<ProcessGroup>> = stage_groups.iter().map(Arc::downgrade).collect();
     tokio::spawn(async move {
         teardown.cancelled().await;
         tokio::time::sleep(TEARDOWN_DRAIN_GRACE).await;
         if let Err(source) = kill_weak_stage_groups(&groups) {
-            record_pipeline_teardown_failure(
-                &teardown_failure,
-                crate::TeardownCause::PipelineFailure,
-                source,
-            );
+            let cause = if chain_cancel
+                .as_ref()
+                .is_some_and(tokio_util::sync::CancellationToken::is_cancelled)
+            {
+                crate::TeardownCause::Cancellation
+            } else {
+                crate::TeardownCause::PipelineFailure
+            };
+            record_pipeline_teardown_failure(&teardown_failure, cause, source);
         }
     })
 }
@@ -2286,6 +2316,17 @@ fn join_error(err: tokio::task::JoinError) -> crate::Error {
     )))
 }
 
+/// Keep the first observed raw stage error unless a later terminal teardown
+/// failure proves the chain was not actually stopped. Among two teardown errors
+/// the first remains authoritative, making source selection stable.
+fn prefer_pipeline_terminal_error(first: crate::Error, later: crate::Error) -> crate::Error {
+    if !first.is_teardown() && later.is_teardown() {
+        later
+    } else {
+        first
+    }
+}
+
 #[derive(Debug)]
 struct PartialDrainError<Item> {
     completed: Vec<Item>,
@@ -2322,35 +2363,50 @@ type InnerDrain = std::result::Result<Vec<InnerStage>, PartialDrainError<InnerSt
 /// bodies *can't* self-report: a raw `Err` return (still inside the task,
 /// but past `is_checked_failure`) and a panic (never returns at all).
 ///
-/// On success, every task's `Ok` payload is returned — in **completion**
-/// order, not submission order; a payload that must be rebuilt in original
-/// stage order (as `capture` does) needs to carry its own position, the way
-/// [`Joined::Inner`]'s index does.
+/// After the first raw error the drain keeps collecting sibling terminal
+/// dispositions. The proactive teardown/group-killer paths bound those siblings;
+/// this extra collection is what lets a later [`ErrorReason::Teardown`] outrank an
+/// ordinary `Cancelled`/stdin/pump error instead of aborting the task that carries
+/// proof of a potentially-live process. The first teardown error in completion
+/// order remains authoritative.
+///
+/// On success, every task's `Ok` payload is returned — in **completion** order,
+/// not submission order; a payload that must be rebuilt in original stage order
+/// (as `capture` does) needs to carry its own position, the way [`Joined::Inner`]'s
+/// index does.
 async fn drain_unordered<Item: 'static>(
     mut tasks: tokio::task::JoinSet<Result<Item>>,
     teardown: &tokio_util::sync::CancellationToken,
 ) -> std::result::Result<Vec<Item>, PartialDrainError<Item>> {
     let mut collected = Vec::with_capacity(tasks.len());
+    let mut first_error = None;
     while let Some(joined) = tasks.join_next().await {
         match joined {
             Ok(Ok(item)) => collected.push(item),
             Ok(Err(err)) => {
                 teardown.cancel();
-                return Err(PartialDrainError {
-                    completed: collected,
-                    error: err,
+                first_error = Some(match first_error {
+                    Some(first) => prefer_pipeline_terminal_error(first, err),
+                    None => err,
                 });
             }
             Err(join_err) => {
                 teardown.cancel();
-                return Err(PartialDrainError {
-                    completed: collected,
-                    error: join_error(join_err),
+                let error = join_error(join_err);
+                first_error = Some(match first_error {
+                    Some(first) => prefer_pipeline_terminal_error(first, error),
+                    None => error,
                 });
             }
         }
     }
-    Ok(collected)
+    match first_error {
+        Some(error) => Err(PartialDrainError {
+            completed: collected,
+            error,
+        }),
+        None => Ok(collected),
+    }
 }
 
 #[cfg(test)]
@@ -2427,6 +2483,109 @@ mod tests {
         }
     }
 
+    fn cancellable_marked_pipeline(
+        marker: &std::path::Path,
+        producer_pid: &std::path::Path,
+        consumer_pid: &std::path::Path,
+    ) -> Pipeline {
+        #[cfg(unix)]
+        return Command::new("sh")
+            .args([
+                "-c",
+                &format!(
+                    "printf '%s' \"$$\" > '{}'; sleep 60",
+                    producer_pid.display()
+                ),
+            ])
+            .pipe(Command::new("sh").args([
+                "-c",
+                &format!(
+                    "printf 'pipeline-prefix\\n'; printf 'pipeline-stderr-prefix\\n' >&2; \
+                     printf '%s' \"$$\" > '{}'; : > '{}'; sleep 60",
+                    consumer_pid.display(),
+                    marker.display()
+                ),
+            ]));
+        #[cfg(windows)]
+        {
+            let marker = marker.display().to_string().replace('\'', "''");
+            let producer_pid = producer_pid.display().to_string().replace('\'', "''");
+            let consumer_pid = consumer_pid.display().to_string().replace('\'', "''");
+            let producer = Command::new("powershell").args([
+                "-NoLogo",
+                "-NoProfile",
+                "-NonInteractive",
+                "-Command",
+                &format!(
+                    "[IO.File]::WriteAllText('{producer_pid}', [string]$PID); \
+                     Start-Sleep -Seconds 60"
+                ),
+            ]);
+            let consumer = Command::new("powershell").args([
+                "-NoLogo",
+                "-NoProfile",
+                "-NonInteractive",
+                "-Command",
+                &format!(
+                    "[Console]::Out.WriteLine('pipeline-prefix'); \
+                     [Console]::Error.WriteLine('pipeline-stderr-prefix'); \
+                     [IO.File]::WriteAllText('{consumer_pid}', [string]$PID); \
+                     [IO.File]::WriteAllText('{marker}', 'ready'); \
+                     Start-Sleep -Seconds 60"
+                ),
+            ]);
+            producer.pipe(consumer)
+        }
+    }
+
+    fn survivor_held_output_pipeline(
+        marker: &std::path::Path,
+        survivor_pid: &std::path::Path,
+    ) -> Pipeline {
+        #[cfg(unix)]
+        return Command::new("sh")
+            .args(["-c", "printf 'input\\n'"])
+            .pipe(Command::new("sh").args([
+                "-c",
+                &format!(
+                    "(trap '' HUP TERM; sleep 60) & survivor=$!; \
+                     printf '%s' \"$survivor\" > '{}'; \
+                     printf 'pipeline-prefix\\n'; printf 'pipeline-stderr-prefix\\n' >&2; \
+                     : > '{}'",
+                    survivor_pid.display(),
+                    marker.display()
+                ),
+            ]));
+        #[cfg(windows)]
+        {
+            let marker = marker.display().to_string().replace('\'', "''");
+            let survivor_pid = survivor_pid.display().to_string().replace('\'', "''");
+            let producer = Command::new("powershell").args([
+                "-NoLogo",
+                "-NoProfile",
+                "-NonInteractive",
+                "-Command",
+                "[Console]::Out.WriteLine('input')",
+            ]);
+            let consumer = Command::new("powershell").args([
+                "-NoLogo",
+                "-NoProfile",
+                "-NonInteractive",
+                "-Command",
+                &format!(
+                    "$child = Start-Process -FilePath 'powershell' \
+                       -ArgumentList @('-NoLogo','-NoProfile','-NonInteractive','-Command', \
+                       'Start-Sleep -Seconds 60') -NoNewWindow -PassThru; \
+                     [IO.File]::WriteAllText('{survivor_pid}', [string]$child.Id); \
+                     [Console]::Out.WriteLine('pipeline-prefix'); \
+                     [Console]::Error.WriteLine('pipeline-stderr-prefix'); \
+                     [IO.File]::WriteAllText('{marker}', 'ready')"
+                ),
+            ]);
+            producer.pipe(consumer)
+        }
+    }
+
     async fn wait_for_pipeline_marker(marker: &std::path::Path) {
         for _ in 0..500 {
             if marker.exists() {
@@ -2438,6 +2597,44 @@ mod tests {
             "pipeline stage did not publish readiness marker: {}",
             marker.display()
         );
+    }
+
+    async fn read_pipeline_pids(paths: &[&std::path::Path]) -> Vec<u32> {
+        for _ in 0..500 {
+            let parsed: Option<Vec<u32>> = paths
+                .iter()
+                .map(|path| {
+                    std::fs::read_to_string(path)
+                        .ok()?
+                        .trim()
+                        .parse::<u32>()
+                        .ok()
+                })
+                .collect();
+            if let Some(pids) = parsed {
+                return pids;
+            }
+            tokio::time::sleep(Duration::from_millis(10)).await;
+        }
+        panic!("pipeline stages did not publish pid files: {paths:?}");
+    }
+
+    #[cfg(feature = "process-control")]
+    async fn assert_pipeline_pids_gone(pids: &[u32]) {
+        for _ in 0..500 {
+            if pids.iter().all(|pid| {
+                !crate::process_is_alive(*pid, None).expect("pipeline stage liveness probe")
+            }) {
+                return;
+            }
+            tokio::time::sleep(Duration::from_millis(10)).await;
+        }
+        let alive: Vec<_> = pids
+            .iter()
+            .copied()
+            .filter(|pid| crate::process_is_alive(*pid, None).unwrap_or(true))
+            .collect();
+        panic!("pipeline teardown left live stage processes: {alive:?}");
     }
 
     fn assert_pipeline_teardown(error: &crate::Error, expected: crate::TeardownCause) {
@@ -2569,6 +2766,151 @@ mod tests {
             "the live-session timeout attempts every stage group"
         );
         let _ = std::fs::remove_file(marker);
+    }
+
+    #[cfg(feature = "process-control")]
+    #[tokio::test(flavor = "current_thread")]
+    #[ignore = "spawns a real buffered pipeline for cancellation teardown fault injection"]
+    async fn buffered_pipeline_cancellation_collects_a_sibling_teardown_failure() {
+        let marker = pipeline_marker("buffered_cancel");
+        let producer_pid = pipeline_marker("buffered_cancel_producer");
+        let consumer_pid = pipeline_marker("buffered_cancel_consumer");
+        for path in [&marker, &producer_pid, &consumer_pid] {
+            let _ = std::fs::remove_file(path);
+        }
+        let token = crate::CancellationToken::new();
+        let pipeline = cancellable_marked_pipeline(&marker, &producer_pid, &consumer_pid)
+            .cancel_on(token.clone());
+        let task = tokio::spawn(async move { pipeline.output_string().await });
+        wait_for_pipeline_marker(&marker).await;
+        let pids = read_pipeline_pids(&[&producer_pid, &consumer_pid]).await;
+        let faults = crate::sys::fault_injection::Faults::new()
+            .fail_from_nth(
+                crate::sys::fault_injection::Site::ProcessGroupTeardown,
+                Some("hard"),
+                2,
+                5,
+            )
+            .arm();
+
+        let started = tokio::time::Instant::now();
+        token.cancel();
+        let error = tokio::time::timeout(Duration::from_secs(10), task)
+            .await
+            .expect("buffered sibling disposition collection must stay bounded")
+            .expect("pipeline task")
+            .expect_err("a sibling teardown failure must outrank cancellation");
+        assert!(started.elapsed() < Duration::from_secs(10));
+        match error.reason() {
+            crate::ErrorReason::Teardown { cause, source, .. } => {
+                assert_eq!(*cause, crate::TeardownCause::Cancellation);
+                assert_eq!(source.raw_os_error(), Some(5));
+            }
+            other => panic!("expected sibling cancellation Teardown, got {other:?}"),
+        }
+        assert!(
+            faults.matched(crate::sys::fault_injection::Site::ProcessGroupTeardown) >= 2,
+            "one stage must confirm cancellation before its sibling teardown fails"
+        );
+        drop(faults);
+        assert_pipeline_pids_gone(&pids).await;
+        for path in [&marker, &producer_pid, &consumer_pid] {
+            let _ = std::fs::remove_file(path);
+        }
+    }
+
+    #[cfg(feature = "process-control")]
+    #[tokio::test(flavor = "current_thread")]
+    #[ignore = "spawns a real live pipeline for cancellation teardown fault injection"]
+    async fn live_pipeline_cancellation_collects_a_sibling_teardown_failure() {
+        let marker = pipeline_marker("live_cancel");
+        let producer_pid = pipeline_marker("live_cancel_producer");
+        let consumer_pid = pipeline_marker("live_cancel_consumer");
+        for path in [&marker, &producer_pid, &consumer_pid] {
+            let _ = std::fs::remove_file(path);
+        }
+        let token = crate::CancellationToken::new();
+        let session = cancellable_marked_pipeline(&marker, &producer_pid, &consumer_pid)
+            .cancel_on(token.clone())
+            .start()
+            .await
+            .expect("start cancellable live pipeline");
+        wait_for_pipeline_marker(&marker).await;
+        let pids = read_pipeline_pids(&[&producer_pid, &consumer_pid]).await;
+        let faults = crate::sys::fault_injection::Faults::new()
+            .fail_from_nth(
+                crate::sys::fault_injection::Site::ProcessGroupTeardown,
+                Some("hard"),
+                2,
+                5,
+            )
+            .arm();
+
+        let started = tokio::time::Instant::now();
+        token.cancel();
+        let error = tokio::time::timeout(Duration::from_secs(10), session.finish())
+            .await
+            .expect("live sibling disposition collection must stay bounded")
+            .expect_err("a sibling teardown failure must outrank cancellation");
+        assert!(started.elapsed() < Duration::from_secs(10));
+        match error.reason() {
+            crate::ErrorReason::Teardown { cause, source, .. } => {
+                assert_eq!(*cause, crate::TeardownCause::Cancellation);
+                assert_eq!(source.raw_os_error(), Some(5));
+            }
+            other => panic!("expected sibling cancellation Teardown, got {other:?}"),
+        }
+        assert!(
+            faults.matched(crate::sys::fault_injection::Site::ProcessGroupTeardown) >= 2,
+            "one stage must confirm cancellation before its sibling teardown fails"
+        );
+        drop(faults);
+        assert_pipeline_pids_gone(&pids).await;
+        for path in [&marker, &producer_pid, &consumer_pid] {
+            let _ = std::fs::remove_file(path);
+        }
+    }
+
+    #[cfg(feature = "process-control")]
+    #[tokio::test(flavor = "current_thread")]
+    #[ignore = "spawns a descendant that outlives the pipeline stage while holding output"]
+    async fn buffered_pipeline_finalization_bounds_survivor_held_output_and_salvages_prefix() {
+        let marker = pipeline_marker("survivor_output");
+        let survivor_pid = pipeline_marker("survivor_output_pid");
+        for path in [&marker, &survivor_pid] {
+            let _ = std::fs::remove_file(path);
+        }
+        let pipeline = survivor_held_output_pipeline(&marker, &survivor_pid);
+        let task = tokio::spawn(async move { pipeline.output_string().await });
+        wait_for_pipeline_marker(&marker).await;
+        let survivor = read_pipeline_pids(&[&survivor_pid]).await[0];
+
+        let started = tokio::time::Instant::now();
+        let result = tokio::time::timeout(Duration::from_secs(9), task)
+            .await
+            .expect("pipeline output-pump finalization must remain bounded")
+            .expect("pipeline task")
+            .expect("the direct stages exited successfully");
+        let elapsed = started.elapsed();
+        assert!(
+            elapsed >= Duration::from_secs(4),
+            "the survivor must genuinely hold output through the pump grace: {elapsed:?}"
+        );
+        assert!(elapsed < Duration::from_secs(9));
+        assert!(
+            result.stdout().contains("pipeline-prefix"),
+            "the bounded abort keeps the last-stage prefix: {:?}",
+            result.stdout()
+        );
+        assert!(
+            result.stderr().contains("pipeline-stderr-prefix"),
+            "the bounded abort keeps the stderr prefix: {:?}",
+            result.stderr()
+        );
+        assert_pipeline_pids_gone(&[survivor]).await;
+        for path in [&marker, &survivor_pid] {
+            let _ = std::fs::remove_file(path);
+        }
     }
 
     /// Compile-time proof that sharing the last stage's handle with the standing
@@ -3478,6 +3820,53 @@ mod tests {
             teardown.is_cancelled(),
             "a raw Err must fire teardown so a quiet sibling is unblocked"
         );
+    }
+
+    #[tokio::test]
+    async fn drain_unordered_collects_a_sibling_teardown_after_the_first_raw_error() {
+        let teardown = tokio_util::sync::CancellationToken::new();
+        let sibling_settled = Arc::new(std::sync::atomic::AtomicBool::new(false));
+        let mut tasks: tokio::task::JoinSet<Result<&'static str>> = tokio::task::JoinSet::new();
+        tasks.spawn(async {
+            Err(crate::Error::io(std::io::Error::other(
+                "first cancelled-like error",
+            )))
+        });
+        tasks.spawn({
+            let teardown = teardown.clone();
+            let sibling_settled = sibling_settled.clone();
+            async move {
+                teardown.cancelled().await;
+                sibling_settled.store(true, Ordering::Release);
+                Err(crate::Error::teardown(
+                    "sibling",
+                    crate::TeardownCause::Cancellation,
+                    "process-group hard kill",
+                    std::io::Error::from_raw_os_error(5),
+                    "prefix".into(),
+                    String::new(),
+                    None,
+                ))
+            }
+        });
+
+        let failure =
+            tokio::time::timeout(Duration::from_secs(5), drain_unordered(tasks, &teardown))
+                .await
+                .expect("terminal sibling collection must remain bounded")
+                .expect_err("the retained sibling teardown must fail the drain");
+
+        assert!(
+            sibling_settled.load(Ordering::Acquire),
+            "the first raw error must not abort the sibling disposition task"
+        );
+        match failure.error.reason() {
+            crate::ErrorReason::Teardown { cause, source, .. } => {
+                assert_eq!(*cause, crate::TeardownCause::Cancellation);
+                assert_eq!(source.raw_os_error(), Some(5));
+            }
+            other => panic!("a sibling Teardown must outrank the first raw error: {other:?}"),
+        }
     }
 
     #[tokio::test]

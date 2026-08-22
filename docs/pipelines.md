@@ -326,6 +326,13 @@ errors the pipeline, but
 the pipeline-level builder is the clearer authority.) See
 [Timeouts & cancellation](timeouts-and-cancellation.md).
 
+Cancellation finalization collects the stages' bounded terminal dispositions,
+including siblings that settle after the first `Cancelled` error. If any sibling
+reports an unconfirmed kill/escalation/reap, its `ErrorReason::Teardown`
+deterministically outranks ordinary cancellation, stdin, and output-pump errors;
+the first teardown error observed in completion order supplies the retained OS
+source.
+
 ## Streaming a live chain
 
 The verbs above buffer the whole run. For a long-lived chain you read *from*

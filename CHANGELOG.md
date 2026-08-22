@@ -23,7 +23,9 @@ to a dated version section.
   cannot confirm a terminal child/tree: consuming APIs now return a structured
   `ErrorReason::Teardown` with the initiating cause, original OS error, and
   bounded captured prefix instead of reporting `Timeout`/`Cancelled` over a
-  potentially-live process. Such errors are never retried automatically.
+  potentially-live process. Pipeline cancellation collects bounded sibling
+  terminal dispositions so a sibling teardown failure cannot be hidden by the
+  first ordinary `Cancelled` error. Such errors are never retried automatically.
 - Reject zero PTY dimensions on every platform and dimensions above `i16::MAX`
   on Windows before launch or live resize. ConPTY no longer silently clamps a
   large request while leaving `COLUMNS`/`LINES` at the caller's original values;

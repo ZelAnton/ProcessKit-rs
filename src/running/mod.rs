@@ -3599,6 +3599,46 @@ mod tests {
         }
     }
 
+    fn survivor_held_output_command(marker: &std::path::Path, use_pty: bool) -> Command {
+        #[cfg(unix)]
+        let command = Command::new("sh").args([
+            "-c",
+            &format!(
+                "(trap '' HUP TERM; sleep 60) & survivor=$!; \
+                 printf '%s' \"$survivor\" > '{}'; \
+                 printf 'teardown-prefix\\n'; printf 'teardown-stderr-prefix\\n' >&2; \
+                 sleep 0.25",
+                marker.display()
+            ),
+        ]);
+        #[cfg(windows)]
+        let command = {
+            let marker = marker.display().to_string().replace('\'', "''");
+            Command::new("powershell").args([
+                "-NoLogo",
+                "-NoProfile",
+                "-NonInteractive",
+                "-Command",
+                &format!(
+                    "$child = Start-Process -FilePath 'powershell' \
+                       -ArgumentList @('-NoLogo','-NoProfile','-NonInteractive','-Command', \
+                       'Start-Sleep -Seconds 60') -NoNewWindow -PassThru; \
+                     [IO.File]::WriteAllText('{marker}', [string]$child.Id); \
+                     [Console]::Out.WriteLine('teardown-prefix'); \
+                     [Console]::Error.WriteLine('teardown-stderr-prefix'); \
+                     Start-Sleep -Milliseconds 250"
+                ),
+            ])
+        };
+        #[cfg(feature = "pty")]
+        if use_pty {
+            return command.use_pty();
+        }
+        #[cfg(not(feature = "pty"))]
+        let _ = use_pty;
+        command
+    }
+
     async fn wait_for_marker(marker: &std::path::Path) {
         for _ in 0..500 {
             if marker.exists() {
@@ -3612,6 +3652,50 @@ mod tests {
         );
     }
 
+    async fn read_survivor_pid(marker: &std::path::Path) -> u32 {
+        for _ in 0..500 {
+            if let Ok(text) = std::fs::read_to_string(marker)
+                && let Ok(pid) = text.trim().parse()
+            {
+                return pid;
+            }
+            tokio::time::sleep(Duration::from_millis(10)).await;
+        }
+        panic!("survivor pid was not published: {}", marker.display());
+    }
+
+    #[cfg(feature = "process-control")]
+    async fn cleanup_group_members(group: &ProcessGroup) {
+        group.kill_all().expect("cleanup survivor group");
+        for _ in 0..500 {
+            if group.members().is_ok_and(|members| members.is_empty()) {
+                return;
+            }
+            tokio::time::sleep(Duration::from_millis(10)).await;
+        }
+        panic!("process-group members remained after explicit cleanup");
+    }
+
+    #[cfg(feature = "process-control")]
+    async fn assert_survivor_and_cleanup(group: &ProcessGroup, survivor: u32) {
+        assert!(
+            group.members().expect("members").contains(&survivor),
+            "the descendant must outlive its direct parent while holding output"
+        );
+        assert!(
+            crate::process_is_alive(survivor, None).expect("survivor liveness"),
+            "the survivor must still be alive before explicit cleanup"
+        );
+        cleanup_group_members(group).await;
+        for _ in 0..500 {
+            if !crate::process_is_alive(survivor, None).expect("survivor cleanup liveness probe") {
+                return;
+            }
+            tokio::time::sleep(Duration::from_millis(10)).await;
+        }
+        panic!("survivor {survivor} remained after explicit group cleanup");
+    }
+
     fn assert_teardown_error(error: &Error, expected: TeardownCause, expected_operation: &str) {
         match error.reason() {
             ErrorReason::Teardown {
@@ -3619,6 +3703,7 @@ mod tests {
                 operation,
                 source,
                 stdout,
+                stderr,
                 ..
             } => {
                 assert_eq!(*cause, expected);
@@ -3627,6 +3712,10 @@ mod tests {
                 assert!(
                     stdout.contains("teardown-prefix"),
                     "the bounded drain must retain the prefix: {stdout:?}"
+                );
+                assert!(
+                    stderr.is_empty() || stderr.contains("teardown-stderr-prefix"),
+                    "the bounded drain must retain the stderr prefix when emitted: {stderr:?}"
                 );
             }
             other => panic!("expected Teardown, got {other:?}"),
@@ -3719,18 +3808,20 @@ mod tests {
         let _ = std::fs::remove_file(marker);
     }
 
+    #[cfg(feature = "process-control")]
     #[tokio::test(flavor = "current_thread")]
     #[ignore = "spawns a real owned-group child for deterministic kill fault injection"]
     async fn whole_group_hard_kill_failure_outranks_cancellation() {
         let marker = marker_path("group_hard_kill");
         let token = crate::CancellationToken::new();
-        let run = live_command(&marker, false)
+        let run = survivor_held_output_command(&marker, false)
             .cancel_on(token.clone())
             .start()
             .await
             .expect("start owned-group child");
         wait_for_marker(&marker).await;
-        tokio::time::pause();
+        let survivor = read_survivor_pid(&marker).await;
+        let group = run.own_group_handle().expect("owned process group");
         let faults = crate::sys::fault_injection::Faults::new()
             .fail_every(
                 crate::sys::fault_injection::Site::ProcessGroupTeardown,
@@ -3739,11 +3830,17 @@ mod tests {
             )
             .arm();
 
+        let started = tokio::time::Instant::now();
         token.cancel();
-        let error = run
-            .output_string()
+        let error = tokio::time::timeout(Duration::from_secs(9), run.output_string())
             .await
+            .expect("hard-failure output finalization must remain bounded")
             .expect_err("an unconfirmed group kill must fail closed");
+        let elapsed = started.elapsed();
+        assert!(
+            elapsed >= Duration::from_secs(4),
+            "the survivor must hold the pumps through their bounded grace: {elapsed:?}"
+        );
         assert_teardown_error(
             &error,
             TeardownCause::Cancellation,
@@ -3753,6 +3850,8 @@ mod tests {
             faults.fired(crate::sys::fault_injection::Site::ProcessGroupTeardown),
             1
         );
+        assert_survivor_and_cleanup(&group, survivor).await;
+        drop(faults);
         let _ = std::fs::remove_file(marker);
     }
 
@@ -3830,18 +3929,21 @@ mod tests {
         let _ = std::fs::remove_file(marker);
     }
 
+    #[cfg(feature = "process-control")]
     #[tokio::test(flavor = "current_thread")]
     #[ignore = "spawns a real owned-group child for deterministic graceful fault injection"]
     async fn graceful_group_failure_outranks_cancellation() {
         let marker = marker_path("group_graceful");
         let token = crate::CancellationToken::new();
-        let run = live_command(&marker, false)
+        let run = survivor_held_output_command(&marker, false)
             .cancel_on(token.clone())
             .cancel_grace(Duration::from_secs(1))
             .start()
             .await
             .expect("start graceful child");
         wait_for_marker(&marker).await;
+        let survivor = read_survivor_pid(&marker).await;
+        let group = run.own_group_handle().expect("owned process group");
         let faults = crate::sys::fault_injection::Faults::new()
             .fail_every(
                 crate::sys::fault_injection::Site::ProcessGroupTeardown,
@@ -3850,11 +3952,17 @@ mod tests {
             )
             .arm();
 
+        let started = tokio::time::Instant::now();
         token.cancel();
-        let error = run
-            .output_string()
+        let error = tokio::time::timeout(Duration::from_secs(9), run.output_string())
             .await
+            .expect("graceful-failure output finalization must remain bounded")
             .expect_err("an unconfirmed graceful escalation must fail closed");
+        let elapsed = started.elapsed();
+        assert!(
+            elapsed >= Duration::from_secs(4),
+            "the survivor must hold the pumps through their bounded grace: {elapsed:?}"
+        );
         assert_teardown_error(
             &error,
             TeardownCause::Cancellation,
@@ -3864,6 +3972,159 @@ mod tests {
             faults.fired(crate::sys::fault_injection::Site::ProcessGroupTeardown),
             1
         );
+        assert_survivor_and_cleanup(&group, survivor).await;
+        drop(faults);
+        let _ = std::fs::remove_file(marker);
+    }
+
+    #[cfg(all(feature = "pty", feature = "process-control"))]
+    #[tokio::test(flavor = "current_thread")]
+    #[ignore = "spawns an owned-group PTY tree for deterministic hard-kill fault injection"]
+    async fn owned_pty_group_hard_failure_bounds_survivor_output_and_salvages_prefix() {
+        let marker = marker_path("pty_group_hard");
+        let token = crate::CancellationToken::new();
+        #[cfg(unix)]
+        let command = survivor_held_output_command(&marker, true);
+        // A ConPTY root's descendants are terminated/disconnected with that root;
+        // use the long-lived root to cover PTY ownership on Windows, while the Unix
+        // branch separately proves a surviving slave-fd holder below.
+        #[cfg(windows)]
+        let command = live_command(&marker, true);
+        let run = command
+            .cancel_on(token.clone())
+            .start()
+            .await
+            .expect("start owned-group PTY child");
+        wait_for_marker(&marker).await;
+        #[cfg(unix)]
+        let survivor = read_survivor_pid(&marker).await;
+        let group = run.own_group_handle().expect("owned PTY process group");
+        let faults = crate::sys::fault_injection::Faults::new()
+            .fail_every(
+                crate::sys::fault_injection::Site::ProcessGroupTeardown,
+                Some("hard"),
+                5,
+            )
+            .arm();
+
+        let started = tokio::time::Instant::now();
+        token.cancel();
+        let error = tokio::time::timeout(Duration::from_secs(9), run.output_string())
+            .await
+            .expect("PTY hard-failure finalization must remain bounded")
+            .expect_err("an unconfirmed PTY group kill must fail closed");
+        let elapsed = started.elapsed();
+        // Unix descendants retain the slave fd and exercise the pump deadline.
+        // ConPTY closes the root's terminal stream when that root exits even while
+        // the separately tracked Job member survives, so Windows proves the PTY
+        // disposition/prefix/cleanup axes without a false open-descriptor premise.
+        #[cfg(unix)]
+        assert!(
+            elapsed >= Duration::from_secs(4),
+            "the PTY survivor must hold output through the bounded grace: {elapsed:?}"
+        );
+        assert!(elapsed < Duration::from_secs(9));
+        assert_teardown_error(
+            &error,
+            TeardownCause::Cancellation,
+            "process-group hard kill",
+        );
+        assert_eq!(
+            faults.fired(crate::sys::fault_injection::Site::ProcessGroupTeardown),
+            1
+        );
+        #[cfg(unix)]
+        assert_survivor_and_cleanup(&group, survivor).await;
+        #[cfg(windows)]
+        assert!(
+            group
+                .members()
+                .expect("members after PTY teardown")
+                .is_empty(),
+            "the failed group primitive must not hide a live ConPTY root after direct-child kill"
+        );
+        drop(faults);
+        let _ = std::fs::remove_file(marker);
+    }
+
+    #[cfg(all(feature = "pty", feature = "process-control"))]
+    #[tokio::test(flavor = "current_thread")]
+    #[ignore = "spawns an owned-group PTY tree for deterministic graceful fault injection"]
+    async fn owned_pty_group_graceful_failure_bounds_survivor_output_and_salvages_prefix() {
+        let marker = marker_path("pty_group_graceful");
+        let token = crate::CancellationToken::new();
+        #[cfg(unix)]
+        let command = survivor_held_output_command(&marker, true);
+        #[cfg(windows)]
+        let command = live_command(&marker, true);
+        let run = command
+            .cancel_on(token.clone())
+            .cancel_grace(Duration::from_secs(1))
+            .start()
+            .await
+            .expect("start graceful owned-group PTY child");
+        wait_for_marker(&marker).await;
+        #[cfg(unix)]
+        let survivor = read_survivor_pid(&marker).await;
+        let group = run.own_group_handle().expect("owned PTY process group");
+        let faults = crate::sys::fault_injection::Faults::new()
+            .fail_every(
+                crate::sys::fault_injection::Site::ProcessGroupTeardown,
+                Some("graceful"),
+                5,
+            )
+            .arm();
+
+        let started = tokio::time::Instant::now();
+        token.cancel();
+        let finish_bound = if cfg!(windows) {
+            Duration::from_secs(14)
+        } else {
+            Duration::from_secs(9)
+        };
+        let error = tokio::time::timeout(finish_bound, run.output_string())
+            .await
+            .expect("PTY graceful-failure finalization must remain bounded")
+            .expect_err("an unconfirmed PTY graceful escalation must fail closed");
+        let elapsed = started.elapsed();
+        #[cfg(unix)]
+        assert!(
+            elapsed >= Duration::from_secs(4),
+            "the PTY survivor must hold output through the bounded grace: {elapsed:?}"
+        );
+        assert!(elapsed < finish_bound);
+        assert_teardown_error(
+            &error,
+            TeardownCause::Cancellation,
+            "process-group graceful escalation",
+        );
+        assert_eq!(
+            faults.fired(crate::sys::fault_injection::Site::ProcessGroupTeardown),
+            1
+        );
+        #[cfg(unix)]
+        {
+            assert_survivor_and_cleanup(&group, survivor).await;
+            drop(faults);
+        }
+        #[cfg(windows)]
+        {
+            drop(faults);
+            if !group
+                .members()
+                .expect("members after PTY teardown")
+                .is_empty()
+            {
+                cleanup_group_members(&group).await;
+            }
+            assert!(
+                group
+                    .members()
+                    .expect("members after PTY cleanup")
+                    .is_empty(),
+                "the PTY graceful-failure case must leave no survivor"
+            );
+        }
         let _ = std::fs::remove_file(marker);
     }
 
