@@ -99,10 +99,13 @@ impl RunningProcess {
     /// [`finish`](Self::finish). With the default policy, stderr from a long-lived
     /// or chatty process grows in memory until `finish`; configure a bounded policy
     /// when that is a concern. The command's [`timeout`](crate::Command::timeout)
-    /// bounds the stream: at the deadline the process tree is killed, pipes close,
-    /// and a following
+    /// bounds the stream: at the deadline terminal teardown is attempted and a
+    /// following
     /// [`finish`](Self::finish) reports [`Outcome::TimedOut`]
-    /// even if the child caught the signal and exited cleanly within the grace.
+    /// after it is confirmed, even if the child caught the signal and exited
+    /// cleanly within the grace. A kill/escalation/reap failure instead makes
+    /// `finish` return [`ErrorReason::Teardown`](crate::ErrorReason::Teardown)
+    /// with the bounded captured prefix.
     ///
     /// Returns `Err` instead of a silently-empty stream when stdout was not piped
     /// or a readiness/streaming call already started its one line pump.
@@ -343,6 +346,7 @@ impl RunningProcess {
                 // be to bound the timeout.
                 let timeout_state = self.timeout_state.clone();
                 let gate = self.pid_gate.clone();
+                let teardown_failure = self.teardown_failure.clone();
                 self.deadline_task = Some(tokio::spawn(async move {
                     if !super::deadline::wait_deadline_and_claim(started, limit, &timeout_state)
                         .await
@@ -364,11 +368,33 @@ impl RunningProcess {
                         Some(group) => match grace {
                             Some(grace) => match group.upgrade() {
                                 Some(group) => {
-                                    let _ = group.graceful_terminate(grace, signal).await;
+                                    if let Err(source) =
+                                        super::group_graceful_kill(&group, grace, signal).await
+                                    {
+                                        super::record_teardown_failure(
+                                            &teardown_failure,
+                                            super::TeardownFailure {
+                                                cause: super::TeardownCause::Timeout,
+                                                operation: "process-group graceful escalation",
+                                                source,
+                                            },
+                                        );
+                                    }
                                 }
                                 None => force_kill(&gate), // group already gone
                             },
-                            None => kill_via_weak(&group, &gate),
+                            None => {
+                                if let Err(source) = kill_via_weak(&group, &gate) {
+                                    super::record_teardown_failure(
+                                        &teardown_failure,
+                                        super::TeardownFailure {
+                                            cause: super::TeardownCause::Timeout,
+                                            operation: "process-group hard kill",
+                                            source,
+                                        },
+                                    );
+                                }
+                            }
                         },
                         // Shared group: pid-only teardown (grandchildren of a
                         // forking child are the shared-group teardown gap — pair a
@@ -415,6 +441,7 @@ impl RunningProcess {
         let activity = self.output_activity.clone();
         let timeout_state = self.timeout_state.clone();
         let gate = self.pid_gate.clone();
+        let teardown_failure = self.teardown_failure.clone();
         self.inactivity_task = Some(tokio::spawn(async move {
             activity.wait_for_inactivity(limit).await;
             if !super::deadline::claim_inactivity_timed_out(&timeout_state) {
@@ -427,11 +454,33 @@ impl RunningProcess {
                 Some(group) => match grace {
                     Some(grace) => match group.upgrade() {
                         Some(group) => {
-                            let _ = group.graceful_terminate(grace, signal).await;
+                            if let Err(source) =
+                                super::group_graceful_kill(&group, grace, signal).await
+                            {
+                                super::record_teardown_failure(
+                                    &teardown_failure,
+                                    super::TeardownFailure {
+                                        cause: super::TeardownCause::InactivityTimeout,
+                                        operation: "process-group graceful escalation",
+                                        source,
+                                    },
+                                );
+                            }
                         }
                         None => force_kill(&gate),
                     },
-                    None => kill_via_weak(&group, &gate),
+                    None => {
+                        if let Err(source) = kill_via_weak(&group, &gate) {
+                            super::record_teardown_failure(
+                                &teardown_failure,
+                                super::TeardownFailure {
+                                    cause: super::TeardownCause::InactivityTimeout,
+                                    operation: "process-group hard kill",
+                                    source,
+                                },
+                            );
+                        }
+                    }
                 },
                 None => match grace {
                     Some(grace) => spawn_graceful_kill_and_reap(gate, grace, signal),
@@ -462,6 +511,9 @@ impl RunningProcess {
     /// [`outcome`](Finished::outcome), not raised. The `Err` cases are
     /// [`ErrorReason::Cancelled`](crate::ErrorReason::Cancelled) (the run was cancelled via
     /// [`Command::cancel_on`](crate::Command::cancel_on)),
+    /// [`ErrorReason::Teardown`](crate::ErrorReason::Teardown) (the terminal
+    /// timeout/cancellation kill, escalation, or reap was not confirmed; this
+    /// outranks the initiating disposition and retains available diagnostics),
     /// [`ErrorReason::OutputTooLarge`](crate::ErrorReason::OutputTooLarge) (a fail-loud
     /// [`OutputBufferPolicy`](crate::OutputBufferPolicy) overflowed on a sink the
     /// caller opted into by streaming — a bare `finish` discards untouched stdout
@@ -540,6 +592,28 @@ impl RunningProcess {
         // Re-observe stdin after the pumps drained: a writer that failed inside
         // the teardown window is only visible now (see `finalize_stdin_task`).
         self.finalize_stdin_task().await;
+        // A live `events()` stream already delivered stderr to the caller; other
+        // finishers retain it here so an unconfirmed teardown does not discard the
+        // diagnostic prefix the bounded drain salvaged.
+        let stderr = if self.merged_events_stream {
+            String::new()
+        } else {
+            self.stderr_sink
+                .as_ref()
+                .map(|sink| sink.drain().join("\n"))
+                .unwrap_or_default()
+        };
+        if self
+            .teardown_failure
+            .lock()
+            .expect("teardown failure slot poisoned")
+            .is_some()
+        {
+            let error = self
+                .take_teardown_error(String::new(), stderr, None)
+                .expect("teardown failure was observed under the same slot lock");
+            return Err(error);
+        }
         let outcome = self.checked_outcome(raw_outcome)?;
         // Skip the stdout overflow check when stdout went to the discard sink: the
         // caller didn't ask to capture it, so an over-cap flood is not their error
@@ -585,18 +659,6 @@ impl RunningProcess {
         // the same signal `output_string`/`output_bytes` derive `truncated` from.
         // (A flag read, safe to take while a live `events()` stream still pops.)
         let stderr_truncated = self.stderr_sink.as_ref().is_some_and(|s| s.dropped() > 0);
-        // A live `events()` stream delivers stderr to the caller as
-        // `ProcessEvent::Stderr`; do NOT also drain it here, which would race that
-        // stream for the lines. `Finished::stderr` is empty by design for an
-        // events run (the caller already has stderr as events).
-        let stderr = if self.merged_events_stream {
-            String::new()
-        } else {
-            self.stderr_sink
-                .as_ref()
-                .map(|sink| sink.drain().join("\n"))
-                .unwrap_or_default()
-        };
         Ok(Finished {
             outcome,
             stderr,
@@ -716,8 +778,8 @@ impl RunningProcess {
 
 /// Tear down the group if still alive, then best-effort kill the direct child
 /// through the gate (a no-op if the owner already retired the pid).
-pub(super) fn kill_via_weak(group: &Weak<ProcessGroup>, gate: &PidGate) {
-    if let Some(group) = group.upgrade() {
+pub(super) fn kill_via_weak(group: &Weak<ProcessGroup>, gate: &PidGate) -> std::io::Result<()> {
+    let result = if let Some(group) = group.upgrade() {
         // On Linux + legacy/restricted cgroup this can synchronously block
         // this worker thread up to ~100ms — accepted, not routed through
         // `spawn_blocking`; see the sweep loop in `Cgroup::kill`
@@ -725,9 +787,12 @@ pub(super) fn kill_via_weak(group: &Weak<ProcessGroup>, gate: &PidGate) {
         // every backend: FreeBSD's reaper keeps its post-kill corpse drain in
         // `Drop` alone (see `DRAIN_BUDGET`, src/sys/freebsd.rs), so this call
         // does not block there at all.
-        let _ = group.kill_all();
-    }
+        super::group_hard_kill(&group)
+    } else {
+        Ok(())
+    };
     force_kill(gate);
+    result
 }
 
 /// Gracefully terminate (and let the runtime reap) a single child by pid — the

@@ -224,8 +224,10 @@ pub struct Command {
     stdout_terminator_explicit: bool,
     #[cfg(feature = "pty")]
     stderr_terminator_explicit: bool,
-    /// When cancelled, the run's tree is killed and every consuming path
-    /// resolves to `ErrorReason::Cancelled`. Cheap to clone (internally `Arc`'d), so
+    /// When cancelled, every consuming path tears the run down and resolves to
+    /// `ErrorReason::Cancelled` after terminal state is confirmed (or
+    /// `ErrorReason::Teardown` if it cannot be confirmed). Cheap to clone
+    /// (internally `Arc`'d), so
     /// a `Command` clone — including each `Pipeline` stage and each
     /// `Supervisor` incarnation — shares the same cancel state.
     cancel_token: Option<tokio_util::sync::CancellationToken>,
@@ -1232,7 +1234,9 @@ impl Command {
     /// Tie this run to `token`: cancelling it kills the process tree and makes
     /// every consuming path (`run`/`output_string`/`output_bytes`/`wait`/
     /// `exit_code`/`probe`/`profile`/`finish` and the streamed
-    /// finishers) resolve to [`ErrorReason::Cancelled`].
+    /// finishers) resolve to [`ErrorReason::Cancelled`] after terminal teardown is
+    /// confirmed. If the OS rejects the required kill/escalation/reap, the path
+    /// fails closed with [`ErrorReason::Teardown`] instead.
     /// In a [`Pipeline`](crate::Pipeline), a token on any stage cancels that
     /// stage and the cancellation errors the whole pipeline (the private
     /// pipeline group tears the other stages down).
@@ -1285,8 +1289,9 @@ impl Command {
     /// the `process-control` feature) to route it through the same
     /// `SIGTERM` → grace → `SIGKILL` ladder as
     /// [`timeout_grace`](Self::timeout_grace) instead, giving the child a chance to
-    /// flush state. The *outcome* is unchanged either way — cancellation stays an
-    /// error on every path; only the manner of the goodbye becomes gentler.
+    /// flush state. The ordinary *outcome* is unchanged either way — confirmed
+    /// cancellation stays an error on every path; only the manner of the goodbye
+    /// becomes gentler. An unconfirmed goodbye is [`ErrorReason::Teardown`].
     ///
     /// On a `Command` this **replaces** any previously set token (last write
     /// wins) — contrast the *gap-fill* containers
@@ -1311,10 +1316,11 @@ impl Command {
     ///
     /// **The outcome does not change: cancellation is still always an error.** Every
     /// consuming path still resolves to
-    /// [`ErrorReason::Cancelled`] — whether the child
-    /// exited on the soft signal or was killed after the grace — only the *manner* of
-    /// the teardown becomes gentler, so a child that must flush state, remove a
-    /// pidfile, or finish a transaction gets the chance to. This is the knob for the
+    /// [`ErrorReason::Cancelled`] — whether the child exited on the soft signal or
+    /// was killed after the grace — when terminal teardown is confirmed. A failed
+    /// escalation/reap is [`ErrorReason::Teardown`] instead. Only the *manner* of
+    /// a successful teardown becomes gentler, so a child that must flush state,
+    /// remove a pidfile, or finish a transaction gets the chance to. This is the knob for the
     /// "one shared token, cancelled on Ctrl-C" application-shutdown pattern, where
     /// every child would otherwise be `SIGKILL`ed outright.
     ///
@@ -1382,7 +1388,10 @@ impl Command {
     /// A [`timeout`](Self::timeout) bounds **each attempt**, not the whole retried
     /// operation — there is no total wall-clock ceiling across retries (worst case
     /// ≈ `attempts × timeout` + the sum of the backoffs). Bound the total with
-    /// [`cancel_on`](Self::cancel_on) (a `Cancelled` is terminal — never retried).
+    /// [`cancel_on`](Self::cancel_on) (`Cancelled` and an unconfirmed `Teardown`
+    /// are terminal — never retried).
+    /// [`ErrorReason::Teardown`] is likewise terminal regardless of the classifier:
+    /// its failed attempt may still be live, so starting another copy is unsafe.
     ///
     /// A **one-shot** stdin source
     /// ([`Stdin::from_reader`](crate::Stdin::from_reader) /
@@ -3582,8 +3591,10 @@ impl Command {
     /// timeout, and a signal-kill are *captured* in the returned
     /// [`ProcessResult`] rather than raised (call
     /// [`ensure_success`](crate::ProcessResult::ensure_success) to promote them);
-    /// beyond launch, only [`ErrorReason::Cancelled`] (a cancellation is always
-    /// raised), [`ErrorReason::OutputTooLarge`] (a fail-loud buffer overflowed),
+    /// beyond launch, only [`ErrorReason::Cancelled`] (a confirmed cancellation is
+    /// always raised), [`ErrorReason::Teardown`] (a timeout/cancellation required a
+    /// terminal kill/escalation/reap the OS did not confirm),
+    /// [`ErrorReason::OutputTooLarge`] (a fail-loud buffer overflowed),
     /// [`ErrorReason::Stdin`] (a non-broken-pipe stdin failure on an
     /// otherwise-successful run), and [`ErrorReason::Io`] surface.
     pub async fn output_string(&self) -> Result<ProcessResult<String>> {
@@ -3613,7 +3624,8 @@ impl Command {
     ///
     /// The launch failures listed on [`start`](Self::start), plus — when the run
     /// produced no code — [`ErrorReason::Timeout`] (the deadline elapsed),
-    /// [`ErrorReason::Signalled`] (killed by a signal), or [`ErrorReason::Cancelled`]. A
+    /// [`ErrorReason::Signalled`] (killed by a signal), [`ErrorReason::Cancelled`],
+    /// or [`ErrorReason::Teardown`] (terminal teardown was not confirmed). A
     /// non-zero exit is returned as the code, not raised.
     pub async fn exit_code(&self) -> Result<i32> {
         JobRunner::new().exit_code(self).await
@@ -3630,6 +3642,7 @@ impl Command {
     /// [`ErrorReason::Signalled`] (a signal-kill), [`ErrorReason::Timeout`] (the deadline
     /// elapsed — *raised* here, unlike on
     /// [`output_string`](Self::output_string)), [`ErrorReason::Cancelled`],
+    /// [`ErrorReason::Teardown`] (terminal teardown was not confirmed),
     /// [`ErrorReason::OutputTooLarge`] (a fail-loud buffer truncated the presented
     /// stdout), and [`ErrorReason::Stdin`] (a non-broken-pipe stdin failure on an
     /// otherwise-successful run).
@@ -3648,7 +3661,8 @@ impl Command {
     ///
     /// The same success-checking surface as [`run`](Self::run) —
     /// [`ErrorReason::Exit`] / [`ErrorReason::Signalled`] / [`ErrorReason::Timeout`] /
-    /// [`ErrorReason::Cancelled`] / [`ErrorReason::Stdin`], atop the launch failures on
+    /// [`ErrorReason::Cancelled`] / [`ErrorReason::Teardown`] /
+    /// [`ErrorReason::Stdin`], atop the launch failures on
     /// [`start`](Self::start) — except that, as the lenient building block,
     /// `checked` does **not** fail loud on a bounded-buffer truncation (inspect
     /// [`ProcessResult::truncated`](crate::ProcessResult::truncated) yourself), so
@@ -3666,7 +3680,8 @@ impl Command {
     ///
     /// The same surface as [`checked`](Self::checked) (the launch failures on
     /// [`start`](Self::start) plus [`ErrorReason::Exit`] / [`ErrorReason::Signalled`] /
-    /// [`ErrorReason::Timeout`] / [`ErrorReason::Cancelled`] / [`ErrorReason::Stdin`]); only the
+    /// [`ErrorReason::Timeout`] / [`ErrorReason::Cancelled`] /
+    /// [`ErrorReason::Teardown`] / [`ErrorReason::Stdin`]); only the
     /// captured output is discarded.
     pub async fn run_unit(&self) -> Result<()> {
         JobRunner::new().run_unit(self).await
@@ -3684,7 +3699,7 @@ impl Command {
     /// Any exit code other than `0`/`1` becomes [`ErrorReason::Exit`], and — atop the
     /// launch failures on [`start`](Self::start) — a run that produced no code
     /// errors as [`ErrorReason::Timeout`], [`ErrorReason::Signalled`], or
-    /// [`ErrorReason::Cancelled`]. The strict `0`/`1` contract holds regardless of the
+    /// [`ErrorReason::Cancelled`] or [`ErrorReason::Teardown`]. The strict `0`/`1` contract holds regardless of the
     /// command's [`ok_codes`](Self::ok_codes).
     pub async fn probe(&self) -> Result<bool> {
         JobRunner::new().probe(self).await
@@ -3700,7 +3715,8 @@ impl Command {
     ///
     /// The success-checking surface of [`run`](Self::run) (the launch failures on
     /// [`start`](Self::start), plus [`ErrorReason::Exit`] / [`ErrorReason::Signalled`] /
-    /// [`ErrorReason::Timeout`] / [`ErrorReason::Cancelled`] / [`ErrorReason::Stdin`]), plus
+    /// [`ErrorReason::Timeout`] / [`ErrorReason::Cancelled`] /
+    /// [`ErrorReason::Teardown`] / [`ErrorReason::Stdin`]), plus
     /// [`ErrorReason::OutputTooLarge`] when a fail-loud buffer truncated the stdout the
     /// parser would see. The `parse` closure is infallible, so it adds no error.
     pub async fn parse<T, F>(&self, parse: F) -> Result<T>
@@ -3760,7 +3776,8 @@ impl Command {
     /// The launch failures listed on [`start`](Self::start), plus
     /// [`ErrorReason::Timeout`] when a [`timeout`](Self::timeout) is set and its
     /// deadline elapses mid-stream (which tears the process down),
-    /// [`ErrorReason::Cancelled`], or [`ErrorReason::Io`] while streaming. A stream that ends
+    /// [`ErrorReason::Cancelled`], [`ErrorReason::Teardown`] when terminal
+    /// teardown cannot be confirmed, or [`ErrorReason::Io`] while streaming. A stream that ends
     /// with no match is `Ok(None)`, not an error.
     pub async fn first_line<F>(&self, predicate: F) -> Result<Option<String>>
     where

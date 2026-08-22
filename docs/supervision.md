@@ -482,6 +482,12 @@ A [cancelled](timeouts-and-cancellation.md#cancellation) incarnation is
 could only produce another instantly-cancelled run — the supervisor refuses
 the futile loop.
 
+An `ErrorReason::Teardown` incarnation is terminal too: its child or descendants
+may still be alive because the required kill/escalation/reap was not confirmed,
+so starting a replacement would violate the supervisor's one-incarnation-at-a-time
+contract. The original teardown error is returned without consulting restart
+policy or `give_up_when`.
+
 A [fallible control predicate](#fallible-control-predicates) (`try_stop_when` /
 `try_give_up_when` / `try_health_check`) that returns `Err` is likewise terminal:
 `run()` returns `Err(ErrorReason::Predicate)` — kind `ErrorKind::Predicate`,

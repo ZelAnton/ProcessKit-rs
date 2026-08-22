@@ -77,6 +77,11 @@
 //!   `dup`, a reactor registration); the target label names the owner of the fd
 //!   (`reader`, `writer`, `resize`). This is what makes the post-spawn rollback
 //!   path — otherwise reachable only on an fd-exhausted host — testable.
+//! - `running` / `pipeline` terminal teardown wrappers — the owned child's
+//!   `start_kill` and the process group's hard/graceful teardown calls. Targets
+//!   distinguish `real` / `pty` children and `hard` / `graceful` groups. Async
+//!   tests arming these sites use a current-thread runtime so the thread-local
+//!   scope remains deterministic across awaits.
 //!
 //! A faulted call never reaches the OS at all, which is also what makes a test able
 //! to name a signal it must not actually send.
@@ -91,6 +96,12 @@ use std::io;
 /// unreachable variant can never be armed by mistake.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub(crate) enum Site {
+    /// Run lifecycle: one direct owned-child `start_kill` call. Target label:
+    /// `real` or `pty`.
+    DirectChildKill,
+    /// Run/pipeline lifecycle: one process-group teardown call. Target label:
+    /// `hard` or `graceful`.
+    ProcessGroupTeardown,
     /// Linux: one `write(2)` to a cgroup v2 interface file, through
     /// `sys::linux::cgroup_write`. Target label: the file name.
     #[cfg(target_os = "linux")]
@@ -123,6 +134,8 @@ struct Rule {
     target: Option<&'static str>,
     /// Matching calls still to let through before this rule starts failing.
     skip: usize,
+    /// Matching failures still to inject; `None` means every call after `skip`.
+    remaining: Option<usize>,
     /// The raw OS error a faulted call reports (`EIO`, `ERROR_ACCESS_DENIED`, …).
     errno: i32,
     /// Matching calls seen so far — let through and failed alike.
@@ -163,6 +176,12 @@ pub(crate) fn check(site: Site, target: &str) -> Option<io::Error> {
             if rule.skip > 0 {
                 rule.skip -= 1;
                 return None;
+            }
+            if let Some(remaining) = &mut rule.remaining {
+                if *remaining == 0 {
+                    return None;
+                }
+                *remaining -= 1;
             }
             rule.fired += 1;
             return Some(io::Error::from_raw_os_error(rule.errno));
@@ -211,6 +230,30 @@ impl Faults {
             site,
             target,
             skip: nth - 1,
+            remaining: None,
+            errno,
+            matched: 0,
+            fired: 0,
+        });
+        self
+    }
+
+    /// Let the first `nth - 1` matching calls reach the OS, fail exactly the
+    /// `nth`, then let later calls through again. This keeps teardown-race tests
+    /// deterministic without disabling their real cleanup backstop.
+    pub(crate) fn fail_nth(
+        mut self,
+        site: Site,
+        target: Option<&'static str>,
+        nth: usize,
+        errno: i32,
+    ) -> Self {
+        assert!(nth >= 1, "call ordinals are 1-based; `nth` must be >= 1");
+        self.rules.push(Rule {
+            site,
+            target,
+            skip: nth - 1,
+            remaining: Some(1),
             errno,
             matched: 0,
             fired: 0,
@@ -298,6 +341,18 @@ mod tests {
 
         assert_eq!(injected.raw_os_error(), Some(13));
         assert_eq!(armed.matched(SITE), 2);
+        assert_eq!(armed.fired(SITE), 1);
+    }
+
+    #[test]
+    fn fail_nth_lets_later_calls_through_again() {
+        let armed = Faults::new().fail_nth(SITE, None, 2, 13).arm();
+
+        assert!(check(SITE, "first").is_none(), "call 1 reaches the OS");
+        assert!(check(SITE, "second").is_some(), "call 2 is faulted");
+        assert!(check(SITE, "third").is_none(), "call 3 reaches the OS");
+
+        assert_eq!(armed.matched(SITE), 3);
         assert_eq!(armed.fired(SITE), 1);
     }
 

@@ -500,14 +500,17 @@ async fn main() -> processkit::Result<()> {
 }
 ```
 
-- **`timeout`** kills the whole process tree at the deadline. On the capturing
-  verbs the expiry is *captured* (`ProcessResult::timed_out`), on the
-  success-checking verbs it *raises* `ErrorReason::Timeout` — the full decision
-  table lives in [Timeouts, retries & cancellation](timeouts-and-cancellation.md).
+- **`timeout`** attempts whole-tree teardown at the deadline. After terminal
+  state is confirmed, capturing verbs keep the expiry as data
+  (`ProcessResult::timed_out`) and success-checking verbs raise
+  `ErrorReason::Timeout`; an unconfirmed kill/escalation/reap is
+  `ErrorReason::Teardown` instead. The full decision table lives in
+  [Timeouts, retries & cancellation](timeouts-and-cancellation.md).
 - **`retry`** applies to the success-checking verbs only — `run`, `run_unit`,
   `exit_code`, `probe`, `checked`, `parse`, `try_parse`, and (with `json`)
   `output_json` (each
   runs through the retry loop). The classifier sees the typed error and decides.
+  `Cancelled` and `Teardown` are terminal even when that classifier accepts them.
   The non-erroring `output_string`/`output_bytes` paths never retry, and neither
   does `first_line` (its stream search is single-attempt).
 

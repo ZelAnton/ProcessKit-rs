@@ -6,7 +6,7 @@ use crate::{
     ErrorKind, LimitKind, LimitReason, LimitVerdict, LineTerminator, Mechanism, Outcome,
     OutputLine, OutputStream, OverflowMode, ParentDeathCleanup, Priority, ProcessEvent,
     RestartPolicy, RlimitResource, Signal, SoftSignal, SoftStopScope, StdioMode, StopReason,
-    SupervisionEvent,
+    SupervisionEvent, TeardownCause,
 };
 
 struct Variant {
@@ -274,6 +274,7 @@ fn dictionary() -> Vec<EnumSpec> {
                     Unsupported,
                     Timeout,
                     Cancelled,
+                    Teardown,
                     Predicate,
                     Exit,
                     Signalled,
@@ -281,6 +282,21 @@ fn dictionary() -> Vec<EnumSpec> {
                 ]
             ),
             |value| value.name(),
+        ),
+        configurable(
+            "processkit::TeardownCause",
+            &curated!(
+                TeardownCause,
+                [
+                    Timeout,
+                    InactivityTimeout,
+                    Cancellation,
+                    ExplicitKill,
+                    PipelineFailure
+                ]
+            ),
+            |value| value.name(),
+            TeardownCause::from_name,
         ),
         report_only(
             "processkit::ProcessEvent",

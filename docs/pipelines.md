@@ -301,11 +301,14 @@ async fn main() -> processkit::Result<()> {
 }
 ```
 
-- **`Pipeline::timeout`** bounds the whole chain: at the deadline every
-  stage's sub-group is torn down and the result reports `timed_out`. The
+- **`Pipeline::timeout`** bounds the whole chain: at the deadline teardown is
+  attempted for every stage sub-group and, when confirmed, the result reports
+  `timed_out`. The
   result keeps best-effort stdout and stderr already captured by the final
   stage before teardown, subject to the same buffer/truncation policy as a
-  normal capture.
+  normal capture. If any group kill is rejected, the call fails closed with
+  `ErrorReason::Teardown` (`TeardownCause::Timeout`) and retains that prefix
+  instead of claiming a timed-out result over a potentially-live stage.
 - A **per-stage `Command::timeout`** kills that stage's *whole subtree* — its
   own sub-group, grandchildren of a forking `sh -c …` included, not just its
   direct child. Every stage is evaluated by the same pipefail rule (D14): a
@@ -316,11 +319,22 @@ async fn main() -> processkit::Result<()> {
 Cancellation has two forms. **`Pipeline::cancel_on(token)`** is the chain-level
 control: the token **gap-fills** into every stage that doesn't already carry its
 own `Command::cancel_on` (an explicit per-stage token is left intact), so firing
-it tears the whole chain down and the run resolves to `ErrorReason::Cancelled`. (A
+it tears the whole chain down and the run resolves to `ErrorReason::Cancelled`
+after confirmed teardown; a refused terminal step is `ErrorReason::Teardown`. (A
 `cancel_on` token on an individual stage `Command` also cancels that stage and
 errors the pipeline, but
 the pipeline-level builder is the clearer authority.) See
 [Timeouts & cancellation](timeouts-and-cancellation.md).
+
+Cancellation finalization collects the stages' bounded terminal dispositions,
+including siblings that settle after the first `Cancelled` error. If any sibling
+reports an unconfirmed kill/escalation/reap, its `ErrorReason::Teardown`
+deterministically outranks ordinary cancellation, stdin, and output-pump errors;
+the first teardown error observed in completion order supplies the retained OS
+source. A failed fallback group kill also keeps the cause latched when proactive
+teardown first fired: stage-local or chain cancellation reports
+`TeardownCause::Cancellation`, while an earlier stage failure remains
+`TeardownCause::PipelineFailure` even if a token fires during the drain grace.
 
 ## Streaming a live chain
 
@@ -376,14 +390,17 @@ The session mirrors `RunningProcess`:
   (no stdout — you already streamed it). A chain-wide `Pipeline::timeout` that
   elapsed reports `Outcome::TimedOut`; a `Pipeline::cancel_on` that fired while the
   chain was still running surfaces as `ErrorReason::Cancelled` — exactly as in the
-  buffering verbs. As for a single `Command::cancel_on`, that disposition is
+  buffering verbs. An unconfirmed timeout/cancellation/proactive group kill is
+  `ErrorReason::Teardown` and takes priority over the initiating disposition. As
+  for a single `Command::cancel_on`, that disposition is
   **first-observation-wins**: every stage is observed while the session is live
   (each inner stage by its background drain, the last stage by the session's own
   watcher), so a token fired *after* the chain had already ended does not rewrite
   its real outcome into `Cancelled`, even when `finish()` is called afterwards.
 - **`start_kill()`** and **kill-on-drop** — stop the whole chain now, or drop the
-  session and every stage's tree dies. The no-orphan invariant holds for a live
-  chain (including a partially-started one) just as it does for a single process.
+  session and every stage's tree dies. `start_kill()` attempts every stage group
+  and returns `ErrorReason::Teardown` with `TeardownCause::ExplicitKill` when any
+  group rejects the operation; kill-on-drop remains the backstop.
 
 Whole-chain teardown still applies while streaming: **any** stage's checked
 failure proactively tears the chain down (so a quiet upstream can't hold a failed

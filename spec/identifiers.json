@@ -169,10 +169,22 @@
         { "variant": "Unsupported", "identifier": "unsupported" },
         { "variant": "Timeout", "identifier": "timeout" },
         { "variant": "Cancelled", "identifier": "cancelled" },
+        { "variant": "Teardown", "identifier": "teardown" },
         { "variant": "Predicate", "identifier": "predicate" },
         { "variant": "Exit", "identifier": "exit" },
         { "variant": "Signalled", "identifier": "signalled" },
         { "variant": "Other", "identifier": "other" }
+      ]
+    },
+    {
+      "path": "processkit::TeardownCause",
+      "class": "configurable",
+      "variants": [
+        { "variant": "Timeout", "identifier": "timeout" },
+        { "variant": "InactivityTimeout", "identifier": "inactivity_timeout" },
+        { "variant": "Cancellation", "identifier": "cancellation" },
+        { "variant": "ExplicitKill", "identifier": "explicit_kill" },
+        { "variant": "PipelineFailure", "identifier": "pipeline_failure" }
       ]
     },
     {

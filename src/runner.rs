@@ -358,7 +358,6 @@ pub trait ProcessRunnerExt: ProcessRunner {
         // deadline would abort that watchdog before it fired and strand the child.
         let mut lines = process.stdout_lines()?;
         let search = async move {
-            let _process = process; // keep alive so the watchdog can kill through it
             while let Some(line) = lines.next().await {
                 if predicate(&line) {
                     return Some(line);
@@ -370,10 +369,9 @@ pub trait ProcessRunnerExt: ProcessRunner {
         // end-of-stream commits via the biased `&mut search` arm, so a token that
         // fires an instant after a natural end can't reclassify `Ok(None)` as
         // `Cancelled`. On a firing token we DRAIN the search to its end before
-        // reporting `Cancelled`, rather than dropping it early: `search` owns the
-        // `RunningProcess`, and dropping it aborts the cancel watchdog — the only
-        // thing that kills a shared-group child on cancel — so we keep the process
-        // alive until the watchdog has closed the pipes.
+        // reporting `Cancelled`, rather than dropping it early: keeping the line
+        // stream alive lets the cancel watchdog close the pipes and retain any
+        // terminal teardown failure for `process.finish()` below.
         let raced = async move {
             tokio::pin!(search);
             match cancel {
@@ -383,9 +381,7 @@ pub trait ProcessRunnerExt: ProcessRunner {
                     () = token.cancelled() => {
                         // The cancel watchdog fired its kill the instant the token
                         // did; drain the search to EOF before reporting `Cancelled`
-                        // rather than dropping it early — dropping `search` drops
-                        // the `RunningProcess` and aborts that watchdog before it
-                        // kills (strand-on-cancel). But BOUND the drain: on a
+                        // rather than dropping it early. But BOUND the drain: on a
                         // shared-group handle the watchdog's pid-only kill can't
                         // close a stdout that the direct child's grandchild
                         // inherited and holds open, so the pipe never closes and
@@ -401,8 +397,8 @@ pub trait ProcessRunnerExt: ProcessRunner {
                         // `teardown_grace` (not the deadline's `grace`) is what this
                         // must clear: a `cancel_grace` run's watchdog only kills after
                         // its own grace window, and bounding the drain shorter would
-                        // drop `search` — and with it the handle whose Drop aborts the
-                        // (own-group, inline) graceful teardown — mid-grace.
+                        // stop draining the line stream while the (own-group,
+                        // inline) graceful teardown is still mid-grace.
                         let drain_backstop =
                             teardown_grace.saturating_add(TEARDOWN_BACKSTOP_MARGIN);
                         let _ = tokio::time::timeout(drain_backstop, &mut search).await;
@@ -446,60 +442,95 @@ pub trait ProcessRunnerExt: ProcessRunner {
                 None => std::future::pending::<()>().await,
             }
         };
-        let found = tokio::select! {
+        enum Completion {
+            Search(std::result::Result<Option<String>, ()>),
+            AbsoluteTimeout,
+            InactivityTimeout,
+        }
+        let completion = tokio::select! {
             biased;
-            result = raced => match result {
-                Ok(found) => found,
-                Err(()) => return Err(crate::ErrorReason::Cancelled { program }.into()),
-            },
-            () = absolute_backstop => {
-                return Err(crate::ErrorReason::Timeout {
-                    program,
-                    timeout: timeout.unwrap_or_default(),
-                    inactivity: false,
-                    stdout: String::new(),
-                    stderr: String::new(),
-                    stdout_bytes: None,
-                }.into());
-            }
-            () = inactivity_backstop => {
-                return Err(crate::ErrorReason::Timeout {
-                    program,
-                    timeout: inactivity_timeout.unwrap_or_default(),
-                    inactivity: true,
-                    stdout: String::new(),
-                    stderr: String::new(),
-                    stdout_bytes: None,
-                }.into());
-            }
+            result = raced => Completion::Search(result),
+            () = absolute_backstop => Completion::AbsoluteTimeout,
+            () = inactivity_backstop => Completion::InactivityTimeout,
         };
+
+        match completion {
+            Completion::Search(Err(())) => {
+                // Cancellation outranks stdin/pump failures, but an unconfirmed
+                // terminal teardown outranks cancellation. `finish` reclaims the
+                // watchdog and performs the bounded drain before exposing that
+                // distinction; keeping `process` outside `search` is what makes
+                // this confirmation possible.
+                match process.finish().await {
+                    Err(error) if error.is_teardown() => return Err(error),
+                    Err(error) if error.is_cancelled() => return Err(error),
+                    Ok(_) | Err(_) => {
+                        return Err(crate::ErrorReason::Cancelled { program }.into());
+                    }
+                }
+            }
+            timeout_completion @ (Completion::AbsoluteTimeout | Completion::InactivityTimeout) => {
+                let inactivity = matches!(timeout_completion, Completion::InactivityTimeout);
+                // Timeout/inactivity outranks stdin/pump failures, but not a
+                // potentially-live child/tree. A persistent kill/escalation/reap
+                // failure is retained by `finish` as Teardown; otherwise preserve
+                // first_line's established Timeout classification.
+                if let Err(error) = process.finish().await
+                    && error.is_teardown()
+                {
+                    return Err(error);
+                }
+                return Err(crate::ErrorReason::Timeout {
+                    program,
+                    timeout: if inactivity {
+                        inactivity_timeout.unwrap_or_default()
+                    } else {
+                        timeout.unwrap_or_default()
+                    },
+                    inactivity,
+                    stdout: String::new(),
+                    stderr: String::new(),
+                    stdout_bytes: None,
+                }
+                .into());
+            }
+            Completion::Search(Ok(found)) => {
+                // Continue with the arbiter classification below.
+                if found.is_some() {
+                    return Ok(found);
+                }
+            }
+        }
         // Distinguish a deadline kill (arbiter `TS_TIMED_OUT`, set before the kill,
-        // so the child is already dead when the stream closed) from a natural end.
+        // so the teardown was already attempted when the stream closed) from a
+        // natural end. `finish` below decides whether that attempt was confirmed.
         // In the narrow tie where a cancel token also fired in the same poll that
         // saw the deadline-closed stream, the biased search-first arm already
         // committed `Ok(None)` here, so this surfaces as `Timeout` rather than
         // `Cancelled` — the arbiter is a committed record of the deadline, whereas
         // re-reading the token would reintroduce the natural-end-vs-late-token race
         // the drain fixed. Both still error; a retry re-hits the cancel short-circuit.
-        if found.is_none() {
-            let (timeout, inactivity) = match arbiter.load(std::sync::atomic::Ordering::Acquire) {
-                crate::running::TS_TIMED_OUT => (timeout.unwrap_or_default(), false),
-                crate::running::TS_INACTIVITY_TIMED_OUT => {
-                    (inactivity_timeout.unwrap_or_default(), true)
-                }
-                _ => return Ok(found),
-            };
-            return Err(crate::ErrorReason::Timeout {
-                program,
-                timeout,
-                inactivity,
-                stdout: String::new(),
-                stderr: String::new(),
-                stdout_bytes: None,
+        let (timeout, inactivity) = match arbiter.load(std::sync::atomic::Ordering::Acquire) {
+            crate::running::TS_TIMED_OUT => (timeout.unwrap_or_default(), false),
+            crate::running::TS_INACTIVITY_TIMED_OUT => {
+                (inactivity_timeout.unwrap_or_default(), true)
             }
-            .into());
+            _ => return Ok(None),
+        };
+        if let Err(error) = process.finish().await
+            && error.is_teardown()
+        {
+            return Err(error);
         }
-        Ok(found)
+        Err(crate::ErrorReason::Timeout {
+            program,
+            timeout,
+            inactivity,
+            stdout: String::new(),
+            stderr: String::new(),
+            stdout_bytes: None,
+        }
+        .into())
     }
 }
 
@@ -557,9 +588,11 @@ where
         match attempt().await {
             Ok(value) => return Ok(value),
             Err(err) => {
-                // Cancelled is terminal — token stays cancelled, every retry
-                // would hit the pre-spawn short-circuit again.
-                if err.is_cancelled() {
+                // Cancelled is terminal because the token stays cancelled.
+                // Teardown is terminal because the failed attempt may still be
+                // live; launching another copy would compound the unconfirmed
+                // process tree even when a broad caller classifier says retry.
+                if err.is_cancelled() || err.is_teardown() {
                     return Err(err);
                 }
                 // A one-shot streaming stdin (from_reader/from_lines) feeds a
@@ -1868,6 +1901,85 @@ mod tests {
             1,
             "a cancelled run must not be retried"
         );
+    }
+
+    struct AlwaysTeardown(AtomicU32);
+
+    #[async_trait::async_trait]
+    impl ProcessRunner for AlwaysTeardown {
+        async fn output_string(&self, command: &Command) -> Result<ProcessResult<String>> {
+            self.0.fetch_add(1, Ordering::SeqCst);
+            Err(crate::Error::teardown(
+                command.program().to_string_lossy(),
+                crate::TeardownCause::Timeout,
+                "process-group hard kill",
+                std::io::Error::other("kill refused"),
+                String::new(),
+                String::new(),
+                None,
+            ))
+        }
+    }
+
+    #[tokio::test]
+    async fn unconfirmed_teardown_is_terminal_even_when_the_classifier_accepts() {
+        let runner = AlwaysTeardown(AtomicU32::new(0));
+        let cmd = Command::new("x").retry(5, Duration::ZERO, |_| true);
+        let error = runner
+            .run(&cmd)
+            .await
+            .expect_err("unconfirmed teardown is never retried");
+        assert!(error.is_teardown(), "expected Teardown, got {error:?}");
+        assert_eq!(
+            runner.0.load(Ordering::SeqCst),
+            1,
+            "a potentially-live failed attempt must not be duplicated"
+        );
+    }
+
+    #[tokio::test(flavor = "current_thread")]
+    #[ignore = "spawns a real child for the streamed deadline teardown-failure path"]
+    async fn first_line_surfaces_an_unconfirmed_deadline_teardown() {
+        #[cfg(unix)]
+        let command = Command::new("sh")
+            .args(["-c", "printf 'prefix\\n'; sleep 60"])
+            .timeout(Duration::from_millis(100));
+        #[cfg(windows)]
+        let command = Command::new("powershell")
+            .args([
+                "-NoLogo",
+                "-NoProfile",
+                "-NonInteractive",
+                "-Command",
+                "[Console]::Out.WriteLine('prefix'); Start-Sleep -Seconds 60",
+            ])
+            .timeout(Duration::from_millis(100));
+        let faults = crate::sys::fault_injection::Faults::new()
+            .fail_every(
+                crate::sys::fault_injection::Site::ProcessGroupTeardown,
+                Some("hard"),
+                5,
+            )
+            .arm();
+
+        let error = JobRunner::new()
+            .first_line(&command, |_| false)
+            .await
+            .expect_err("a potentially-live child must not be reported as Timeout");
+        match error.reason() {
+            ErrorReason::Teardown {
+                cause,
+                operation,
+                source,
+                ..
+            } => {
+                assert_eq!(*cause, crate::TeardownCause::Timeout);
+                assert_eq!(*operation, "process-group hard kill");
+                assert_eq!(source.raw_os_error(), Some(5));
+            }
+            other => panic!("expected Teardown, got {other:?}"),
+        }
+        assert!(faults.fired(crate::sys::fault_injection::Site::ProcessGroupTeardown) >= 1);
     }
 
     // The natural-end-of-stream-vs-late-token *race* the E7 change eliminates is

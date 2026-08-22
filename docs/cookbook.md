@@ -136,9 +136,11 @@ async fn main() -> processkit::Result<()> {
 }
 ```
 
-At the deadline the whole tree is killed. On the capture verbs the timeout is
-*captured* (`timed_out()`, partial output kept); on the success-checking verbs
-(`run`, `exit_code`) it surfaces as `ErrorReason::Timeout`.
+At the deadline ProcessKit attempts whole-tree teardown. Once terminal state is
+confirmed, capture verbs keep the timeout as data (`timed_out()`, partial output
+kept) and success-checking verbs (`run`, `exit_code`) surface
+`ErrorReason::Timeout`. A rejected kill/escalation/reap that leaves the tree
+potentially live is `ErrorReason::Teardown` instead.
 
 ## Let a tool clean up on timeout
 
