@@ -75,8 +75,8 @@ const LAST_STAGE_PROBE_MAX: Duration = Duration::from_millis(500);
 /// - **Stdin/stdout at the ends** — the *first* stage's configured
 ///   [`stdin`](Command::stdin) is honored; inner stages' stdin is the pipe
 ///   (any configured source is overridden). Stdout is the mirror image: the
-///   *last* stage's is the chain's output and is honored exactly as
-///   configured, while an inner stage's belongs to the pipe — a
+///   *last* stage's is the chain's output and is honored as configured when that
+///   destination is supported, while an inner stage's belongs to the pipe — a
 ///   [`stdout`](Command::stdout) mode or [`stdout_file`](Command::stdout_file)
 ///   redirect set on a non-final stage goes inert for that run (the file is
 ///   neither created nor truncated, and no stdout observer fires — as none
@@ -86,8 +86,10 @@ const LAST_STAGE_PROBE_MAX: Duration = Duration::from_millis(500);
 ///   [`merge_stderr_in_pipe`](Command::merge_stderr_in_pipe), which sends it
 ///   through the downstream pipe and gives up the separate capture.
 /// - **PTY only at the end** — `Command::use_pty` is supported on the final
-///   stage, whose merged terminal stream remains the pipeline's captured or
-///   streamed stdout. A PTY on any earlier stage is rejected with
+///   stage when both logical output destinations remain `Piped`; its merged
+///   terminal stream is then the pipeline's captured or streamed stdout. Every
+///   PTY stage's destination is checked before the first process starts. A PTY
+///   on any earlier stage retains its more specific rejection with
 ///   [`ErrorReason::Unsupported`](crate::ErrorReason::Unsupported) before the
 ///   first process starts: a PTY master is a terminal session, not a stdout pipe
 ///   that can be handed to the next stage.
@@ -296,7 +298,9 @@ impl Pipeline {
     /// stdout observers — `on_stdout_line`, `stdout_tee`, `stdout_raw_tee` — do not
     /// fire, as they do not on any non-final stage. Stderr keeps its own
     /// configuration, and the **final** stage's stdout, being the chain's output, is
-    /// honoured exactly as configured.
+    /// honoured as configured when that destination is supported. In particular, a
+    /// final `use_pty` stage requires piped logical stdout and stderr; the whole
+    /// chain is validated before any stage starts.
     ///
     /// The one non-final stdout configuration that is rejected instead of overridden
     /// is `use_pty` (the `pty` feature): a PTY master's merged terminal stream cannot
@@ -403,8 +407,9 @@ impl Pipeline {
     /// that carries a redirect for its standalone use reusable as a stage. What it is
     /// **not** is silent data loss: before this, such a stage's output vanished (or
     /// landed in a file) while the next stage started on an immediate EOF and the
-    /// chain reported success. The **final** stage is unaffected — its stdout is the
-    /// chain's output and is honoured exactly as configured.
+    /// chain reported success. The **final** stage's stdout is the chain's output and
+    /// is honoured as configured when that destination is supported. A final
+    /// `use_pty` stage specifically requires piped logical stdout and stderr.
     ///
     /// [`use_pty`](Command::use_pty) on a non-final stage stays a pre-spawn
     /// [`ErrorReason::Unsupported`](crate::ErrorReason::Unsupported) rather than an
@@ -423,6 +428,13 @@ impl Pipeline {
                 operation: format!("pipeline use_pty on non-final stage {}", index + 1),
             }
             .into());
+        }
+        // Validate the complete chain before creating the first group. Keep this
+        // after the topology check above so a non-final PTY retains the more useful
+        // pipeline-specific diagnosis even when its own destination is invalid.
+        #[cfg(feature = "pty")]
+        for stage in &self.stages {
+            stage.ensure_pty_stdio_compatible()?;
         }
         // Wall-clock start of the whole chain, before the first spawn.
         let started = std::time::Instant::now();
@@ -2377,6 +2389,7 @@ mod tests {
     async fn non_final_pty_stage_is_rejected_before_any_spawn() {
         let error = Command::new("never-spawn-first")
             .use_pty()
+            .stdout(crate::StdioMode::Null)
             .pipe(Command::new("never-spawn-second"))
             .start()
             .await
@@ -2388,6 +2401,52 @@ mod tests {
                     if operation.contains("use_pty") && operation.contains("stage 1")
             ),
             "the wiring error must be typed and identify the non-final stage: {error:?}"
+        );
+    }
+
+    #[cfg(feature = "pty")]
+    #[tokio::test]
+    async fn final_pty_destination_is_rejected_before_any_pipeline_spawn_or_file_effect() {
+        let dir = tempfile::tempdir().expect("temp dir");
+        let preserved = dir.path().join("preserved.log");
+        let absent = dir.path().join("never-created.log");
+        std::fs::write(&preserved, "sentinel").expect("seed preserved redirect");
+        let runner = Arc::new(crate::doubles::RecordingRunner::new(
+            crate::doubles::ScriptedRunner::new().fallback(crate::doubles::Reply::not_found()),
+        ));
+        let pipeline = Command::new("never-spawn-producer")
+            .pipe(
+                Command::new("never-spawn-final")
+                    .use_pty()
+                    .stdout_file(&preserved)
+                    .stderr_file(&absent),
+            )
+            .with_test_runner(runner.clone());
+
+        let error = pipeline
+            .start()
+            .await
+            .expect_err("an incompatible final PTY destination must reject the whole chain");
+        assert!(
+            matches!(
+                error.reason(),
+                crate::ErrorReason::Unsupported { operation }
+                    if operation == "use_pty with a non-piped stdout destination"
+            ),
+            "the command-level PTY destination diagnosis must be retained: {error:?}"
+        );
+        assert!(
+            runner.calls().is_empty(),
+            "preflight must not ask the runner to spawn an upstream stage"
+        );
+        assert_eq!(
+            std::fs::read_to_string(&preserved).expect("read preserved redirect"),
+            "sentinel",
+            "preflight must not truncate the configured stdout redirect"
+        );
+        assert!(
+            !absent.exists(),
+            "preflight must not create the configured stderr redirect"
         );
     }
 

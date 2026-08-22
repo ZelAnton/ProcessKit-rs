@@ -139,9 +139,9 @@ The ends of the chain behave like a single `Command`:
 - **Inner** stages read from the pipe, full stop: any `stdin` source or
   `keep_stdin_open` configured on them is overridden.
 - **Inner** stages likewise *write* to the pipe, full stop — see below.
-- The **last** stage's stdout is the chain's own output and is honored exactly as
-  configured (`stdout(Null)`, `stdout_file(..)` and friends all behave as they do on
-  a standalone command).
+- The **last** stage's stdout is the chain's own output and is honored as configured
+  when that destination is supported (`stdout(Null)`, `stdout_file(..)` and friends
+  behave as they do on a standalone non-PTY command).
 - Inner stages' **stderr** is captured per-stage for pipefail diagnostics;
   only the last stage's stdout reaches you. A stage explicitly marked with
   `merge_stderr_in_pipe()` is the exception described below.
@@ -190,6 +190,12 @@ an empty stdin.
 The one non-final stdout configuration that *is* rejected rather than overridden is
 `use_pty()`: a PTY master carries a merged terminal stream that cannot feed a later
 stage at all, so the chain fails before spawn with `ErrorReason::Unsupported`.
+The final stage may use a PTY only with its supported merged `Piped` stdout and
+`Piped` stderr destination; `Inherit`, `Null`, and file redirects are rejected.
+The pipeline checks every PTY stage's destination before it starts any stage, so
+an invalid final-stage destination cannot run an upstream command or open a
+redirect file first. A non-final PTY retains the more specific pipeline-topology
+error because it cannot provide the next stage's stdin pipe at all.
 
 ## Merging a stage's stderr into the pipe
 
