@@ -538,6 +538,14 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
 }
 ```
 
+Dimensions must be non-zero. Windows ConPTY represents each axis in a signed
+16-bit `COORD`, so `1..=32767` is accepted there and larger values fail with
+`ErrorReason::Io` (`InvalidInput`) before a child is spawned or a live terminal
+is resized. Unix `winsize` uses `u16` fields and accepts the full non-zero range
+through `65535`. Values are never clamped: a successful spawn therefore keeps
+the applied terminal geometry and synthesized `COLUMNS`/`LINES` aligned, while
+explicit environment operations retain their documented precedence.
+
 `resize_pty` works while you still hold the handle — typically interleaved with
 driving an owned `stdout_lines()`/`events()` stream and the `take_stdin()` writer
 of a live session. It returns `ErrorReason::Unsupported`
@@ -548,6 +556,8 @@ on **Windows** `ResizePseudoConsole` has no signal, so a console client observes
 the new size on its next console query and conhost may reflow a little later. On a
 non-`use_pty` command `pty_size` is a documented no-op (nothing to size). See
 [platform support](platform-support.md#pty-mode-use_pty-the-pty-feature).
+An invalid resize is checked before the backend call and leaves the live PTY
+usable for a later valid resize.
 Because a running process's environment is immutable, live resize does not
 rewrite `COLUMNS`/`LINES`; applications learn the new size through the platform
 resize mechanism.

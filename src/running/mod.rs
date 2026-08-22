@@ -951,6 +951,11 @@ impl RunningProcess {
     ///
     /// A genuine OS failure of the resize syscall surfaces as
     /// [`ErrorReason::Io`].
+    /// A zero column or row is also an `Io` error with
+    /// [`InvalidInput`](std::io::ErrorKind::InvalidInput). On Windows, where
+    /// ConPTY represents each axis as a signed 16-bit `COORD`, values above
+    /// `i16::MAX` are rejected the same way; Unix accepts every non-zero `u16`.
+    /// Invalid geometry is never clamped and never reaches the live terminal.
     ///
     /// The PTY-variant scripted double ([`ScriptedRunner`](crate::testing::ScriptedRunner)
     /// with [`use_pty`](crate::Command::use_pty)) models this hermetically:
@@ -990,6 +995,7 @@ impl RunningProcess {
                 if exited {
                     return Err(pty_resize_gone(program));
                 }
+                crate::sys::pty::validate_size(cols, rows).map_err(Error::io)?;
                 pty.child_mut().resize(cols, rows).map_err(Error::io)
             }
             // A scripted double answers only when it models a PTY run; the model is
@@ -1002,6 +1008,7 @@ impl RunningProcess {
                 if scripted.has_exited_now() {
                     return Err(pty_resize_gone(program));
                 }
+                crate::sys::pty::validate_size(cols, rows).map_err(Error::io)?;
                 scripted.record_resize(cols, rows);
                 Ok(())
             }
@@ -3161,6 +3168,75 @@ mod tests {
             .start(&cmd)
             .await
             .expect("scripted start")
+    }
+
+    #[cfg(all(feature = "pty", windows))]
+    #[tokio::test]
+    async fn conpty_resize_boundaries_fail_without_recording_or_closing_the_session() {
+        let runner = ScriptedRunner::new().fallback(Reply::pending());
+        let mut run = runner
+            .start(&Command::new("tui").use_pty())
+            .await
+            .expect("scripted PTY start");
+        let max = i16::MAX as u16;
+
+        for (cols, rows) in [
+            (0, 1),
+            (1, 0),
+            (max + 1, 1),
+            (1, max + 1),
+            (u16::MAX, u16::MAX),
+        ] {
+            let error = run
+                .resize_pty(cols, rows)
+                .expect_err("invalid ConPTY resize must fail");
+            assert!(
+                matches!(error.reason(), ErrorReason::Io(source) if source.kind() == std::io::ErrorKind::InvalidInput),
+                "expected Io(InvalidInput) for {cols}x{rows}, got {error:?}"
+            );
+        }
+        assert_eq!(
+            run.scripted_recorded_resizes(),
+            Some(vec![]),
+            "invalid geometry must never be delivered to the backend"
+        );
+
+        run.resize_pty(1, 1)
+            .expect("the live PTY remains usable after refused resizes");
+        run.resize_pty(max, max)
+            .expect("the signed COORD boundary remains valid");
+        assert_eq!(
+            run.scripted_recorded_resizes(),
+            Some(vec![(1, 1), (max, max)])
+        );
+    }
+
+    #[cfg(all(feature = "pty", unix))]
+    #[tokio::test]
+    async fn unix_resize_rejects_zero_but_keeps_large_u16_values() {
+        let runner = ScriptedRunner::new().fallback(Reply::pending());
+        let mut run = runner
+            .start(&Command::new("tui").use_pty())
+            .await
+            .expect("scripted PTY start");
+
+        let error = run
+            .resize_pty(0, 1)
+            .expect_err("zero-sized Unix PTY geometry must fail");
+        assert!(
+            matches!(error.reason(), ErrorReason::Io(source) if source.kind() == std::io::ErrorKind::InvalidInput)
+        );
+        run.resize_pty(i16::MAX as u16 + 1, i16::MAX as u16 + 1)
+            .expect("Unix must not inherit ConPTY's signed-coordinate limit");
+        run.resize_pty(u16::MAX, u16::MAX)
+            .expect("Unix winsize retains the full non-zero u16 range");
+        assert_eq!(
+            run.scripted_recorded_resizes(),
+            Some(vec![
+                (i16::MAX as u16 + 1, i16::MAX as u16 + 1),
+                (u16::MAX, u16::MAX),
+            ])
+        );
     }
 
     /// Install the task slot a real stdin writer uses, without spawning a

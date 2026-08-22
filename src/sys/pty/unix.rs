@@ -56,6 +56,7 @@ impl PtyChild {
     /// gated on the child still running, so this never runs against a torn-down
     /// session.
     pub(crate) fn resize(&self, cols: u16, rows: u16) -> io::Result<()> {
+        super::validate_size(cols, rows)?;
         let winsize = libc::winsize {
             ws_row: rows,
             ws_col: cols,
@@ -157,6 +158,7 @@ fn terminal_eof(fd: &OwnedFd) -> io::Result<u8> {
 /// Open a pseudo-terminal sized `cols`×`rows`, returning the (master, slave) fds
 /// as owned handles.
 fn open_pty(cols: u16, rows: u16) -> io::Result<(OwnedFd, OwnedFd)> {
+    super::validate_size(cols, rows)?;
     let mut master: libc::c_int = -1;
     let mut slave: libc::c_int = -1;
     // The child's initial window size ([`Command::pty_size`], default 80×24 — a

@@ -10,8 +10,8 @@
 //!
 //! The whole module is gated on the `pty` feature (via the `mod` declaration in
 //! `main.rs`). The pre-spawn destination-contract test remains hermetic and runs
-//! normally. Together these prove that invalid destinations have no file/child
-//! side effect, the child sees a terminal (`isatty`), a prompt/response
+//! normally. Together these prove that invalid destinations and geometry have no
+//! file/child side effect, the child sees a terminal (`isatty`), a prompt/response
 //! round-trips over the single master, terminal echo is disabled for secret entry
 //! (Unix), and the PTY child stays contained so kill-on-drop reaps it.
 
@@ -287,6 +287,91 @@ async fn pty_child_receives_terminal_identity_matching_its_initial_size() {
         "identity must match pty_size(101, 37): {:?}",
         sized.stdout()
     );
+
+    let overridden = completes_within(
+        Duration::from_secs(20),
+        "explicit PTY terminal identity overrides",
+        JobRunner::new().output_string(
+            &terminal_identity_probe()
+                .use_pty()
+                .pty_size(101, 37)
+                .env("COLUMNS", "132")
+                .env("LINES", "43"),
+        ),
+    )
+    .await
+    .expect("PTY identity override run");
+    assert!(
+        overridden.stdout().contains("COLUMNS=132") && overridden.stdout().contains("LINES=43"),
+        "explicit env operations must override synthesized PTY identity: {:?}",
+        overridden.stdout()
+    );
+}
+
+#[cfg(windows)]
+#[tokio::test]
+async fn invalid_conpty_spawn_sizes_fail_before_child_side_effects() {
+    let temp = tempfile::tempdir().expect("temp dir");
+    let marker = temp.path().join("child-ran.txt");
+    let escaped = marker.to_string_lossy().replace('\'', "''");
+    let max = i16::MAX as u16;
+
+    for (cols, rows) in [
+        (0, 1),
+        (1, 0),
+        (max + 1, 1),
+        (1, max + 1),
+        (u16::MAX, u16::MAX),
+    ] {
+        let script = format!("Set-Content -LiteralPath '{escaped}' -Value ran");
+        let command = Command::new("powershell")
+            .args(["-NoProfile", "-NonInteractive", "-Command", &script])
+            .use_pty()
+            .pty_size(cols, rows);
+        let error = match JobRunner::new().start(&command).await {
+            Ok(_) => panic!("invalid ConPTY geometry {cols}x{rows} started a child"),
+            Err(error) => error,
+        };
+        assert!(
+            matches!(error.reason(), ErrorReason::Io(source) if source.kind() == std::io::ErrorKind::InvalidInput),
+            "expected Io(InvalidInput) for {cols}x{rows}, got {error:?}"
+        );
+        assert!(
+            !marker.exists(),
+            "a child ran despite rejected {cols}x{rows} ConPTY geometry"
+        );
+    }
+}
+
+#[cfg(windows)]
+#[tokio::test]
+#[ignore = "spawns a real pseudo-terminal"]
+async fn refused_conpty_resizes_leave_the_live_session_usable() {
+    let mut run = JobRunner::new()
+        .start(&sleeper().use_pty())
+        .await
+        .expect("start ConPTY sleeper");
+    let max = i16::MAX as u16;
+
+    for (cols, rows) in [
+        (0, 1),
+        (1, 0),
+        (max + 1, 1),
+        (1, max + 1),
+        (u16::MAX, u16::MAX),
+    ] {
+        let error = run
+            .resize_pty(cols, rows)
+            .expect_err("invalid ConPTY resize must fail");
+        assert!(
+            matches!(error.reason(), ErrorReason::Io(source) if source.kind() == std::io::ErrorKind::InvalidInput),
+            "expected Io(InvalidInput) for {cols}x{rows}, got {error:?}"
+        );
+    }
+
+    run.resize_pty(120, 40)
+        .expect("refused geometry must not damage the live ConPTY");
+    drop(run);
 }
 
 #[cfg(windows)]

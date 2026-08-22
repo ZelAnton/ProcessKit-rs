@@ -22,8 +22,6 @@
 //! Exactly one platform module (`unix.rs` / `windows.rs`) compiles per target,
 //! each exposing the same [`PtyChild`] shape and a `spawn_pty` entry point.
 
-// `io` is used only by the Unix `EofOnEio` adapter below.
-#[cfg(unix)]
 use std::io;
 
 #[cfg_attr(unix, path = "unix.rs")]
@@ -41,6 +39,71 @@ pub(crate) use imp::{PtyChild, spawn_pty};
 /// dimensions a size-querying child expects. Shared by both platform backends so
 /// the "unset → 80×24" rule lives in exactly one place.
 pub(crate) const DEFAULT_PTY_SIZE: (u16, u16) = (80, 24);
+
+/// Validate a PTY geometry before a backend creates or mutates an OS terminal.
+///
+/// A zero axis is not a usable terminal geometry on either backend. Windows has
+/// the additional representational limit imposed by ConPTY's signed [`COORD`]
+/// fields; Unix `winsize` fields are `u16`, so every non-zero `u16` remains valid
+/// there. Public launch/resize seams and both backend entry points call this one
+/// helper so an invalid request cannot be reported as a successful, differently
+/// sized terminal.
+pub(crate) fn validate_size(cols: u16, rows: u16) -> io::Result<()> {
+    if cols == 0 || rows == 0 {
+        return Err(io::Error::new(
+            io::ErrorKind::InvalidInput,
+            format!(
+                "PTY window size must have non-zero columns and rows (requested {cols}x{rows})"
+            ),
+        ));
+    }
+
+    #[cfg(windows)]
+    if cols > i16::MAX as u16 || rows > i16::MAX as u16 {
+        return Err(io::Error::new(
+            io::ErrorKind::InvalidInput,
+            format!(
+                "Windows ConPTY window size cannot exceed {} columns or rows (requested {cols}x{rows})",
+                i16::MAX
+            ),
+        ));
+    }
+
+    Ok(())
+}
+
+#[cfg(test)]
+mod size_tests {
+    use super::validate_size;
+
+    #[test]
+    fn zero_axes_are_invalid_on_every_backend() {
+        for (cols, rows) in [(0, 1), (1, 0), (0, 0)] {
+            let error = validate_size(cols, rows).expect_err("zero-sized PTY axis must fail");
+            assert_eq!(error.kind(), std::io::ErrorKind::InvalidInput);
+        }
+    }
+
+    #[cfg(windows)]
+    #[test]
+    fn conpty_accepts_its_signed_coord_boundary_and_rejects_larger_values() {
+        let max = i16::MAX as u16;
+        assert!(validate_size(1, 1).is_ok());
+        assert!(validate_size(max, max).is_ok());
+        for (cols, rows) in [(max + 1, 1), (1, max + 1), (u16::MAX, u16::MAX)] {
+            let error = validate_size(cols, rows).expect_err("ConPTY COORD overflow must fail");
+            assert_eq!(error.kind(), std::io::ErrorKind::InvalidInput);
+        }
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn unix_keeps_the_full_non_zero_u16_range() {
+        assert!(validate_size(1, 1).is_ok());
+        assert!(validate_size(i16::MAX as u16 + 1, i16::MAX as u16 + 1).is_ok());
+        assert!(validate_size(u16::MAX, u16::MAX).is_ok());
+    }
+}
 
 /// A boxed async reader over the PTY master's **merged** output (stdout+stderr).
 /// Flows through the same [`pump_lines_core`](crate::pump) machinery a real

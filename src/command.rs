@@ -962,6 +962,16 @@ impl Command {
     /// the live terminal geometry but cannot rewrite an already-running
     /// process's environment.
     ///
+    /// # Launch-time errors
+    ///
+    /// A PTY launch rejects a zero column or row as
+    /// [`ErrorReason::Io`] with [`InvalidInput`](std::io::ErrorKind::InvalidInput).
+    /// Windows ConPTY uses signed 16-bit `COORD` fields, so it also rejects either
+    /// axis above `i16::MAX`; Unix keeps the full non-zero `u16` range. Validation
+    /// happens before a child starts and before the synthesized `COLUMNS`/`LINES`
+    /// defaults are materialized, so a successful launch always applies exactly
+    /// the requested geometry.
+    ///
     /// # Only meaningful with `use_pty`
     ///
     /// This is a **PTY-only** knob. On a command that is **not**
@@ -2222,12 +2232,13 @@ impl Command {
         matches!(self.stderr_mode, StdioMode::Piped) && self.stderr_file.is_none()
     }
 
-    /// Reject stdio destinations a single merged PTY master cannot honor.
+    /// Reject a PTY launch configuration the selected backend cannot honor.
     ///
     /// Both the live/double launch boundary and [`build_tokio`](Self::build_tokio)
-    /// call this helper. Keeping the decision here matters especially for file
-    /// redirects: rejection must happen before `build_tokio` opens, creates, or
-    /// truncates a path the PTY slave would immediately replace.
+    /// call this helper. Keeping both the destination and geometry decisions here
+    /// matters especially for file redirects and terminal identity: rejection
+    /// must happen before `build_tokio` opens a path, before a child starts, and
+    /// before invalid dimensions can become synthesized `COLUMNS`/`LINES` values.
     #[cfg(feature = "pty")]
     pub(crate) fn ensure_pty_stdio_compatible(&self) -> Result<()> {
         if !self.use_pty {
@@ -2244,6 +2255,9 @@ impl Command {
                 operation: "use_pty with a separate stderr destination".into(),
             }
             .into());
+        }
+        if let Some((cols, rows)) = self.pty_size {
+            crate::sys::pty::validate_size(cols, rows).map_err(Error::io)?;
         }
         Ok(())
     }
@@ -6383,6 +6397,72 @@ mod tests {
                 .configured_pty_size(),
             Some((200, 50)),
         );
+    }
+
+    #[cfg(feature = "pty")]
+    #[test]
+    fn pty_size_rejects_zero_only_when_pty_mode_is_effective() {
+        for (cols, rows) in [(0, 1), (1, 0), (0, 0)] {
+            let error = Command::new("tui")
+                .use_pty()
+                .pty_size(cols, rows)
+                .ensure_pty_stdio_compatible()
+                .expect_err("zero-sized PTY geometry must fail at launch preflight");
+            assert!(
+                matches!(error.reason(), ErrorReason::Io(source) if source.kind() == std::io::ErrorKind::InvalidInput),
+                "expected Io(InvalidInput) for {cols}x{rows}, got {error:?}"
+            );
+        }
+
+        Command::new("plain")
+            .pty_size(0, 0)
+            .ensure_pty_stdio_compatible()
+            .expect("pty_size remains a documented no-op without use_pty");
+    }
+
+    #[cfg(all(feature = "pty", windows))]
+    #[test]
+    fn conpty_size_preflight_matches_the_signed_coord_range() {
+        let max = i16::MAX as u16;
+        for (cols, rows) in [(1, 1), (max, max)] {
+            Command::new("tui")
+                .use_pty()
+                .pty_size(cols, rows)
+                .ensure_pty_stdio_compatible()
+                .expect("representable ConPTY geometry must pass preflight");
+        }
+
+        for (cols, rows) in [(max + 1, 1), (1, max + 1), (u16::MAX, u16::MAX)] {
+            let error = Command::new("tui")
+                .use_pty()
+                .pty_size(cols, rows)
+                // Environment overrides retain precedence for a valid launch,
+                // but cannot make an unrepresentable OS geometry valid.
+                .env("COLUMNS", "80")
+                .env("LINES", "24")
+                .ensure_pty_stdio_compatible()
+                .expect_err("ConPTY COORD overflow must fail at launch preflight");
+            assert!(
+                matches!(error.reason(), ErrorReason::Io(source) if source.kind() == std::io::ErrorKind::InvalidInput),
+                "expected Io(InvalidInput) for {cols}x{rows}, got {error:?}"
+            );
+        }
+    }
+
+    #[cfg(all(feature = "pty", unix))]
+    #[test]
+    fn unix_pty_size_preflight_keeps_the_full_non_zero_u16_range() {
+        for (cols, rows) in [
+            (1, 1),
+            (i16::MAX as u16 + 1, i16::MAX as u16 + 1),
+            (u16::MAX, u16::MAX),
+        ] {
+            Command::new("tui")
+                .use_pty()
+                .pty_size(cols, rows)
+                .ensure_pty_stdio_compatible()
+                .expect("Unix winsize accepts every non-zero u16 geometry");
+        }
     }
 
     #[cfg(feature = "pty")]
