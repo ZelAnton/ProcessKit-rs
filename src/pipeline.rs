@@ -3148,6 +3148,66 @@ mod tests {
         }
     }
 
+    fn partial_prefix_pipeline(
+        marker: &std::path::Path,
+        producer_pid: &std::path::Path,
+        consumer_pid: &std::path::Path,
+        stdout_prefix: &str,
+        stderr_prefix: &str,
+        token: crate::CancellationToken,
+    ) -> Pipeline {
+        #[cfg(unix)]
+        {
+            let producer = Command::new("sh").args([
+                "-c",
+                &format!(
+                    "printf '%s' \"$$\" > '{}'; sleep 60",
+                    producer_pid.display()
+                ),
+            ]);
+            let consumer = Command::new("sh").args([
+                "-c",
+                &format!(
+                    "printf '%s' '{stdout_prefix}'; printf '%s' '{stderr_prefix}' >&2; \
+                     printf '%s' \"$$\" > '{}'; : > '{}'; sleep 60",
+                    consumer_pid.display(),
+                    marker.display()
+                ),
+            ]);
+            return producer.pipe(consumer.cancel_on(token));
+        }
+        #[cfg(windows)]
+        {
+            let marker = marker.display().to_string().replace('\'', "''");
+            let producer_pid = producer_pid.display().to_string().replace('\'', "''");
+            let consumer_pid = consumer_pid.display().to_string().replace('\'', "''");
+            let producer = Command::new("powershell").args([
+                "-NoLogo",
+                "-NoProfile",
+                "-NonInteractive",
+                "-Command",
+                &format!(
+                    "[IO.File]::WriteAllText('{producer_pid}', [string]$PID); \
+                     Start-Sleep -Seconds 60"
+                ),
+            ]);
+            let consumer = Command::new("powershell").args([
+                "-NoLogo",
+                "-NoProfile",
+                "-NonInteractive",
+                "-Command",
+                &format!(
+                    "[Console]::Out.Write('{stdout_prefix}'); \
+                     [Console]::Error.Write('{stderr_prefix}'); \
+                     [IO.File]::WriteAllText('{consumer_pid}', [string]$PID); \
+                     [IO.File]::WriteAllText('{marker}', 'ready'); \
+                     Start-Sleep -Seconds 60"
+                ),
+            ]);
+            producer.pipe(consumer.cancel_on(token))
+        }
+    }
+
     fn cancellable_marked_pipeline(
         marker: &std::path::Path,
         producer_pid: &std::path::Path,
@@ -3425,6 +3485,189 @@ mod tests {
             _ => unreachable!(),
         }
         drop(faults);
+        assert_pipeline_pids_gone(&pids).await;
+        for path in [&marker, &producer_pid, &consumer_pid] {
+            let _ = std::fs::remove_file(path);
+        }
+    }
+
+    #[cfg(feature = "process-control")]
+    #[tokio::test(flavor = "current_thread")]
+    #[ignore = "spawns a real buffered pipeline for partial-tail production wiring"]
+    async fn buffered_text_failed_confirmation_retains_unterminated_prefixes() {
+        const STDOUT_PREFIX: &str = "text-partial-prefix";
+        const STDERR_PREFIX: &str = "text-partial-stderr";
+        let marker = pipeline_marker("buffered_text_partial");
+        let producer_pid = pipeline_marker("buffered_text_partial_producer");
+        let consumer_pid = pipeline_marker("buffered_text_partial_consumer");
+        for path in [&marker, &producer_pid, &consumer_pid] {
+            let _ = std::fs::remove_file(path);
+        }
+        let token = crate::CancellationToken::new();
+        let mut publications = crate::pump::observe_partial_tail_publications();
+        let pipeline = partial_prefix_pipeline(
+            &marker,
+            &producer_pid,
+            &consumer_pid,
+            STDOUT_PREFIX,
+            STDERR_PREFIX,
+            token.clone(),
+        )
+        .timeout(Duration::from_secs(5));
+        let task = tokio::spawn(async move { pipeline.output_string().await });
+        wait_for_pipeline_marker(&marker).await;
+        let pids = read_pipeline_pids(&[&producer_pid, &consumer_pid]).await;
+        tokio::time::timeout(
+            Duration::from_secs(2),
+            publications.wait_for_all(&[STDOUT_PREFIX, STDERR_PREFIX]),
+        )
+        .await
+        .expect("both text partial tails must reach the production pump seam");
+        let faults = crate::sys::fault_injection::Faults::new()
+            .fail_nth(
+                crate::sys::fault_injection::Site::ProcessGroupTeardown,
+                Some("hard"),
+                1,
+                5,
+            )
+            .arm();
+
+        tokio::time::pause();
+        token.cancel();
+        for _ in 0..1_000 {
+            if faults.fired(crate::sys::fault_injection::Site::ProcessGroupTeardown) == 1 {
+                break;
+            }
+            tokio::task::yield_now().await;
+        }
+        assert_eq!(
+            faults.fired(crate::sys::fault_injection::Site::ProcessGroupTeardown),
+            1
+        );
+        tokio::time::advance(Duration::from_millis(4_950)).await;
+        for _ in 0..1_000 {
+            if task.is_finished() {
+                break;
+            }
+            tokio::task::yield_now().await;
+        }
+        assert!(task.is_finished(), "partial-tail teardown remains bounded");
+        tokio::time::resume();
+
+        let error = task
+            .await
+            .expect("pipeline task")
+            .expect_err("unconfirmed text teardown must fail closed");
+        assert_pipeline_confirmation_source(&error, crate::TeardownCause::Cancellation, 5);
+        match error.reason() {
+            crate::ErrorReason::Teardown { stdout, stderr, .. } => {
+                assert_eq!(stdout, STDOUT_PREFIX);
+                assert_eq!(stderr, STDERR_PREFIX);
+            }
+            _ => unreachable!(),
+        }
+        drop(faults);
+        drop(publications);
+        assert_pipeline_pids_gone(&pids).await;
+        for path in [&marker, &producer_pid, &consumer_pid] {
+            let _ = std::fs::remove_file(path);
+        }
+    }
+
+    #[cfg(feature = "process-control")]
+    #[tokio::test(flavor = "current_thread")]
+    #[ignore = "spawns a real raw pipeline for partial-tail production wiring"]
+    async fn buffered_raw_failed_confirmation_retains_bytes_and_unterminated_stderr() {
+        const STDOUT_PREFIX: &[u8] = b"raw-partial-bytes";
+        const STDERR_PREFIX: &str = "raw-partial-stderr";
+        let marker = pipeline_marker("buffered_raw_partial");
+        let producer_pid = pipeline_marker("buffered_raw_partial_producer");
+        let consumer_pid = pipeline_marker("buffered_raw_partial_consumer");
+        for path in [&marker, &producer_pid, &consumer_pid] {
+            let _ = std::fs::remove_file(path);
+        }
+        let token = crate::CancellationToken::new();
+        let mut tail_publications = crate::pump::observe_partial_tail_publications();
+        let mut raw_publications = crate::running::observe_raw_stdout_publications();
+        let pipeline = partial_prefix_pipeline(
+            &marker,
+            &producer_pid,
+            &consumer_pid,
+            std::str::from_utf8(STDOUT_PREFIX).expect("ASCII test prefix"),
+            STDERR_PREFIX,
+            token.clone(),
+        )
+        .timeout(Duration::from_secs(5));
+        let task = tokio::spawn(async move { pipeline.output_bytes().await });
+        wait_for_pipeline_marker(&marker).await;
+        let pids = read_pipeline_pids(&[&producer_pid, &consumer_pid]).await;
+        tokio::time::timeout(
+            Duration::from_secs(2),
+            tail_publications.wait_for_all(&[STDERR_PREFIX]),
+        )
+        .await
+        .expect("raw stderr partial tail must reach the production pump seam");
+        tokio::time::timeout(
+            Duration::from_secs(2),
+            raw_publications.wait_until_contains(STDOUT_PREFIX),
+        )
+        .await
+        .expect("raw stdout bytes must reach the production capture buffer");
+        let faults = crate::sys::fault_injection::Faults::new()
+            .fail_nth(
+                crate::sys::fault_injection::Site::ProcessGroupTeardown,
+                Some("hard"),
+                1,
+                5,
+            )
+            .arm();
+
+        tokio::time::pause();
+        token.cancel();
+        for _ in 0..1_000 {
+            if faults.fired(crate::sys::fault_injection::Site::ProcessGroupTeardown) == 1 {
+                break;
+            }
+            tokio::task::yield_now().await;
+        }
+        assert_eq!(
+            faults.fired(crate::sys::fault_injection::Site::ProcessGroupTeardown),
+            1
+        );
+        tokio::time::advance(Duration::from_millis(4_950)).await;
+        for _ in 0..1_000 {
+            if task.is_finished() {
+                break;
+            }
+            tokio::task::yield_now().await;
+        }
+        assert!(
+            task.is_finished(),
+            "raw partial-tail teardown remains bounded"
+        );
+        tokio::time::resume();
+
+        let error = task
+            .await
+            .expect("pipeline task")
+            .expect_err("unconfirmed raw teardown must fail closed");
+        assert_pipeline_confirmation_source(&error, crate::TeardownCause::Cancellation, 5);
+        match error.reason() {
+            crate::ErrorReason::Teardown {
+                stdout,
+                stderr,
+                stdout_bytes,
+                ..
+            } => {
+                assert_eq!(stdout.as_bytes(), STDOUT_PREFIX);
+                assert_eq!(stderr, STDERR_PREFIX);
+                assert_eq!(stdout_bytes.as_deref(), Some(STDOUT_PREFIX));
+            }
+            _ => unreachable!(),
+        }
+        drop(faults);
+        drop(tail_publications);
+        drop(raw_publications);
         assert_pipeline_pids_gone(&pids).await;
         for path in [&marker, &producer_pid, &consumer_pid] {
             let _ = std::fs::remove_file(path);

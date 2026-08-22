@@ -118,6 +118,70 @@ fn observe_guard_entry() {
     });
 }
 
+#[cfg(test)]
+thread_local! {
+    static PARTIAL_TAIL_TEST_TX:
+        std::cell::RefCell<Option<tokio::sync::mpsc::UnboundedSender<String>>> =
+        const { std::cell::RefCell::new(None) };
+}
+
+/// Test-only observation of the real pump publication seam. Pipeline regression
+/// tests use it to prove that unterminated stdout/stderr text reached
+/// `SharedLines::partial_tail` before they fire teardown.
+#[cfg(test)]
+pub(crate) struct PartialTailPublicationGuard {
+    receiver: tokio::sync::mpsc::UnboundedReceiver<String>,
+}
+
+#[cfg(test)]
+impl PartialTailPublicationGuard {
+    pub(crate) async fn wait_for_all(&mut self, expected: &[&str]) {
+        let mut remaining: std::collections::BTreeSet<String> =
+            expected.iter().map(|value| (*value).to_owned()).collect();
+        while !remaining.is_empty() {
+            let value = self
+                .receiver
+                .recv()
+                .await
+                .expect("partial-tail publication sender remains installed");
+            remaining.remove(&value);
+        }
+    }
+}
+
+#[cfg(test)]
+impl Drop for PartialTailPublicationGuard {
+    fn drop(&mut self) {
+        PARTIAL_TAIL_TEST_TX.with(|slot| {
+            slot.borrow_mut().take();
+        });
+    }
+}
+
+#[cfg(test)]
+pub(crate) fn observe_partial_tail_publications() -> PartialTailPublicationGuard {
+    let (sender, receiver) = tokio::sync::mpsc::unbounded_channel();
+    PARTIAL_TAIL_TEST_TX.with(|slot| {
+        assert!(
+            slot.borrow_mut().replace(sender).is_none(),
+            "partial-tail publication observer already installed"
+        );
+    });
+    PartialTailPublicationGuard { receiver }
+}
+
+#[cfg(test)]
+fn publish_partial_tail_for_test(tail: &str) {
+    if tail.is_empty() {
+        return;
+    }
+    PARTIAL_TAIL_TEST_TX.with(|slot| {
+        if let Some(sender) = slot.borrow().as_ref() {
+            let _ = sender.send(tail.to_owned());
+        }
+    });
+}
+
 /// A push-style per-line callback (e.g. tee each line to a log).
 pub(crate) type LineHandler = Arc<dyn Fn(&str) + Send + Sync>;
 
@@ -456,6 +520,7 @@ pub(crate) struct SharedLines {
     activity: Arc<OutputActivity>,
 }
 
+#[derive(Clone)]
 struct Inner {
     lines: VecDeque<String>,
     /// Retained-line cap (`OutputBufferPolicy::max_lines`).
@@ -887,6 +952,8 @@ impl SharedLines {
         if changed {
             drop(inner);
             self.publish_change();
+            #[cfg(test)]
+            publish_partial_tail_for_test(tail);
         }
     }
 
@@ -1049,20 +1116,31 @@ impl SharedLines {
         Self::drain_locked(&mut inner)
     }
 
-    /// Clone complete retained lines without consuming the sink. Pipeline
-    /// teardown uses this immediately before a fallback kill: that kill can wake
-    /// the stage finisher and let it drain the same backlog before the chain-level
-    /// error is assembled. Partial tails remain the existing post-kill salvage's
-    /// responsibility; peeking them would risk duplicating a line the live pump
-    /// completes immediately afterwards.
-    pub(crate) fn retained_snapshot(&self) -> Vec<String> {
-        self.inner
-            .lock()
-            .expect("SharedLines poisoned")
-            .lines
-            .iter()
-            .cloned()
-            .collect()
+    /// Clone the retained backlog plus a still-live, not-yet-superseded partial
+    /// tail without consuming or finalizing either. Pipeline teardown uses this
+    /// immediately before a fallback kill: that kill can wake the stage finisher
+    /// and let it drain the live sink before the chain-level error is assembled.
+    ///
+    /// The clone is folded under the sink's single critical section through the
+    /// same retention policy as destructive salvage. The live `Inner`, counters,
+    /// tail seal, and one-consumer backlog remain untouched. A later completed
+    /// line may supersede the cloned tail, but the checkpoint is used only for an
+    /// immediate failed-confirmation return and is never joined to that later
+    /// line, so it cannot duplicate the prefix.
+    pub(crate) fn retained_snapshot(&self, shape: impl FnOnce(String) -> String) -> Vec<String> {
+        let inner = self.inner.lock().expect("SharedLines poisoned");
+        let mut snapshot = inner.clone();
+        if snapshot.partial_tail_pending && !snapshot.partial_tail_finalized {
+            let oversized = snapshot.partial_tail_oversized;
+            let tail = std::mem::take(&mut snapshot.partial_tail);
+            let total_lines = self.count.load(Ordering::Relaxed).saturating_add(1);
+            if oversized {
+                Self::record_oversized_locked(&mut snapshot);
+            } else {
+                Self::retain_line_locked(&mut snapshot, shape(tail), total_lines);
+            }
+        }
+        snapshot.lines.into_iter().collect()
     }
 
     /// The locked half of [`drain`](Self::drain).
@@ -2152,6 +2230,34 @@ mod tests {
             sink.drain_with_partial_tail(|tail| tail),
             vec!["abab".to_owned(), "ab".to_owned()],
         );
+    }
+
+    /// The failed-confirmation checkpoint is a side view, not a second
+    /// consumer: it must shape and include the live tail while leaving backlog,
+    /// tail seal, and accounting untouched for the eventual consuming salvage.
+    #[test]
+    fn retained_snapshot_includes_a_shaped_tail_without_consuming_it() {
+        let sink = SharedLines::new(&OutputBufferPolicy::unbounded());
+        sink.push("complete".to_owned());
+        sink.set_partial_tail("partial");
+
+        let first = sink.retained_snapshot(|tail| format!("shaped:{tail}"));
+        let second = sink.retained_snapshot(|tail| format!("shaped:{tail}"));
+        assert_eq!(first, vec!["complete", "shaped:partial"]);
+        assert_eq!(second, first, "a checkpoint does not consume the tail");
+        assert_eq!(sink.count(), 1, "checkpointing does not count a line");
+        assert_eq!(
+            sink.dropped(),
+            0,
+            "checkpointing does not alter policy state"
+        );
+
+        assert_eq!(
+            sink.drain_with_partial_tail(|tail| format!("shaped:{tail}")),
+            first,
+            "the sole consuming salvage still owns backlog and tail"
+        );
+        assert_eq!(sink.count(), 2, "only consuming salvage counts the tail");
     }
 
     /// The same seal covers an over-cap line the pump *skipped*: without it, a

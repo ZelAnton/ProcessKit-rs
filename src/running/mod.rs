@@ -153,6 +153,76 @@ fn take_backend_wait_failure() -> Option<Arc<DeferredBackendWaitFailure>> {
     BACKEND_WAIT_FAILURE.with(|slot| slot.borrow_mut().take())
 }
 
+#[cfg(test)]
+thread_local! {
+    static RAW_STDOUT_TEST_TX:
+        std::cell::RefCell<Option<tokio::sync::mpsc::UnboundedSender<Vec<u8>>>> =
+        const { std::cell::RefCell::new(None) };
+}
+
+/// Test-only observation of bytes accepted by the production raw stdout pump.
+/// The guard lets pipeline regressions synchronize teardown with a real captured
+/// prefix instead of relying on a scheduler delay after the child wrote it.
+#[cfg(test)]
+pub(crate) struct RawStdoutPublicationGuard {
+    receiver: tokio::sync::mpsc::UnboundedReceiver<Vec<u8>>,
+    observed: Vec<u8>,
+}
+
+#[cfg(test)]
+impl RawStdoutPublicationGuard {
+    pub(crate) async fn wait_until_contains(&mut self, expected: &[u8]) {
+        if expected.is_empty() {
+            return;
+        }
+        while !self
+            .observed
+            .windows(expected.len())
+            .any(|window| window == expected)
+        {
+            let chunk = self
+                .receiver
+                .recv()
+                .await
+                .expect("raw stdout publication sender remains installed");
+            self.observed.extend_from_slice(&chunk);
+        }
+    }
+}
+
+#[cfg(test)]
+impl Drop for RawStdoutPublicationGuard {
+    fn drop(&mut self) {
+        RAW_STDOUT_TEST_TX.with(|slot| {
+            slot.borrow_mut().take();
+        });
+    }
+}
+
+#[cfg(test)]
+pub(crate) fn observe_raw_stdout_publications() -> RawStdoutPublicationGuard {
+    let (sender, receiver) = tokio::sync::mpsc::unbounded_channel();
+    RAW_STDOUT_TEST_TX.with(|slot| {
+        assert!(
+            slot.borrow_mut().replace(sender).is_none(),
+            "raw stdout publication observer already installed"
+        );
+    });
+    RawStdoutPublicationGuard {
+        receiver,
+        observed: Vec::new(),
+    }
+}
+
+#[cfg(test)]
+fn publish_raw_stdout_for_test(chunk: &[u8]) {
+    RAW_STDOUT_TEST_TX.with(|slot| {
+        if let Some(sender) = slot.borrow().as_ref() {
+            let _ = sender.send(chunk.to_vec());
+        }
+    });
+}
+
 /// In-flight byte cap for the discard sink used by `wait`/`profile`. These verbs
 /// retain no lines, but the pump still assembles each line in memory before
 /// discarding it; without a byte cap a newline-free flood (e.g. `base64 -w0`)
@@ -341,8 +411,14 @@ impl LineCapture {
     /// kill. If that kill wakes this capture's finisher, the chain error can still
     /// retain the prefix even though the finisher drains the shared sinks first.
     pub(crate) fn retained_snapshot(&self) -> (String, String, bool, usize, usize) {
-        let stdout = self.stdout.retained_snapshot().join("\n");
-        let stderr = self.stderr.retained_snapshot().join("\n");
+        let stdout = self
+            .stdout
+            .retained_snapshot(|tail| self.stdout_config.shape_capture_line(tail))
+            .join("\n");
+        let stderr = self
+            .stderr
+            .retained_snapshot(|tail| self.stderr_config.shape_capture_line(tail))
+            .join("\n");
         (
             stdout,
             stderr,
@@ -3606,7 +3682,10 @@ impl RawCapture {
     pub(crate) fn retained_snapshot(&self) -> (Vec<u8>, String, bool, usize, usize) {
         let mut stdout = self.out_buf.lock().expect("stdout buffer poisoned").clone();
         clamp_dropoldest_tail(&mut stdout, self.stdout_cap, self.stdout_mode);
-        let stderr = self.stderr_sink.retained_snapshot().join("\n");
+        let stderr = self
+            .stderr_sink
+            .retained_snapshot(|tail| self.stderr_config.shape_capture_line(tail))
+            .join("\n");
         (
             stdout,
             stderr,
@@ -3685,6 +3764,9 @@ async fn pump_raw_bytes<R>(
                     &signals.overflowed,
                     &signals.truncated,
                 );
+                drop(guard);
+                #[cfg(test)]
+                publish_raw_stdout_for_test(&chunk[..n]);
             }
             // Broken pipe = the writer end closed = the normal end of a child
             // stream (std already maps it to `Ok(0)`; this is a defensive net):
