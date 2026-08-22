@@ -19,6 +19,11 @@ to a dated version section.
 
 ### Fixed
 
+- Reject zero PTY dimensions on every platform and dimensions above `i16::MAX`
+  on Windows before launch or live resize. ConPTY no longer silently clamps a
+  large request while leaving `COLUMNS`/`LINES` at the caller's original values;
+  Unix retains its full non-zero `u16` range, and a refused live resize leaves
+  the existing terminal usable.
 - Reject `use_pty()` combined with stdout/stderr `Inherit`, `Null`, or file
   redirects before opening a redirect file or spawning the child — including
   preflighting every pipeline stage before any upstream child starts. PTY output

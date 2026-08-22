@@ -343,7 +343,7 @@ launches the child under a real pseudo-terminal instead of three pipes, so an
 | Mechanism | `openpty` — the pty slave becomes the child's stdio, spawned through the **same** cgroup/process-group containment path as any other run | `CreatePseudoConsole` (ConPTY) — the child is created suspended, `AssignProcessToJobObject`'d to the **same** Job Object, then resumed |
 | stdout/stderr | **merged** onto one piped logical-stdout master (`ProcessResult::stderr` is empty); `Inherit`/`Null`/file destinations on either descriptor are rejected before file open or spawn | **merged**, same destination contract and pre-spawn rejection |
 | Echo control | terminal **echo disabled** (termios) so a written secret is not echoed back into the merged output | ConPTY has no portable per-write echo control — echo behavior is host-managed (not disabled) |
-| Window size | `winsize` passed to `openpty`, default 80×24; set with [`Command::pty_size(cols, rows)`](https://docs.rs/processkit/latest/processkit/struct.Command.html#method.pty_size) | `COORD` passed to `CreatePseudoConsole`, default 80×24; same builder |
+| Window size | `winsize` passed to `openpty`, default 80×24; set with [`Command::pty_size(cols, rows)`](https://docs.rs/processkit/latest/processkit/struct.Command.html#method.pty_size); non-zero `u16` axes (`1..=65535`) | `COORD` passed to `CreatePseudoConsole`, default 80×24; same builder, but signed fields limit each axis to `1..=32767` |
 | Terminal environment | `TERM=xterm-256color`; `COLUMNS`/`LINES` match the initial window size | `COLUMNS`/`LINES` match the initial window size; no synthetic `TERM` because ConPTY exposes VT handling through Windows console APIs |
 | Live resize | [`RunningProcess::resize_pty(cols, rows)`](https://docs.rs/processkit/latest/processkit/struct.RunningProcess.html#method.resize_pty) → `TIOCSWINSZ` on the master, which delivers **`SIGWINCH`** to the child's foreground process group | `resize_pty` → `ResizePseudoConsole`; **no `SIGWINCH`** — a console client learns of the new geometry on its next console query, and conhost may reflow **asynchronously** (delivery is best-effort, not synchronously observable) |
 | Line framing | effective [`LineTerminator`](https://docs.rs/processkit/latest/processkit/enum.LineTerminator.html) defaults to **`CarriageReturn`** (bare-`\r` progress frames stream as lines; an explicit `line_terminator(...)` wins), platform-agnostic | same |
@@ -369,12 +369,19 @@ Windows `TERM`, if any, remains subject to the normal environment layering.
 Explicit `env("TERM", ...)`, `env("COLUMNS", ...)`, `env("LINES", ...)` or
 matching `env_remove(...)` calls always override these defaults, including when
 the command also uses `env_clear()` or `inherit_env(...)`.
+Zero dimensions are rejected before launch on both backends. Windows also
+rejects either axis above `i16::MAX` before creating ConPTY resources instead of
+clamping it to a geometry that disagrees with the requested value and synthesized
+environment; Unix has no corresponding signed limit and accepts every non-zero
+`u16` value.
 
 Change a *running* session's size —
 e.g. propagating a host window resize — with
 [`RunningProcess::resize_pty(cols, rows)`](https://docs.rs/processkit/latest/processkit/struct.RunningProcess.html#method.resize_pty).
 It returns [`ErrorReason::Unsupported`](https://docs.rs/processkit/latest/processkit/enum.ErrorReason.html)
 (never a panic or a silent no-op) on a non-PTY run or once the child has exited.
+On a live PTY, zero dimensions — and, on Windows, axes above `i16::MAX` — return
+`ErrorReason::Io` with `InvalidInput` before the terminal is mutated.
 The platform delivery differs: Unix `TIOCSWINSZ` raises `SIGWINCH` on the child
 synchronously, whereas Windows `ResizePseudoConsole` has no signal — conhost
 reflows and the client observes the new geometry on its next console query,

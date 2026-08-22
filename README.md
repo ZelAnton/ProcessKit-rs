@@ -97,7 +97,9 @@ direct child.
 - **Real PTY sessions.** Enable the opt-in `pty` feature and call
   `Command::use_pty()` for a child that requires a controlling terminal:
   `openpty` on Unix, `CreatePseudoConsole` (ConPTY) on Windows. Initial and live
-  window sizing use `pty_size` / `resize_pty`; output is the terminal's merged
+  window sizing use `pty_size` / `resize_pty`; dimensions must be non-zero, and
+  Windows additionally caps each axis at `i16::MAX` because ConPTY uses signed
+  `COORD` fields (Unix keeps the remaining `u16` range). Output is the terminal's merged
   stdout/stderr stream exposed as piped logical stdout (alternate stdio/file
   destinations are rejected before spawn), while the existing
   job/cgroup/process-group containment and kill-on-drop guarantee remain

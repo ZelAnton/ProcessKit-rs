@@ -669,7 +669,10 @@ Two ways to satisfy them:
     so a written password is not echoed back into the merged output (the ConPTY
     has no portable per-write echo control, so that is Unix-only).
   - The child receives `COLUMNS`/`LINES` matching the initial PTY size (80×24,
-    or `pty_size(cols, rows)`). Unix also defaults `TERM=xterm-256color`;
+    or `pty_size(cols, rows)`). A zero axis is rejected before spawn on every
+    platform; Windows also rejects either axis above `i16::MAX` rather than
+    clamping ConPTY's signed `COORD`, while Unix accepts the full remaining
+    `u16` range. Unix also defaults `TERM=xterm-256color`;
     Windows relies on ConPTY's console/VT APIs and does not synthesize `TERM`.
     Explicit `env(...)` or `env_remove(...)` calls for any of these names win.
   - **Containment is unchanged** — the PTY child lives in the same

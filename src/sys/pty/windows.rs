@@ -86,15 +86,15 @@ fn classify_wait_failure(waited: u32) -> io::Result<()> {
     }
 }
 
-/// Build a ConPTY [`COORD`] from a `(cols, rows)` window size. `COORD`'s fields
-/// are signed 16-bit, so a size beyond `i16::MAX` (far past any real terminal) is
-/// clamped rather than wrapped negative — a defensive cap, never hit in practice.
-fn coord(cols: u16, rows: u16) -> COORD {
-    let clamp = |v: u16| v.min(i16::MAX as u16) as i16;
-    COORD {
-        X: clamp(cols),
-        Y: clamp(rows),
-    }
+/// Build a ConPTY [`COORD`] from an honestly representable `(cols, rows)` size.
+/// Validation happens before the signed casts so ConPTY never receives a
+/// clamped geometry different from the caller's request.
+fn coord(cols: u16, rows: u16) -> io::Result<COORD> {
+    super::validate_size(cols, rows)?;
+    Ok(COORD {
+        X: cols as i16,
+        Y: rows as i16,
+    })
 }
 
 // Conhost reports the client's final console writes asynchronously after its
@@ -281,7 +281,8 @@ impl PtyChild {
         // SAFETY: `hpc` is a live pseudoconsole handle for the call's duration —
         // the caller gated on the child still running, so no reap/`Drop` has closed
         // it. `ResizePseudoConsole` returns an `HRESULT`; non-zero is a failure.
-        let hr = unsafe { ResizePseudoConsole(self.hpc, coord(cols, rows)) };
+        let size = coord(cols, rows)?;
+        let hr = unsafe { ResizePseudoConsole(self.hpc, size) };
         if hr != 0 {
             return Err(hresult_to_io_error(hr));
         }
@@ -733,6 +734,11 @@ fn spawn_pty_with_thread_spawner<F>(
 where
     F: FnMut(&'static str, BridgeTask) -> io::Result<JoinHandle<()>>,
 {
+    let (cols, rows) = opts.pty_size.unwrap_or(super::DEFAULT_PTY_SIZE);
+    // This must precede pipe creation: an invalid public request is a pure
+    // preflight failure, not a partially-created ConPTY session.
+    let size = coord(cols, rows)?;
+
     // Two pipes: the child's input (we write `input_write`) and output (we read
     // `output_read`). The ConPTY takes ownership of `input_read`/`output_write`.
     let mut input_read: HANDLE = std::ptr::null_mut();
@@ -761,8 +767,6 @@ where
     // child's ends before that would leave the render pipe with no writer and the
     // output empty. They are closed only on the success path below (and by the
     // error cleanups) — see `close_child_ends`.
-    let (cols, rows) = opts.pty_size.unwrap_or(super::DEFAULT_PTY_SIZE);
-    let size = coord(cols, rows);
     // `HPCON` is an `isize` handle in windows-sys, not a pointer.
     let mut hpc: HPCON = 0;
     // SAFETY: valid pipe handles and an out-pointer for the pseudoconsole handle.
@@ -1960,22 +1964,36 @@ mod tests {
     }
 
     #[test]
-    fn coord_maps_a_window_size_and_clamps_beyond_i16() {
+    fn coord_maps_only_representable_window_sizes() {
         // An ordinary size passes through unchanged.
-        let c = coord(120, 40);
+        let c = coord(120, 40).expect("ordinary ConPTY size");
         assert_eq!((c.X, c.Y), (120, 40));
 
         // The default is the historical 80×24.
         let d = coord(
             super::super::DEFAULT_PTY_SIZE.0,
             super::super::DEFAULT_PTY_SIZE.1,
-        );
+        )
+        .expect("default ConPTY size");
         assert_eq!((d.X, d.Y), (80, 24));
 
-        // A size past `i16::MAX` (never a real terminal) is clamped, not wrapped
-        // negative — a defensive guard on the signed `COORD` fields.
-        let big = coord(u16::MAX, 40_000);
-        assert_eq!((big.X, big.Y), (i16::MAX, i16::MAX));
+        let max = coord(i16::MAX as u16, i16::MAX as u16)
+            .expect("the signed COORD boundary remains representable");
+        assert_eq!((max.X, max.Y), (i16::MAX, i16::MAX));
+
+        for (cols, rows) in [
+            (0, 1),
+            (1, 0),
+            (i16::MAX as u16 + 1, 1),
+            (1, i16::MAX as u16 + 1),
+            (u16::MAX, u16::MAX),
+        ] {
+            let error = match coord(cols, rows) {
+                Ok(_) => panic!("unrepresentable ConPTY size {cols}x{rows} must fail"),
+                Err(error) => error,
+            };
+            assert_eq!(error.kind(), io::ErrorKind::InvalidInput);
+        }
     }
 
     #[test]

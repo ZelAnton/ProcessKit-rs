@@ -22,6 +22,7 @@ Before changing code, preserve the structured evidence:
 | [`ResourceLimit` while creating a group](#resourcelimit-while-creating-a-group) | Invalid value, unsupported mechanism, or an existing but undelegated cgroup? |
 | [The process runs, but no output appears](#the-process-runs-but-no-output-appears) | End-of-run capture, incomplete line, child-side pipe buffering, or non-piped output? |
 | [PTY output contains ANSI/VT garbage](#pty-output-contains-ansivt-garbage) | Retained text that can be sanitized, or an exact/raw sink that intentionally stays byte-accurate? |
+| [PTY window size is rejected](#pty-window-size-is-rejected) | Zero axis, or a Windows ConPTY dimension outside signed `COORD` range? |
 | [`wait` or a stream never finishes](#wait-or-a-stream-never-finishes) | Open stdin, undrained full-duplex output, missing line terminator, or a live process/descendant? |
 | [Graceful shutdown does not work on Windows](#graceful-shutdown-does-not-work-on-windows) | Windowed `WM_CLOSE`, opted-in console `CTRL_BREAK`, or hard-kill-only member? |
 | [`Timeout` instead of `NotReady` — or vice versa](#timeout-instead-of-notready--or-vice-versa) | Run contract versus non-killing readiness observation? |
@@ -181,6 +182,18 @@ by default; an explicit `LineTerminator::Newline` can make redraw-style progress
 look delayed even after escapes are removed.
 
 Full contract: [PTY output hygiene](streaming.md#pty-output-hygiene-line-framing-and-vt-sanitization).
+
+## PTY window size is rejected
+
+`pty_size` and `resize_pty` accept `u16` arguments, but zero is not a usable PTY
+axis and is rejected as `ErrorReason::Io` (`InvalidInput`) on every platform.
+Windows ConPTY has the narrower `1..=32767` range because `COORD` stores signed
+16-bit fields; Unix accepts every non-zero `u16` value. ProcessKit rejects an
+out-of-range ConPTY request rather than silently clamping it, so retry with a
+representable size. A refused launch starts no child, and a refused live resize
+does not mutate or close the existing terminal.
+
+Full contract: [PTY window size and live resize](streaming.md#pty-window-size-and-live-resize).
 
 ## `wait` or a stream never finishes
 
