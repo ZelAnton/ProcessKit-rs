@@ -56,19 +56,36 @@ struct CgroupReclaim {
     attempts: u64,
 }
 
-/// One process-wide manager owns all eventual cgroup cleanup. The result is
-/// cached so a thread-resource failure is observable and every later handoff
-/// takes the same safe fallback rather than repeatedly trying to spawn threads
-/// from `Drop`.
-static CGROUP_RECLAIMER: OnceLock<Result<Sender<CgroupReclaim>, String>> = OnceLock::new();
+/// The process-wide handoff state keeps a request alive until the manager has
+/// accepted it. In particular, a failed thread start or a broken channel must
+/// not turn a still-contained survivor into an untracked cgroup tree.
+struct CgroupReclaimerState {
+    sender: Option<Sender<CgroupReclaim>>,
+    pending: Vec<CgroupReclaim>,
+}
+
+static CGROUP_RECLAIMER: OnceLock<Mutex<CgroupReclaimerState>> = OnceLock::new();
+
+fn cgroup_reclaimer_state() -> &'static Mutex<CgroupReclaimerState> {
+    CGROUP_RECLAIMER.get_or_init(|| {
+        Mutex::new(CgroupReclaimerState {
+            sender: None,
+            pending: Vec::new(),
+        })
+    })
+}
 
 fn report_cgroup_reclaim_failure(scope: &'static str, kind: io::ErrorKind, attempt: u64) {
     // A busy cgroup is expected while a non-escalating survivor is alive, so do
     // not emit one warning per 10 ms poll. The first refusal and periodic
     // reminders make a permanently unreadable/undeletable hierarchy visible
     // without turning a long-lived survivor into a log flood.
+    if attempt != 1 && !attempt.is_multiple_of(1_000) {
+        return;
+    }
+
     #[cfg(feature = "tracing")]
-    if attempt == 1 || attempt.is_multiple_of(1_000) {
+    {
         tracing::warn!(
             target: "processkit",
             operation = "cgroup_reclaim",
@@ -79,7 +96,10 @@ fn report_cgroup_reclaim_failure(scope: &'static str, kind: io::ErrorKind, attem
         );
     }
     #[cfg(not(feature = "tracing"))]
-    let _ = (scope, kind, attempt);
+    eprintln!(
+        "processkit: cgroup cleanup is pending (scope={scope}, error={kind:?}, attempt={attempt}); \
+         the directory remains registered for retry"
+    );
 }
 
 impl CgroupReclaim {
@@ -120,18 +140,56 @@ impl CgroupReclaim {
     }
 }
 
-fn cgroup_reclaimer_sender() -> io::Result<&'static Sender<CgroupReclaim>> {
-    match CGROUP_RECLAIMER.get_or_init(|| {
+impl CgroupReclaimerState {
+    /// Send every queued request, retaining the request that a broken receiver
+    /// returns (and all requests after it) for a fresh manager attempt.
+    fn send_pending(&mut self, sender: &Sender<CgroupReclaim>) -> io::Result<()> {
+        let pending = std::mem::take(&mut self.pending);
+        let mut pending = pending.into_iter();
+        while let Some(request) = pending.next() {
+            match sender.send(request) {
+                Ok(()) => {}
+                Err(mpsc::SendError(request)) => {
+                    self.pending.push(request);
+                    self.pending.extend(pending);
+                    return Err(io::Error::new(
+                        io::ErrorKind::BrokenPipe,
+                        "cgroup reclaimer channel disconnected",
+                    ));
+                }
+            }
+        }
+        Ok(())
+    }
+}
+
+/// Start (or reuse) the process-wide manager and hand it every queued request.
+/// A failed start leaves the queue untouched; a later cgroup drop gets another
+/// chance to start the manager instead of inheriting a permanently cached error.
+fn start_cgroup_reclaimer(state: &mut CgroupReclaimerState) -> io::Result<()> {
+    if state.sender.is_none() {
         let (sender, receiver) = mpsc::channel();
         std::thread::Builder::new()
             .name("processkit-cgroup-reclaimer".into())
             .spawn(move || cgroup_reclaim_loop(receiver))
-            .map(|_| sender)
-            .map_err(|source| format!("could not start cgroup reclaimer: {source}"))
-    }) {
-        Ok(sender) => Ok(sender),
-        Err(message) => Err(io::Error::other(message.clone())),
+            .map_err(|source| {
+                io::Error::other(format!("could not start cgroup reclaimer: {source}"))
+            })?;
+        state.sender = Some(sender);
     }
+
+    let sender = state
+        .sender
+        .as_ref()
+        .expect("cgroup reclaimer sender installed")
+        .clone();
+    if let Err(error) = state.send_pending(&sender) {
+        // Let the old manager observe the disconnected channel and finish any
+        // request it already owns; a fresh manager gets the retained queue.
+        state.sender = None;
+        return Err(error);
+    }
+    Ok(())
 }
 
 fn cgroup_reclaim_loop(receiver: Receiver<CgroupReclaim>) {
@@ -172,26 +230,24 @@ fn cgroup_reclaim_loop(receiver: Receiver<CgroupReclaim>) {
 
 /// Transfer the paths that a dropped cgroup still owns to the process-wide
 /// retry manager. `Drop` cannot report an error, so a manager-start/send failure
-/// gets one immediate retry and an observable warning while the paths remain
-/// untouched for an operator to reclaim safely.
+/// is recorded in the durable queue and made observable while the paths remain
+/// untouched for a later retry.
 fn enqueue_cgroup_reclaim(parent: PathBuf, leaves: Vec<PathBuf>) {
     let request = CgroupReclaim {
         parent,
         leaves,
         attempts: 0,
     };
-    match cgroup_reclaimer_sender() {
-        Ok(sender) => {
-            if let Err(mpsc::SendError(mut request)) = sender.send(request) {
-                report_cgroup_reclaim_failure("handoff", io::ErrorKind::BrokenPipe, 1);
-                let _ = request.reclaim_once();
-            }
-        }
-        Err(error) => {
-            report_cgroup_reclaim_failure("handoff", error.kind(), 1);
-            let mut request = request;
-            let _ = request.reclaim_once();
-        }
+
+    let state = cgroup_reclaimer_state();
+    let mut state = state.lock().expect("cgroup reclaimer state poisoned");
+    state.pending.push(request);
+
+    // A transient thread-resource failure must not be cached forever. One
+    // enqueue performs one start attempt; subsequent drops retry without ever
+    // discarding the requests already in `pending`.
+    if let Err(error) = start_cgroup_reclaimer(&mut state) {
+        report_cgroup_reclaim_failure("handoff", error.kind(), 1);
     }
 }
 
@@ -5401,7 +5457,8 @@ mod leaf_cgroup_tests {
     use std::time::Duration;
 
     use super::{
-        Backend, Cgroup, CgroupReclaim, Job, LEAF_RECLAIM_FLOOR, LeafSlot, enqueue_cgroup_reclaim,
+        Backend, Cgroup, CgroupReclaim, CgroupReclaimerState, Job, LEAF_RECLAIM_FLOOR, LeafSlot,
+        enqueue_cgroup_reclaim,
     };
     use crate::sys::SkipDropKill;
 
@@ -5870,6 +5927,65 @@ mod leaf_cgroup_tests {
             std::thread::sleep(Duration::from_millis(10));
         }
         panic!("the process-wide reclaimer did not remove {parent:?} after the survivor drained");
+    }
+
+    /// A broken handoff must return the request to durable state instead of
+    /// dropping it after one synchronous reclaim attempt. The next manager can
+    /// accept the same request, which then keeps retrying until the survivor's
+    /// stand-in leaves the leaf.
+    #[test]
+    fn refused_reclaimer_handoff_is_retained_for_a_later_manager() {
+        let tmp = tempfile::tempdir().expect("create a reclaim test directory");
+        let parent = tmp.path().join("processkit-job");
+        let leaf = parent.join("spawn-survivor");
+        let survivor = leaf.join("survivor");
+        std::fs::create_dir(&parent).expect("create parent");
+        std::fs::create_dir(&leaf).expect("create leaf");
+        std::fs::create_dir(&survivor).expect("stand in for the live survivor");
+
+        let mut state = CgroupReclaimerState {
+            sender: None,
+            pending: vec![CgroupReclaim {
+                parent: parent.clone(),
+                leaves: vec![leaf.clone()],
+                attempts: 0,
+            }],
+        };
+        let (refused_sender, refused_receiver) = std::sync::mpsc::channel();
+        drop(refused_receiver);
+        assert_eq!(
+            state
+                .send_pending(&refused_sender)
+                .expect_err("a closed manager must refuse the handoff")
+                .kind(),
+            io::ErrorKind::BrokenPipe
+        );
+        assert_eq!(
+            state.pending.len(),
+            1,
+            "SendError must return the request to the durable queue"
+        );
+
+        let (sender, receiver) = std::sync::mpsc::channel();
+        state
+            .send_pending(&sender)
+            .expect("a later manager accepts the retained request");
+        let mut request = receiver.recv().expect("receive the retained request");
+        assert!(
+            !request.reclaim_once(),
+            "the survivor still keeps the leaf busy"
+        );
+        assert!(leaf.exists(), "reclaim must not evict a live survivor");
+
+        std::fs::remove_dir(&survivor).expect("the survivor leaves its cgroup");
+        assert!(
+            request.reclaim_once(),
+            "the retained request must remain retryable until removal is confirmed"
+        );
+        assert!(
+            !parent.exists(),
+            "the later retry removes the empty hierarchy"
+        );
     }
 }
 
