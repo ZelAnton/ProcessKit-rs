@@ -25,7 +25,8 @@ use crate::error::Result;
 use crate::group::ProcessGroup;
 use crate::result::{Outcome, ProcessResult};
 use crate::running::{
-    ExitObservation, Finished, LineCapture, ProcessEvents, RawCapture, RunningProcess, StdoutLines,
+    ExitObservation, Finished, LineCapture, ProcessEvents, RawCapture, RunningProcess,
+    StderrCapture, StdoutLines,
 };
 use crate::sync::atomic::{AtomicBool, AtomicU8, AtomicUsize, Ordering};
 
@@ -261,12 +262,39 @@ struct RetainedStageCapture {
     unchecked: bool,
     ok_codes: Vec<i32>,
     timeout: Option<Duration>,
-    tracker: LineCapture,
+    tracker: RetainedCapture,
+}
+
+enum RetainedCapture {
+    Lines(LineCapture),
+    Stderr(StderrCapture),
+}
+
+impl RetainedCapture {
+    fn stderr_snapshot(&self) -> (String, bool) {
+        match self {
+            Self::Lines(tracker) => {
+                let (_, stderr, truncated, _, _) = tracker.retained_snapshot();
+                (stderr, truncated)
+            }
+            Self::Stderr(tracker) => {
+                let (stderr, truncated, _, _) = tracker.retained_snapshot();
+                (stderr, truncated)
+            }
+        }
+    }
+}
+
+fn prepare_retained_capture(process: &mut RunningProcess) -> RetainedCapture {
+    process
+        .prepare_line_capture()
+        .map(RetainedCapture::Lines)
+        .unwrap_or_else(|_| RetainedCapture::Stderr(process.prepare_stderr_capture()))
 }
 
 impl RetainedStageCapture {
     fn retained_outcome(&self, torn_down: bool) -> InnerStage {
-        let (_, stderr, stderr_truncated, _, _) = self.tracker.retained_snapshot();
+        let (stderr, stderr_truncated) = self.tracker.stderr_snapshot();
         (
             self.index,
             StageOutcome {
@@ -831,7 +859,7 @@ impl Pipeline {
                 unchecked,
                 ok_codes: ok_codes.clone(),
                 timeout,
-                tracker,
+                tracker: RetainedCapture::Lines(tracker),
             });
             let teardown = teardown.clone();
             let teardown_cause = teardown_cause.clone();
@@ -1845,8 +1873,8 @@ impl PipelineSession {
         let (mut last, inner_tasks) = self.take_live_parts();
         if self.last_capture.is_none()
             && pipeline_teardown_failure_is_recorded(&self.teardown_failure)
-            && let Ok(tracker) = last.prepare_line_capture()
         {
+            let tracker = prepare_retained_capture(&mut last);
             self.last_capture = Some(RetainedStageCapture {
                 index: self.inner_count,
                 program: self.last_program.clone(),
@@ -2107,17 +2135,15 @@ impl PipelineSession {
         if self.last_capture.is_some() {
             return;
         }
-        let tracker = self.with_last(RunningProcess::prepare_line_capture);
-        if let Ok(tracker) = tracker {
-            self.last_capture = Some(RetainedStageCapture {
-                index: self.inner_count,
-                program: self.last_program.clone(),
-                unchecked: self.last_unchecked,
-                ok_codes: self.last_ok_codes.clone(),
-                timeout: self.last_timeout,
-                tracker,
-            });
-        }
+        let tracker = self.with_last(prepare_retained_capture);
+        self.last_capture = Some(RetainedStageCapture {
+            index: self.inner_count,
+            program: self.last_program.clone(),
+            unchecked: self.last_unchecked,
+            ok_codes: self.last_ok_codes.clone(),
+            timeout: self.last_timeout,
+            tracker,
+        });
     }
 
     /// Lend the last stage's handle out of the shared slot for the length of one
@@ -3491,6 +3517,7 @@ mod tests {
         marker: &std::path::Path,
         producer_pid: &std::path::Path,
         consumer_pid: &std::path::Path,
+        stdout_mode: crate::StdioMode,
     ) -> Pipeline {
         #[cfg(unix)]
         {
@@ -3512,6 +3539,7 @@ mod tests {
                         marker.display()
                     ),
                 ])
+                .stdout(stdout_mode)
                 .output_buffer(crate::OutputBufferPolicy::bounded(1));
             return producer.pipe(consumer);
         }
@@ -3545,6 +3573,7 @@ mod tests {
                          Start-Sleep -Seconds 60"
                     ),
                 ])
+                .stdout(stdout_mode)
                 .output_buffer(crate::OutputBufferPolicy::bounded(1));
             producer.pipe(consumer)
         }
@@ -4169,18 +4198,19 @@ mod tests {
     }
 
     #[cfg(feature = "process-control")]
-    #[tokio::test(flavor = "current_thread")]
-    #[ignore = "spawns a real pipeline for deterministic last-group kill fault injection"]
-    async fn pipeline_start_kill_failure_retains_live_last_stage_diagnostics() {
-        let marker = pipeline_marker("explicit_last_kill_failure");
-        let producer_pid = pipeline_marker("explicit_last_kill_failure_producer");
-        let consumer_pid = pipeline_marker("explicit_last_kill_failure_consumer");
+    async fn assert_last_kill_failure_retains_diagnostics(
+        case: &str,
+        stdout_mode: crate::StdioMode,
+    ) {
+        let marker = pipeline_marker(case);
+        let producer_pid = pipeline_marker(&format!("{case}_producer"));
+        let consumer_pid = pipeline_marker(&format!("{case}_consumer"));
         for path in [&marker, &producer_pid, &consumer_pid] {
             let _ = std::fs::remove_file(path);
         }
         let mut partial_tails = crate::pump::observe_partial_tail_publications();
         let mut session =
-            explicit_last_kill_failure_pipeline(&marker, &producer_pid, &consumer_pid)
+            explicit_last_kill_failure_pipeline(&marker, &producer_pid, &consumer_pid, stdout_mode)
                 .start()
                 .await
                 .expect("start live pipeline");
@@ -4253,6 +4283,28 @@ mod tests {
         for path in [&marker, &producer_pid, &consumer_pid] {
             let _ = std::fs::remove_file(path);
         }
+    }
+
+    #[cfg(feature = "process-control")]
+    #[tokio::test(flavor = "current_thread")]
+    #[ignore = "spawns a real pipeline for deterministic last-group kill fault injection"]
+    async fn pipeline_start_kill_failure_retains_live_last_stage_diagnostics() {
+        assert_last_kill_failure_retains_diagnostics(
+            "explicit_last_kill_failure",
+            crate::StdioMode::Piped,
+        )
+        .await;
+    }
+
+    #[cfg(feature = "process-control")]
+    #[tokio::test(flavor = "current_thread")]
+    #[ignore = "spawns a real pipeline for deterministic last-group kill fault injection"]
+    async fn pipeline_start_kill_failure_retains_piped_stderr_with_null_stdout() {
+        assert_last_kill_failure_retains_diagnostics(
+            "explicit_last_kill_failure_null_stdout",
+            crate::StdioMode::Null,
+        )
+        .await;
     }
 
     #[tokio::test(flavor = "current_thread")]
