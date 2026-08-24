@@ -1880,7 +1880,10 @@ impl RunningProcess {
     ///   confirmed; the initiating cancellation is not reported as complete.
     /// - [`ErrorReason::Stdin`] — a non-broken-pipe stdin-source failure on an
     ///   otherwise-successful run.
-    /// - [`ErrorReason::Io`] — the graceful teardown or the exit wait failed.
+    /// - [`ErrorReason::Io`] — the graceful teardown or the exit wait failed. A
+    ///   graceful-teardown failure is returned as soon as it is observed, without
+    ///   waiting indefinitely for a child the failed escalation left alive; it
+    ///   takes precedence over a concurrent exit-wait result.
     ///
     /// A timeout or signal-kill is *captured* in the returned [`Outcome`], not
     /// raised.
@@ -1915,13 +1918,27 @@ impl RunningProcess {
         }
         // Reap concurrently: an unreaped zombie still answers `kill(pgid, 0)`
         // probes, so without a concurrent reap a SIGTERM-handling child would
-        // look alive for the whole grace and eat a pointless SIGKILL.
-        let (term_result, outcome) = tokio::join!(
-            group.graceful_terminate(grace, crate::sys::SIGTERM_RAW),
-            self.wait(),
-        );
-        term_result?;
-        outcome
+        // look alive for the whole grace and eat a pointless SIGKILL. Do not
+        // `join!` the two futures, though: a failed hard-kill can leave the child
+        // alive, making the wait hide the teardown error forever. Returning that
+        // primary error drops the still-owned wait future, so `RunningProcess::Drop`
+        // keeps the group kill-on-drop and orphan-reap backstops intact.
+        let teardown = group_graceful_kill(&group, grace, crate::sys::SIGTERM_RAW);
+        let wait = self.wait();
+        tokio::pin!(teardown, wait);
+        tokio::select! {
+            teardown_result = &mut teardown => {
+                teardown_result.map_err(Error::io)?;
+                wait.await
+            }
+            outcome = &mut wait => {
+                // Preserve the historical error priority even when the wait
+                // finishes first: teardown failure outranks a successful Outcome
+                // or a secondary wait error.
+                teardown.await.map_err(Error::io)?;
+                outcome
+            }
+        }
     }
 
     /// Minimal non-consuming exit wait — the [`wait_any`](crate::wait_any) race
@@ -4017,6 +4034,61 @@ mod tests {
             }
             other => panic!("expected Teardown, got {other:?}"),
         }
+    }
+
+    #[cfg(feature = "process-control")]
+    #[tokio::test(flavor = "current_thread")]
+    #[ignore = "spawns a real owned-group child for graceful-shutdown fault injection"]
+    async fn shutdown_returns_graceful_group_failure_without_waiting_for_live_child() {
+        let marker = marker_path("shutdown_graceful_failure");
+        let run = live_command(&marker, false)
+            .start()
+            .await
+            .expect("start owned-group child");
+        let pid = run.pid().expect("live child pid");
+        wait_for_marker(&marker).await;
+        assert!(
+            crate::process_is_alive(pid, None).expect("child liveness before shutdown"),
+            "the injected graceful failure must begin with a live child"
+        );
+        let faults = crate::sys::fault_injection::Faults::new()
+            .fail_every(
+                crate::sys::fault_injection::Site::ProcessGroupTeardown,
+                Some("graceful"),
+                5,
+            )
+            .arm();
+
+        let started = Instant::now();
+        let error = tokio::time::timeout(
+            Duration::from_secs(2),
+            run.shutdown(Duration::from_secs(30)),
+        )
+        .await
+        .expect("shutdown must return the graceful failure without awaiting the live child")
+        .expect_err("the injected graceful group teardown must fail");
+        assert!(
+            started.elapsed() < Duration::from_secs(2),
+            "shutdown waited for the live child after teardown failed"
+        );
+        match error.reason() {
+            ErrorReason::Io(source) => assert_eq!(source.raw_os_error(), Some(5)),
+            other => panic!("the original graceful teardown error must win, got {other:?}"),
+        }
+        assert_eq!(
+            faults.fired(crate::sys::fault_injection::Site::ProcessGroupTeardown),
+            1
+        );
+        drop(faults);
+
+        for _ in 0..500 {
+            if !crate::process_is_alive(pid, None).expect("child liveness after shutdown failure") {
+                let _ = std::fs::remove_file(marker);
+                return;
+            }
+            tokio::time::sleep(Duration::from_millis(10)).await;
+        }
+        panic!("kill-on-drop backstop left child {pid} alive after shutdown failure");
     }
 
     #[cfg(feature = "process-control")]
