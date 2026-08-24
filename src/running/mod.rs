@@ -406,6 +406,35 @@ pub(crate) struct LineCapture {
     stderr_config: StreamConfig,
 }
 
+/// A non-consuming stderr-only checkpoint for a live process.
+///
+/// Unlike [`LineCapture`], preparing this checkpoint never depends on stdout
+/// being piped or still available. Pipeline teardown uses it after normal stdout
+/// streaming has already become unavailable, while the process finisher remains
+/// the sole consumer of the shared stderr sink.
+#[derive(Clone)]
+pub(crate) struct StderrCapture {
+    stderr: Arc<SharedLines>,
+    stderr_config: StreamConfig,
+}
+
+impl StderrCapture {
+    /// Retain the decoded backlog plus a live unterminated tail without draining
+    /// either, so the ordinary finisher can still consume the same sink.
+    pub(crate) fn retained_snapshot(&self) -> (String, bool, usize, usize) {
+        let stderr = self
+            .stderr
+            .retained_snapshot(|tail| self.stderr_config.shape_capture_line(tail))
+            .join("\n");
+        (
+            stderr,
+            self.stderr.dropped() > 0,
+            self.stderr.count(),
+            self.stderr.seen_bytes(),
+        )
+    }
+}
+
 impl LineCapture {
     /// Non-destructive complete-line view used just before a pipeline fallback
     /// kill. If that kill wakes this capture's finisher, the chain error can still
@@ -1391,6 +1420,36 @@ impl RunningProcess {
             stdout_config: self.stdout_config.clone(),
             stderr_config: self.stderr_config.clone(),
         })
+    }
+
+    /// Prepare a non-consuming view of stderr independently of stdout.
+    ///
+    /// A live pipeline may honor `stdout(Null)`/`stdout(Inherit)`, or its caller
+    /// may already own the one-shot stdout stream. Neither condition should stop
+    /// a bounded teardown failure from retaining piped stderr. Reuse an existing
+    /// sink when another streaming path already armed it; otherwise start exactly
+    /// one stderr pump and leave the process finisher as the sole consumer.
+    pub(crate) fn prepare_stderr_capture(&mut self) -> StderrCapture {
+        let stderr_sink = self.stderr_sink.clone().unwrap_or_else(|| {
+            SharedLines::new_with_activity(&self.buffer, self.output_activity.clone())
+        });
+        if self.stderr_sink.is_none() {
+            self.stderr_pump = self.backend.take_stderr_reader().map(|pipe| {
+                tokio::spawn(pump_lines_core(
+                    pipe,
+                    self.stderr_config.clone(),
+                    stderr_sink.clone(),
+                ))
+            });
+            if self.stderr_pump.is_none() {
+                stderr_sink.close_now();
+            }
+            self.stderr_sink = Some(stderr_sink.clone());
+        }
+        StderrCapture {
+            stderr: stderr_sink,
+            stderr_config: self.stderr_config.clone(),
+        }
     }
 
     /// Prepare raw stdout plus line-oriented stderr capture before a caller
@@ -4693,6 +4752,40 @@ mod tests {
             stdout_cap: None,
             stdout_mode: OverflowMode::DropOldest,
         }
+    }
+
+    #[tokio::test]
+    async fn stderr_checkpoint_is_independent_of_stdout_and_non_consuming() {
+        let command = Command::new("tool")
+            .stdout(crate::StdioMode::Null)
+            .output_buffer(OutputBufferPolicy::bounded(1));
+        let mut run = ScriptedRunner::new()
+            .fallback(Reply::ok("").with_stderr("discarded\nretained-tail"))
+            .start(&command)
+            .await
+            .expect("scripted start");
+        let checkpoint = run.prepare_stderr_capture();
+
+        let (stderr, truncated) = tokio::time::timeout(Duration::from_secs(1), async {
+            loop {
+                let (stderr, truncated, _, _) = checkpoint.retained_snapshot();
+                if stderr == "retained-tail" {
+                    break (stderr, truncated);
+                }
+                tokio::task::yield_now().await;
+            }
+        })
+        .await
+        .expect("stderr pump reaches the independent checkpoint");
+        assert_eq!(stderr, "retained-tail");
+        assert!(truncated, "the checkpoint retains stderr's buffer policy");
+
+        let finished = run.finish().await.expect("stderr remains consumable");
+        assert_eq!(finished.stderr, "retained-tail");
+        assert!(
+            finished.stderr_truncated,
+            "the sole consumer sees the same truncation state"
+        );
     }
 
     /// A chain-wide timeout snapshots the last stage's capture while its pumps
