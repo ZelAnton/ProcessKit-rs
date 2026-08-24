@@ -16,8 +16,9 @@ use std::os::fd::{AsRawFd, FromRawFd, OwnedFd, RawFd};
 use std::os::unix::ffi::{OsStrExt, OsStringExt};
 use std::os::unix::process::CommandExt;
 use std::path::{Path, PathBuf};
-use std::sync::Mutex;
 use std::sync::atomic::{AtomicU64, Ordering};
+use std::sync::mpsc::{self, Receiver, Sender};
+use std::sync::{Mutex, OnceLock};
 use std::time::Duration;
 
 use tokio::process::{Child, Command};
@@ -37,6 +38,241 @@ use crate::sys::{ProcIdentity, ProcMetrics};
 
 /// Process-wide counter so concurrent jobs get distinct cgroup names.
 static NEXT_ID: AtomicU64 = AtomicU64::new(0);
+
+/// The interval at which the process-wide cgroup reclaimer retries a directory
+/// that the kernel still reports as busy. A single manager keeps a spared job
+/// from retaining one thread of its own, while still retrying until the last
+/// survivor has left its cgroup.
+const CGROUP_RECLAIM_POLL: Duration = Duration::from_millis(10);
+
+/// A cgroup tree handed to the reclaimer after `Job::drop` could not remove it
+/// synchronously. The paths are deliberately owned by this request: once the
+/// `Job` is gone there is no registry left to consult, and forgetting a leaf
+/// would make the parent impossible to remove and would hide a still-contained
+/// survivor from later whole-tree operations before the handoff.
+struct CgroupReclaim {
+    parent: PathBuf,
+    leaves: Vec<PathBuf>,
+    attempts: u64,
+}
+
+/// The process-wide handoff state keeps a request alive until the manager has
+/// accepted it. In particular, a failed thread start or a broken channel must
+/// not turn a still-contained survivor into an untracked cgroup tree.
+struct CgroupReclaimerState {
+    sender: Option<Sender<CgroupReclaim>>,
+    pending: Vec<CgroupReclaim>,
+}
+
+static CGROUP_RECLAIMER: OnceLock<Mutex<CgroupReclaimerState>> = OnceLock::new();
+
+fn cgroup_reclaimer_state() -> &'static Mutex<CgroupReclaimerState> {
+    CGROUP_RECLAIMER.get_or_init(|| {
+        Mutex::new(CgroupReclaimerState {
+            sender: None,
+            pending: Vec::new(),
+        })
+    })
+}
+
+#[cfg(not(feature = "tracing"))]
+fn write_cgroup_reclaim_failure<W: io::Write>(
+    writer: &mut W,
+    scope: &'static str,
+    kind: io::ErrorKind,
+    attempt: u64,
+) {
+    let _ = writeln!(
+        writer,
+        "processkit: cgroup cleanup is pending (scope={scope}, error={kind:?}, attempt={attempt}); \
+         the directory remains registered for retry"
+    );
+}
+
+fn report_cgroup_reclaim_failure(scope: &'static str, kind: io::ErrorKind, attempt: u64) {
+    // A busy cgroup is expected while a non-escalating survivor is alive, so do
+    // not emit one warning per 10 ms poll. The first refusal and periodic
+    // reminders make a permanently unreadable/undeletable hierarchy visible
+    // without turning a long-lived survivor into a log flood.
+    if attempt != 1 && !attempt.is_multiple_of(1_000) {
+        return;
+    }
+
+    #[cfg(feature = "tracing")]
+    {
+        tracing::warn!(
+            target: "processkit",
+            operation = "cgroup_reclaim",
+            scope,
+            error_kind = ?kind,
+            attempt,
+            "cgroup cleanup is pending; the directory remains registered for retry"
+        );
+    }
+    #[cfg(not(feature = "tracing"))]
+    {
+        // An embedding process may close stderr; diagnostics must not abort the
+        // sole reclaimer thread and strand its still-contained request.
+        let mut stderr = io::stderr();
+        write_cgroup_reclaim_failure(&mut stderr, scope, kind, attempt);
+    }
+}
+
+impl CgroupReclaim {
+    /// Try one depth-first reclaim pass. A directory is removed from this
+    /// request only after `rmdir` confirms success (or `NotFound` confirms that
+    /// somebody else already removed it). Every other error keeps the path for
+    /// the next pass, preserving the survivor's containment and enumeration.
+    fn reclaim_once(&mut self) -> bool {
+        self.reclaim_once_with(report_cgroup_reclaim_failure)
+    }
+
+    fn reclaim_once_with(
+        &mut self,
+        mut report: impl FnMut(&'static str, io::ErrorKind, u64),
+    ) -> bool {
+        self.attempts = self.attempts.saturating_add(1);
+        let attempt = self.attempts;
+        let mut pending_leaf = false;
+        self.leaves.retain(|leaf| match std::fs::remove_dir(leaf) {
+            Ok(()) => false,
+            Err(error) if error.kind() == io::ErrorKind::NotFound => false,
+            Err(error) => {
+                pending_leaf = true;
+                report("leaf", error.kind(), attempt);
+                true
+            }
+        });
+
+        // A parent with any registered leaf still present cannot be removed;
+        // avoiding that call also keeps an expected `ENOTEMPTY` from obscuring
+        // the leaf error that is actually blocking progress. If an unknown
+        // child exists, the parent rmdir below remains the safe retry guard.
+        if pending_leaf || !self.leaves.is_empty() {
+            return false;
+        }
+
+        match std::fs::remove_dir(&self.parent) {
+            Ok(()) => true,
+            Err(error) if error.kind() == io::ErrorKind::NotFound => true,
+            Err(error) => {
+                report("parent", error.kind(), attempt);
+                false
+            }
+        }
+    }
+}
+
+impl CgroupReclaimerState {
+    /// Send every queued request, retaining the request that a broken receiver
+    /// returns (and all requests after it) for a fresh manager attempt.
+    fn send_pending(&mut self, sender: &Sender<CgroupReclaim>) -> io::Result<()> {
+        let pending = std::mem::take(&mut self.pending);
+        let mut pending = pending.into_iter();
+        while let Some(request) = pending.next() {
+            match sender.send(request) {
+                Ok(()) => {}
+                Err(mpsc::SendError(request)) => {
+                    self.pending.push(request);
+                    self.pending.extend(pending);
+                    return Err(io::Error::new(
+                        io::ErrorKind::BrokenPipe,
+                        "cgroup reclaimer channel disconnected",
+                    ));
+                }
+            }
+        }
+        Ok(())
+    }
+}
+
+/// Start (or reuse) the process-wide manager and hand it every queued request.
+/// A failed start leaves the queue untouched; a later cgroup drop gets another
+/// chance to start the manager instead of inheriting a permanently cached error.
+fn start_cgroup_reclaimer(state: &mut CgroupReclaimerState) -> io::Result<()> {
+    if state.sender.is_none() {
+        let (sender, receiver) = mpsc::channel();
+        std::thread::Builder::new()
+            .name("processkit-cgroup-reclaimer".into())
+            .spawn(move || cgroup_reclaim_loop(receiver))
+            .map_err(|source| {
+                io::Error::other(format!("could not start cgroup reclaimer: {source}"))
+            })?;
+        state.sender = Some(sender);
+    }
+
+    let sender = state
+        .sender
+        .as_ref()
+        .expect("cgroup reclaimer sender installed")
+        .clone();
+    if let Err(error) = state.send_pending(&sender) {
+        // Let the old manager observe the disconnected channel and finish any
+        // request it already owns; a fresh manager gets the retained queue.
+        state.sender = None;
+        return Err(error);
+    }
+    Ok(())
+}
+
+fn cgroup_reclaim_loop(receiver: Receiver<CgroupReclaim>) {
+    let mut pending = Vec::new();
+    loop {
+        while let Ok(request) = receiver.try_recv() {
+            pending.push(request);
+        }
+
+        let mut index = 0;
+        while index < pending.len() {
+            if pending[index].reclaim_once() {
+                pending.swap_remove(index);
+            } else {
+                index += 1;
+            }
+        }
+
+        if pending.is_empty() {
+            match receiver.recv() {
+                Ok(request) => pending.push(request),
+                Err(_) => return,
+            }
+        } else {
+            match receiver.recv_timeout(CGROUP_RECLAIM_POLL) {
+                Ok(request) => pending.push(request),
+                Err(mpsc::RecvTimeoutError::Timeout) => {}
+                // The sender is process-global and should not disconnect, but
+                // retaining pending requests is safer than abandoning paths if
+                // that invariant ever changes.
+                Err(mpsc::RecvTimeoutError::Disconnected) => {
+                    std::thread::sleep(CGROUP_RECLAIM_POLL);
+                }
+            }
+        }
+    }
+}
+
+/// Transfer the paths that a dropped cgroup still owns to the process-wide
+/// retry manager. `Drop` cannot report an error, so a manager-start/send failure
+/// is recorded in the durable queue and made observable while the paths remain
+/// untouched for a later retry.
+fn enqueue_cgroup_reclaim(parent: PathBuf, leaves: Vec<PathBuf>) {
+    let request = CgroupReclaim {
+        parent,
+        leaves,
+        attempts: 0,
+    };
+
+    let state = cgroup_reclaimer_state();
+    let mut state = state.lock().expect("cgroup reclaimer state poisoned");
+    state.pending.push(request);
+
+    // A transient thread-resource failure must not be cached forever. One
+    // enqueue performs one start attempt; subsequent drops retry without ever
+    // discarding the requests already in `pending`.
+    if let Err(error) = start_cgroup_reclaimer(&mut state) {
+        report_cgroup_reclaim_failure("handoff", error.kind(), 1);
+    }
+}
 
 /// A per-process salt mixed into the cgroup dir name so a pid recycled long after
 /// a *crashed* ProcessKit process (whose `Drop` never cleaned up its
@@ -870,27 +1106,21 @@ impl Drop for Job {
                         std::thread::sleep(Duration::from_millis(2));
                     }
                 }
-                // Best-effort: an emptied cgroup dir is removed here — the common
-                // case, plus the escalate=false case where survivors all drained
-                // during the grace. When survivors remain under escalate=false
-                // this `rmdir` fails with EBUSY and the dir is intentionally left
-                // to keep containing the orphaned tree; it is then *not* reclaimed
-                // even after that tree later exits, because the owning `Job` is
-                // already gone. That permanent empty-dir leak is the accepted cost
-                // of choosing not to escalate — symmetric with the Windows backend
-                // deliberately orphaning its survivors.
-                //
                 // The per-spawn leaves go first and unconditionally: a cgroup
                 // directory that still has child directories cannot be removed at
                 // all (`rmdir` answers `ENOTEMPTY`), so an unreclaimed leaf would
-                // leak the whole job directory rather than just itself. On the
-                // escalate=false path the leaves that *are* empty are still worth
-                // reclaiming even though their parent must stay — and the one a
-                // spared survivor lives in stays too (`EBUSY`), so that documented
-                // leak is now the job dir plus one leaf per spared spawn: the same
-                // accepted cost, one level deeper, bounded by what was spared.
+                // keep the whole job directory alive. A non-escalating shutdown is
+                // allowed to leave a survivor in its leaf and parent, but that is
+                // only temporary containment: once this synchronous pass has done
+                // everything it can, the remaining paths are handed to the
+                // process-wide reclaimer, which retries without issuing a kill.
                 cg.reclaim_leaves();
-                let _ = std::fs::remove_dir(&cg.path);
+                let parent = cg.path.clone();
+                match std::fs::remove_dir(&parent) {
+                    Ok(()) => {}
+                    Err(e) if e.kind() == io::ErrorKind::NotFound => {}
+                    Err(_) => enqueue_cgroup_reclaim(parent, cg.leaf_dirs()),
+                }
             }
             // The `ProcessGroup` field hard-kills its tracked groups in its own
             // `Drop`, which runs as this `Job` is torn down — nothing to do here.
@@ -5247,9 +5477,36 @@ mod leaf_cgroup_tests {
     use std::cell::Cell;
     use std::io;
     use std::path::{Path, PathBuf};
+    use std::time::Duration;
 
-    use super::{Backend, Cgroup, Job, LEAF_RECLAIM_FLOOR, LeafSlot};
+    use super::{
+        Backend, Cgroup, CgroupReclaim, CgroupReclaimerState, Job, LEAF_RECLAIM_FLOOR, LeafSlot,
+        enqueue_cgroup_reclaim,
+    };
     use crate::sys::SkipDropKill;
+
+    #[cfg(not(feature = "tracing"))]
+    struct ClosedDiagnosticSink {
+        writes: usize,
+    }
+
+    #[cfg(not(feature = "tracing"))]
+    impl io::Write for ClosedDiagnosticSink {
+        fn write(&mut self, _buffer: &[u8]) -> io::Result<usize> {
+            self.writes += 1;
+            Err(io::Error::new(
+                io::ErrorKind::BrokenPipe,
+                "diagnostic sink is closed",
+            ))
+        }
+
+        fn flush(&mut self) -> io::Result<()> {
+            Err(io::Error::new(
+                io::ErrorKind::BrokenPipe,
+                "diagnostic sink is closed",
+            ))
+        }
+    }
 
     /// A stand-in job cgroup on a real temporary directory, carrying the two
     /// interface files this backend writes on it (`cgroup.procs` for an adopted
@@ -5642,6 +5899,177 @@ mod leaf_cgroup_tests {
         );
         drop(tmp);
     }
+
+    /// A busy survivor leaf is retained while a drained sibling is reclaimed;
+    /// after the survivor leaves, the same request can safely remove both the
+    /// leaf and its parent. This is the kernel-confirmed release rule used by
+    /// the process-wide reclaimer (a nested directory stands in for a populated
+    /// cgroup without requiring delegated cgroup v2 in the test environment).
+    #[test]
+    fn eventual_reclaim_keeps_busy_leaf_until_the_survivor_drains() {
+        let tmp = tempfile::tempdir().expect("create a reclaim test directory");
+        let parent = tmp.path().join("processkit-job");
+        let busy = parent.join("spawn-busy");
+        let drained = parent.join("spawn-drained");
+        let survivor = busy.join("survivor");
+        std::fs::create_dir(&parent).expect("create parent");
+        std::fs::create_dir(&busy).expect("create busy leaf");
+        std::fs::create_dir(&survivor).expect("stand in for the live survivor");
+        std::fs::create_dir(&drained).expect("create drained leaf");
+
+        let mut request = CgroupReclaim {
+            parent: parent.clone(),
+            leaves: vec![busy.clone(), drained.clone()],
+            attempts: 0,
+        };
+        assert!(
+            !request.reclaim_once(),
+            "a busy survivor keeps the request pending"
+        );
+        assert!(busy.exists(), "the busy leaf stays registered");
+        assert!(
+            !drained.exists(),
+            "the drained sibling is reclaimed immediately"
+        );
+        assert_eq!(request.leaves, vec![busy.clone()]);
+
+        std::fs::remove_dir(&survivor).expect("the survivor leaves its cgroup");
+        assert!(
+            request.reclaim_once(),
+            "the final reclaim removes leaf and parent"
+        );
+        assert!(!busy.exists(), "the formerly busy leaf is now reclaimed");
+        assert!(
+            !parent.exists(),
+            "the empty parent is reclaimed after its leaf"
+        );
+    }
+
+    /// The handoff path is the production shape after a non-escalating `Drop`:
+    /// cleanup starts while a survivor keeps the leaf busy, then retries after
+    /// the stand-in survivor drains without ever issuing a kill.
+    #[test]
+    fn process_wide_reclaimer_retries_after_survivor_release() {
+        let tmp = tempfile::tempdir().expect("create a reclaim test directory");
+        let parent = tmp.path().join("processkit-job");
+        let leaf = parent.join("spawn-survivor");
+        let survivor = leaf.join("survivor");
+        std::fs::create_dir(&parent).expect("create parent");
+        std::fs::create_dir(&leaf).expect("create leaf");
+        std::fs::create_dir(&survivor).expect("stand in for the live survivor");
+
+        enqueue_cgroup_reclaim(parent.clone(), vec![leaf.clone()]);
+        std::thread::sleep(Duration::from_millis(30));
+        assert!(
+            parent.exists(),
+            "a live survivor keeps the handed-off cgroup contained"
+        );
+
+        std::fs::remove_dir(&survivor).expect("the survivor leaves its cgroup");
+        for _ in 0..200 {
+            if !parent.exists() {
+                return;
+            }
+            std::thread::sleep(Duration::from_millis(10));
+        }
+        panic!("the process-wide reclaimer did not remove {parent:?} after the survivor drained");
+    }
+
+    /// A broken handoff must return the request to durable state instead of
+    /// dropping it after one synchronous reclaim attempt. The next manager can
+    /// accept the same request, which then keeps retrying until the survivor's
+    /// stand-in leaves the leaf.
+    #[test]
+    fn refused_reclaimer_handoff_is_retained_for_a_later_manager() {
+        let tmp = tempfile::tempdir().expect("create a reclaim test directory");
+        let parent = tmp.path().join("processkit-job");
+        let leaf = parent.join("spawn-survivor");
+        let survivor = leaf.join("survivor");
+        std::fs::create_dir(&parent).expect("create parent");
+        std::fs::create_dir(&leaf).expect("create leaf");
+        std::fs::create_dir(&survivor).expect("stand in for the live survivor");
+
+        let mut state = CgroupReclaimerState {
+            sender: None,
+            pending: vec![CgroupReclaim {
+                parent: parent.clone(),
+                leaves: vec![leaf.clone()],
+                attempts: 0,
+            }],
+        };
+        let (refused_sender, refused_receiver) = std::sync::mpsc::channel();
+        drop(refused_receiver);
+        assert_eq!(
+            state
+                .send_pending(&refused_sender)
+                .expect_err("a closed manager must refuse the handoff")
+                .kind(),
+            io::ErrorKind::BrokenPipe
+        );
+        assert_eq!(
+            state.pending.len(),
+            1,
+            "SendError must return the request to the durable queue"
+        );
+
+        let (sender, receiver) = std::sync::mpsc::channel();
+        state
+            .send_pending(&sender)
+            .expect("a later manager accepts the retained request");
+        let mut request = receiver.recv().expect("receive the retained request");
+        assert!(
+            !request.reclaim_once(),
+            "the survivor still keeps the leaf busy"
+        );
+        assert!(leaf.exists(), "reclaim must not evict a live survivor");
+
+        std::fs::remove_dir(&survivor).expect("the survivor leaves its cgroup");
+        assert!(
+            request.reclaim_once(),
+            "the retained request must remain retryable until removal is confirmed"
+        );
+        assert!(
+            !parent.exists(),
+            "the later retry removes the empty hierarchy"
+        );
+    }
+
+    /// Diagnostics must remain best-effort: a closed stderr-equivalent sink
+    /// cannot abort the manager while the failed reclaim request remains
+    /// pending for a later retry.
+    #[cfg(not(feature = "tracing"))]
+    #[test]
+    fn closed_diagnostic_sink_does_not_drop_pending_reclaim() {
+        let tmp = tempfile::tempdir().expect("create a reclaim test directory");
+        let parent = tmp.path().join("processkit-job");
+        let leaf = parent.join("spawn-survivor");
+        let survivor = leaf.join("survivor");
+        std::fs::create_dir(&parent).expect("create parent");
+        std::fs::create_dir(&leaf).expect("create leaf");
+        std::fs::create_dir(&survivor).expect("stand in for the live survivor");
+
+        let mut request = CgroupReclaim {
+            parent: parent.clone(),
+            leaves: vec![leaf.clone()],
+            attempts: 0,
+        };
+        let mut sink = ClosedDiagnosticSink { writes: 0 };
+        assert!(
+            !request.reclaim_once_with(|scope, kind, attempt| {
+                super::write_cgroup_reclaim_failure(&mut sink, scope, kind, attempt)
+            }),
+            "a live survivor keeps the request pending"
+        );
+        assert_eq!(sink.writes, 1, "the failed diagnostic write was attempted");
+        assert!(leaf.exists(), "the failed reclaim remains registered");
+
+        std::fs::remove_dir(&survivor).expect("the survivor leaves its cgroup");
+        assert!(
+            request.reclaim_once(),
+            "the pending request remains retryable after diagnostic failure"
+        );
+        assert!(!parent.exists(), "the later retry removes the hierarchy");
+    }
 }
 
 /// T-273's leaf machinery against a **real cgroup v2 hierarchy** — the half of the
@@ -5860,6 +6288,60 @@ mod real_cgroup_leaf_tests {
         );
         reap(first).await;
         reap(second).await;
+    }
+
+    /// A non-escalating graceful shutdown leaves the direct child alive and in
+    /// its leaf after `Job` is dropped. Once the caller later terminates that
+    /// survivor, the detached reclaimer removes the leaf and parent rather than
+    /// preserving an empty cgroup hierarchy forever.
+    #[tokio::test(flavor = "current_thread")]
+    #[ignore = "creates real cgroups and spawns real subprocesses"]
+    async fn non_escalating_shutdown_reclaims_after_the_survivor_exits() {
+        let Some((job, dir)) = cgroup_job() else {
+            return;
+        };
+        let mut survivor = Command::new("sh");
+        // The ignored TERM disposition survives the exec, so the direct child
+        // remains a single process in its leaf and can be terminated explicitly
+        // after the non-escalating shutdown has handed containment away.
+        survivor.args(["-c", "trap '' TERM; exec sleep 60"]);
+        let mut child = job
+            .spawn(&mut survivor, &SpawnOptions::default())
+            .expect("spawn the survivor");
+        let pid = child.id().expect("a survivor pid");
+
+        job.graceful_shutdown(libc::SIGTERM, Duration::from_millis(20), false)
+            .await
+            .expect("non-escalating graceful shutdown");
+        assert!(
+            child.try_wait().expect("probe survivor").is_none(),
+            "the survivor must remain alive after escalate=false"
+        );
+        let leaves = leaf_dirs_on_disk(&dir);
+        assert_eq!(
+            leaves.len(),
+            1,
+            "the survivor still has one containing leaf"
+        );
+        assert!(
+            procs_of(&leaves[0]).contains(&pid),
+            "the survivor remains in containment before Job::drop"
+        );
+
+        drop(job);
+        assert!(
+            child.try_wait().expect("probe spared survivor").is_none(),
+            "the detached reclaimer must never hard-kill a spared survivor"
+        );
+        reap(child).await;
+
+        for _ in 0..300 {
+            if !dir.exists() {
+                return;
+            }
+            tokio::time::sleep(Duration::from_millis(10)).await;
+        }
+        panic!("the cgroup hierarchy {dir:?} remained after its survivor exited");
     }
 
     /// A launch that never produces a child leaves no leaf directory behind, so a
