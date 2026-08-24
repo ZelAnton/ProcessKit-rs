@@ -75,6 +75,20 @@ fn cgroup_reclaimer_state() -> &'static Mutex<CgroupReclaimerState> {
     })
 }
 
+#[cfg(not(feature = "tracing"))]
+fn write_cgroup_reclaim_failure<W: io::Write>(
+    writer: &mut W,
+    scope: &'static str,
+    kind: io::ErrorKind,
+    attempt: u64,
+) {
+    let _ = writeln!(
+        writer,
+        "processkit: cgroup cleanup is pending (scope={scope}, error={kind:?}, attempt={attempt}); \
+         the directory remains registered for retry"
+    );
+}
+
 fn report_cgroup_reclaim_failure(scope: &'static str, kind: io::ErrorKind, attempt: u64) {
     // A busy cgroup is expected while a non-escalating survivor is alive, so do
     // not emit one warning per 10 ms poll. The first refusal and periodic
@@ -96,10 +110,12 @@ fn report_cgroup_reclaim_failure(scope: &'static str, kind: io::ErrorKind, attem
         );
     }
     #[cfg(not(feature = "tracing"))]
-    eprintln!(
-        "processkit: cgroup cleanup is pending (scope={scope}, error={kind:?}, attempt={attempt}); \
-         the directory remains registered for retry"
-    );
+    {
+        // An embedding process may close stderr; diagnostics must not abort the
+        // sole reclaimer thread and strand its still-contained request.
+        let mut stderr = io::stderr();
+        write_cgroup_reclaim_failure(&mut stderr, scope, kind, attempt);
+    }
 }
 
 impl CgroupReclaim {
@@ -108,6 +124,13 @@ impl CgroupReclaim {
     /// somebody else already removed it). Every other error keeps the path for
     /// the next pass, preserving the survivor's containment and enumeration.
     fn reclaim_once(&mut self) -> bool {
+        self.reclaim_once_with(report_cgroup_reclaim_failure)
+    }
+
+    fn reclaim_once_with(
+        &mut self,
+        mut report: impl FnMut(&'static str, io::ErrorKind, u64),
+    ) -> bool {
         self.attempts = self.attempts.saturating_add(1);
         let attempt = self.attempts;
         let mut pending_leaf = false;
@@ -116,7 +139,7 @@ impl CgroupReclaim {
             Err(error) if error.kind() == io::ErrorKind::NotFound => false,
             Err(error) => {
                 pending_leaf = true;
-                report_cgroup_reclaim_failure("leaf", error.kind(), attempt);
+                report("leaf", error.kind(), attempt);
                 true
             }
         });
@@ -133,7 +156,7 @@ impl CgroupReclaim {
             Ok(()) => true,
             Err(error) if error.kind() == io::ErrorKind::NotFound => true,
             Err(error) => {
-                report_cgroup_reclaim_failure("parent", error.kind(), attempt);
+                report("parent", error.kind(), attempt);
                 false
             }
         }
@@ -5462,6 +5485,29 @@ mod leaf_cgroup_tests {
     };
     use crate::sys::SkipDropKill;
 
+    #[cfg(not(feature = "tracing"))]
+    struct ClosedDiagnosticSink {
+        writes: usize,
+    }
+
+    #[cfg(not(feature = "tracing"))]
+    impl io::Write for ClosedDiagnosticSink {
+        fn write(&mut self, _buffer: &[u8]) -> io::Result<usize> {
+            self.writes += 1;
+            Err(io::Error::new(
+                io::ErrorKind::BrokenPipe,
+                "diagnostic sink is closed",
+            ))
+        }
+
+        fn flush(&mut self) -> io::Result<()> {
+            Err(io::Error::new(
+                io::ErrorKind::BrokenPipe,
+                "diagnostic sink is closed",
+            ))
+        }
+    }
+
     /// A stand-in job cgroup on a real temporary directory, carrying the two
     /// interface files this backend writes on it (`cgroup.procs` for an adopted
     /// member, `cgroup.kill` for the whole-job teardown), both empty.
@@ -5986,6 +6032,43 @@ mod leaf_cgroup_tests {
             !parent.exists(),
             "the later retry removes the empty hierarchy"
         );
+    }
+
+    /// Diagnostics must remain best-effort: a closed stderr-equivalent sink
+    /// cannot abort the manager while the failed reclaim request remains
+    /// pending for a later retry.
+    #[cfg(not(feature = "tracing"))]
+    #[test]
+    fn closed_diagnostic_sink_does_not_drop_pending_reclaim() {
+        let tmp = tempfile::tempdir().expect("create a reclaim test directory");
+        let parent = tmp.path().join("processkit-job");
+        let leaf = parent.join("spawn-survivor");
+        let survivor = leaf.join("survivor");
+        std::fs::create_dir(&parent).expect("create parent");
+        std::fs::create_dir(&leaf).expect("create leaf");
+        std::fs::create_dir(&survivor).expect("stand in for the live survivor");
+
+        let mut request = CgroupReclaim {
+            parent: parent.clone(),
+            leaves: vec![leaf.clone()],
+            attempts: 0,
+        };
+        let mut sink = ClosedDiagnosticSink { writes: 0 };
+        assert!(
+            !request.reclaim_once_with(|scope, kind, attempt| {
+                super::write_cgroup_reclaim_failure(&mut sink, scope, kind, attempt)
+            }),
+            "a live survivor keeps the request pending"
+        );
+        assert_eq!(sink.writes, 1, "the failed diagnostic write was attempted");
+        assert!(leaf.exists(), "the failed reclaim remains registered");
+
+        std::fs::remove_dir(&survivor).expect("the survivor leaves its cgroup");
+        assert!(
+            request.reclaim_once(),
+            "the pending request remains retryable after diagnostic failure"
+        );
+        assert!(!parent.exists(), "the later retry removes the hierarchy");
     }
 }
 
