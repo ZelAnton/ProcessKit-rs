@@ -65,6 +65,8 @@ struct CgroupReclaimerState {
 }
 
 static CGROUP_RECLAIMER: OnceLock<Mutex<CgroupReclaimerState>> = OnceLock::new();
+#[cfg(test)]
+static CGROUP_RECLAIMER_TEST_LOCK: Mutex<()> = Mutex::new(());
 
 fn cgroup_reclaimer_state() -> &'static Mutex<CgroupReclaimerState> {
     CGROUP_RECLAIMER.get_or_init(|| {
@@ -73,6 +75,15 @@ fn cgroup_reclaimer_state() -> &'static Mutex<CgroupReclaimerState> {
             pending: Vec::new(),
         })
     })
+}
+
+fn lock_cgroup_reclaimer(
+    reclaimer: &Mutex<CgroupReclaimerState>,
+) -> std::sync::MutexGuard<'_, CgroupReclaimerState> {
+    // `Job::drop` cannot propagate poison; the inner queue still owns cleanup.
+    reclaimer
+        .lock()
+        .unwrap_or_else(|poisoned| poisoned.into_inner())
 }
 
 #[cfg(not(feature = "tracing"))]
@@ -256,20 +267,37 @@ fn cgroup_reclaim_loop(receiver: Receiver<CgroupReclaim>) {
 /// is recorded in the durable queue and made observable while the paths remain
 /// untouched for a later retry.
 fn enqueue_cgroup_reclaim(parent: PathBuf, leaves: Vec<PathBuf>) {
+    #[cfg(test)]
+    // Deliberate unwind regressions may poison their serialization gate too.
+    let _test_guard = CGROUP_RECLAIMER_TEST_LOCK
+        .lock()
+        .unwrap_or_else(|poisoned| poisoned.into_inner());
+    enqueue_cgroup_reclaim_with_state(cgroup_reclaimer_state(), parent, leaves);
+}
+
+fn enqueue_cgroup_reclaim_with_state(
+    reclaimer: &Mutex<CgroupReclaimerState>,
+    parent: PathBuf,
+    leaves: Vec<PathBuf>,
+) {
     let request = CgroupReclaim {
         parent,
         leaves,
         attempts: 0,
     };
 
-    let state = cgroup_reclaimer_state();
-    let mut state = state.lock().expect("cgroup reclaimer state poisoned");
-    state.pending.push(request);
+    let start_error = {
+        let mut state = lock_cgroup_reclaimer(reclaimer);
+        state.pending.push(request);
 
-    // A transient thread-resource failure must not be cached forever. One
-    // enqueue performs one start attempt; subsequent drops retry without ever
-    // discarding the requests already in `pending`.
-    if let Err(error) = start_cgroup_reclaimer(&mut state) {
+        // A transient thread-resource failure must not be cached forever. One
+        // enqueue performs one start attempt; subsequent drops retry without ever
+        // discarding the requests already in `pending`.
+        start_cgroup_reclaimer(&mut state).err()
+    };
+
+    // An embedding tracing subscriber may panic; never let it poison handoff state.
+    if let Some(error) = start_error {
         report_cgroup_reclaim_failure("handoff", error.kind(), 1);
     }
 }
@@ -5477,11 +5505,13 @@ mod leaf_cgroup_tests {
     use std::cell::Cell;
     use std::io;
     use std::path::{Path, PathBuf};
+    use std::sync::Mutex;
     use std::time::Duration;
 
     use super::{
-        Backend, Cgroup, CgroupReclaim, CgroupReclaimerState, Job, LEAF_RECLAIM_FLOOR, LeafSlot,
-        enqueue_cgroup_reclaim,
+        Backend, CGROUP_RECLAIMER_TEST_LOCK, Cgroup, CgroupReclaim, CgroupReclaimerState, Job,
+        LEAF_RECLAIM_FLOOR, LeafSlot, cgroup_reclaimer_state, enqueue_cgroup_reclaim,
+        enqueue_cgroup_reclaim_with_state, lock_cgroup_reclaimer,
     };
     use crate::sys::SkipDropKill;
 
@@ -6032,6 +6062,133 @@ mod leaf_cgroup_tests {
             !parent.exists(),
             "the later retry removes the empty hierarchy"
         );
+    }
+
+    /// Poisoning cannot turn an already queued cgroup into a lost request or make
+    /// the next `Job::drop` abort an outer unwind. The global state is serialized,
+    /// snapshotted and restored so parallel tests never inherit the deliberate
+    /// poison or this test's synthetic queue.
+    #[test]
+    fn poisoned_reclaimer_preserves_pending_and_recovers_during_unwind() {
+        struct RestoreReclaimerState<'a> {
+            reclaimer: &'a Mutex<CgroupReclaimerState>,
+            saved: Option<CgroupReclaimerState>,
+        }
+
+        impl Drop for RestoreReclaimerState<'_> {
+            fn drop(&mut self) {
+                let Some(saved) = self.saved.take() else {
+                    return;
+                };
+                let mut state = lock_cgroup_reclaimer(self.reclaimer);
+                let test_state = std::mem::replace(&mut *state, saved);
+                drop(state);
+                drop(test_state);
+                self.reclaimer.clear_poison();
+            }
+        }
+
+        struct EnqueueOnDrop<'a> {
+            reclaimer: &'a Mutex<CgroupReclaimerState>,
+            parent: Option<PathBuf>,
+        }
+
+        impl Drop for EnqueueOnDrop<'_> {
+            fn drop(&mut self) {
+                if let Some(parent) = self.parent.take() {
+                    enqueue_cgroup_reclaim_with_state(self.reclaimer, parent, Vec::new());
+                }
+            }
+        }
+
+        let retained_parent = PathBuf::from("pending-before-poison");
+        let unwind_parent = PathBuf::from("enqueued-during-unwind");
+        let retry_parent = PathBuf::from("enqueued-on-retry");
+        let (refused_sender, refused_receiver) = std::sync::mpsc::channel();
+        drop(refused_receiver);
+        // A failed assertion must not strand the test gate for later regressions.
+        let _serial = CGROUP_RECLAIMER_TEST_LOCK
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner());
+        let reclaimer = cgroup_reclaimer_state();
+        let saved = {
+            let mut state = lock_cgroup_reclaimer(reclaimer);
+            std::mem::replace(
+                &mut *state,
+                CgroupReclaimerState {
+                    sender: Some(refused_sender),
+                    pending: vec![CgroupReclaim {
+                        parent: retained_parent.clone(),
+                        leaves: Vec::new(),
+                        attempts: 0,
+                    }],
+                },
+            )
+        };
+        let saved_pending_len = saved.pending.len();
+        let saved_had_sender = saved.sender.is_some();
+        reclaimer.clear_poison();
+        let restore = RestoreReclaimerState {
+            reclaimer,
+            saved: Some(saved),
+        };
+
+        let poison = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+            let _state = reclaimer.lock().expect("lock the fresh reclaimer state");
+            panic!("poison the reclaimer state");
+        }));
+        assert!(poison.is_err(), "the setup panic must poison the mutex");
+        assert!(reclaimer.is_poisoned(), "the test must exercise recovery");
+
+        let unwind = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+            let _enqueue_on_drop = EnqueueOnDrop {
+                reclaimer,
+                parent: Some(unwind_parent.clone()),
+            };
+            panic!("exercise enqueue while another unwind is active");
+        }));
+        assert!(unwind.is_err(), "only the deliberate outer panic is caught");
+
+        let (retry_sender, retry_receiver) = std::sync::mpsc::channel();
+        {
+            let mut state = lock_cgroup_reclaimer(reclaimer);
+            assert_eq!(state.pending.len(), 2, "both requests remain durable");
+            assert_eq!(state.pending[0].parent, retained_parent);
+            assert_eq!(state.pending[1].parent, unwind_parent);
+            assert!(
+                state.sender.is_none(),
+                "a refused sender must be retired for the next retry"
+            );
+            state.sender = Some(retry_sender);
+        }
+
+        enqueue_cgroup_reclaim_with_state(reclaimer, retry_parent.clone(), Vec::new());
+        let received = (0..3)
+            .map(|_| {
+                retry_receiver
+                    .recv_timeout(Duration::from_secs(1))
+                    .expect("the replacement manager receives every pending request")
+                    .parent
+            })
+            .collect::<Vec<_>>();
+        assert_eq!(
+            received,
+            [retained_parent, unwind_parent, retry_parent],
+            "recovery preserves queue order and the retry drains old and new work"
+        );
+        assert!(
+            lock_cgroup_reclaimer(reclaimer).pending.is_empty(),
+            "the successful retry must leave no request stranded"
+        );
+
+        drop(restore);
+        assert!(
+            !reclaimer.is_poisoned(),
+            "the deliberate poison must not escape this test"
+        );
+        let restored = lock_cgroup_reclaimer(reclaimer);
+        assert_eq!(restored.pending.len(), saved_pending_len);
+        assert_eq!(restored.sender.is_some(), saved_had_sender);
     }
 
     /// Diagnostics must remain best-effort: a closed stderr-equivalent sink
