@@ -6,20 +6,29 @@
 > "won't do / won't change" decisions live in [`decisions/`](decisions/). See
 > [`ideas/README.md`](ideas/README.md) for the taxonomy.
 >
-> **Stability since 1.0.** The crate has shipped **1.0** and follows
-> [Semantic Versioning](https://semver.org/): the public API is stable, and any
-> breaking change lands only in a new **major** version. One breaking major has
-> shipped (**2.1.0**, reshaping parts of the public interface), and a **3.0 major is
-> now in preparation** — it collects this cycle's breaking changes (the `Error` struct
-> reshape and the `output_events()` → `events()` / `OutputEvent` → `ProcessEvent` stream
-> rename) under [`[Unreleased]`](CHANGELOG.md); see [Upgrading](docs/upgrading.md) for
-> the migration. Items below respect the same discipline: additive work can ride the
-> current line, and anything that would reshape the public interface again is batched
-> into the pending major rather than slipped into a minor. (The history above this point
-> describes the pre-1.0 development sweeps, when the shape could still move freely.)
+> **Stability since 1.0.** The crate follows
+> [Semantic Versioning](https://semver.org/): the public API is stable within a
+> major line, and breaking changes land only in a new major version. The current
+> implementation and API are the Tokio-based v3 line. The next breaking window is
+> v4; its proposed architecture and delivery gates are documented in the
+> [runtime-neutral v4 roadmap](docs/runtime-neutral-v4-roadmap.md). Historical
+> entries below retain the release language used when they were written.
 >
 > Items are roughly ordered by leverage, not strict sequence. Cost is a gut
 > estimate (trivial / moderate / major).
+
+## Next major — runtime-neutral v4
+
+The recommended v4 direction is a **runtime-neutral `processkit` core with
+replaceable, additive backends**. Tokio and async-io are the initial official
+backends; applications may use either or both, and the core plus async-io path
+must remain strictly Tokio-free. Runtime choice is explicit on a non-generic
+`ProcessKit` owner, while platform containment remains one shared implementation.
+
+This is a future architecture, not functionality available in v3. Goals,
+non-goals, capability contracts, migration examples, feasibility spikes, risks,
+effort ranges, conformance gates, and release criteria live in the
+**[ProcessKit v4 runtime-neutral roadmap](docs/runtime-neutral-v4-roadmap.md)**.
 
 ## Shipped
 
@@ -199,9 +208,11 @@ line. Verified fmt/clippy/doc/test/cross-compile.
   `before_spawn` raw-`Command` mutator) was assessed and **declined**
   ([`decisions/before-spawn-hook-2026-07.md`](decisions/before-spawn-hook-2026-07.md)),
   leaving the now-documented `Command::to_tokio_command()` as the honest escape hatch.
-  The rest (runtime-agnostic, lite/sys split, observability/docs-site, cassette-cwd
-  portability, retry jitter, internal-simplification notes) remain gated on a concrete
-  consumer or further-out — see those records.
+  Runtime-neutral execution has since been promoted to the explicit
+  [v4 roadmap](docs/runtime-neutral-v4-roadmap.md). The remaining items (lite/sys
+  split, observability/docs-site, cassette-cwd portability, retry jitter, and
+  internal-simplification notes) stay gated on a concrete consumer or further-out —
+  see those records.
 - **`cargo-semver-checks` + clippy `pedantic`** stay in `ideas/next-ci-*` — semver-checks
   pays off only *after* the 1.0 freeze; full pedantic is a noisy triage. The targeted
   `# Errors`/`# Panics` doc convention (the high-value slice of pedantic for this
