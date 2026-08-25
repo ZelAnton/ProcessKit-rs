@@ -545,7 +545,9 @@ async fn unix_pty_drop_delivers_eof_after_the_child_resumes_reading() {
     // This live smoke test exercises only the real public lifecycle: dropping
     // the writer injects canonical VEOF, the reading child observes EOF, and the
     // owned process handle bounds and cleans up every failure path.
-    let child = Command::new("sh").args(["-c", "cat >/dev/null; printf 'EOF\\n'"]);
+    // `&&` is part of the verdict: a read error must suppress the marker and
+    // preserve the non-zero shell status instead of masquerading as EOF.
+    let child = Command::new("sh").args(["-c", "cat >/dev/null && printf 'EOF\\n'"]);
     let mut process = JobRunner::new()
         .start(&child.use_pty().keep_stdin_open())
         .await
