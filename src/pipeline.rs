@@ -277,7 +277,10 @@ struct RetainedStageCapture {
     unchecked: bool,
     ok_codes: Vec<i32>,
     timeout: Option<Duration>,
-    tracker: RetainedCapture,
+    // The checkpoint contains shared pump state whose `Notify` is not unwind-safe
+    // on its own. A standard mutex makes the immutable checkpoint poison-aware and
+    // preserves `PipelineSession`'s established unwind-safety auto traits.
+    tracker: Arc<std::sync::Mutex<RetainedCapture>>,
 }
 
 enum RetainedCapture {
@@ -309,7 +312,13 @@ fn prepare_retained_capture(process: &mut RunningProcess) -> RetainedCapture {
 
 impl RetainedStageCapture {
     fn retained_outcome(&self, torn_down: bool) -> InnerStage {
-        let (stderr, stderr_truncated) = self.tracker.stderr_snapshot();
+        // Snapshot shaping may invoke user policy code; a panic there does not
+        // invalidate the immutable checkpoint, so poisoning is unactionable.
+        let tracker = self
+            .tracker
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner());
+        let (stderr, stderr_truncated) = tracker.stderr_snapshot();
         (
             self.index,
             StageOutcome {
@@ -874,7 +883,7 @@ impl Pipeline {
                 unchecked,
                 ok_codes: ok_codes.clone(),
                 timeout,
-                tracker: RetainedCapture::Lines(tracker),
+                tracker: Arc::new(std::sync::Mutex::new(RetainedCapture::Lines(tracker))),
             });
             let teardown = teardown.clone();
             let teardown_cause = teardown_cause.clone();
@@ -1896,7 +1905,7 @@ impl PipelineSession {
                 unchecked: self.last_unchecked,
                 ok_codes: self.last_ok_codes.clone(),
                 timeout: self.last_timeout,
-                tracker,
+                tracker: Arc::new(std::sync::Mutex::new(tracker)),
             });
         }
         let teardown = self.teardown.clone();
@@ -2157,7 +2166,7 @@ impl PipelineSession {
             unchecked: self.last_unchecked,
             ok_codes: self.last_ok_codes.clone(),
             timeout: self.last_timeout,
-            tracker,
+            tracker: Arc::new(std::sync::Mutex::new(tracker)),
         });
     }
 
@@ -3489,7 +3498,7 @@ mod tests {
                     marker.display()
                 ),
             ]);
-            return producer.pipe(consumer);
+            producer.pipe(consumer)
         }
         #[cfg(windows)]
         {
@@ -3556,7 +3565,7 @@ mod tests {
                 ])
                 .stdout(stdout_mode)
                 .output_buffer(crate::OutputBufferPolicy::bounded(1));
-            return producer.pipe(consumer);
+            producer.pipe(consumer)
         }
         #[cfg(windows)]
         {
@@ -4870,8 +4879,9 @@ mod tests {
     }
 
     /// Compile-time proof that sharing the last stage's handle with the standing
-    /// watcher did not cost the session any auto trait: a [`PipelineSession`] is
-    /// still `Send + Sync`, and its readiness probe's future is still `Send`.
+    /// watcher and retained teardown captures did not cost the session any auto
+    /// trait: a [`PipelineSession`] is still `Send + Sync + UnwindSafe +
+    /// RefUnwindSafe`, and its readiness probe's future is still `Send`.
     ///
     /// Both are load-bearing and neither is observable from this crate's own
     /// `#[tokio::test]`s (a current-thread runtime never requires `Send`), so they
@@ -4884,7 +4894,9 @@ mod tests {
     fn session_and_its_probe_future_stay_send(session: &mut PipelineSession) {
         fn assert_send<T: Send>(_: &T) {}
         fn assert_send_sync<T: Send + Sync>(_: &T) {}
+        fn assert_unwind_safe<T: std::panic::UnwindSafe + std::panic::RefUnwindSafe>(_: &T) {}
         assert_send_sync(session);
+        assert_unwind_safe(session);
         assert_send(&session.wait_for_line(|line| line.is_empty(), Duration::ZERO));
     }
 
