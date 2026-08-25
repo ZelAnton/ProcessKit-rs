@@ -4,7 +4,7 @@
 //! is retained (as the merged reader and the stdin writer); terminal echo is
 //! disabled so a written secret is not echoed back into the merged output.
 
-use std::future::Future;
+use std::future::{Future, poll_fn};
 use std::io;
 use std::io::{Read, Write};
 use std::os::fd::{FromRawFd, OwnedFd};
@@ -257,6 +257,18 @@ struct DeferredEof {
 type DeferredEofResponse = Option<tokio::sync::oneshot::Sender<io::Result<()>>>;
 
 impl DeferredEof {
+    fn channel() -> (Self, tokio::sync::oneshot::Receiver<DeferredEofResponse>) {
+        let (request, receiver) = tokio::sync::oneshot::channel();
+        (
+            Self {
+                request: Some(request),
+                response: None,
+                requested: false,
+            },
+            receiver,
+        )
+    }
+
     fn send_request(&mut self, response: DeferredEofResponse) -> Result<bool, ()> {
         if self.requested {
             return Ok(false);
@@ -268,18 +280,54 @@ impl DeferredEof {
         request.send(response).map_err(|_| ())?;
         Ok(true)
     }
+
+    fn poll_shutdown(&mut self, cx: &mut Context<'_>) -> Poll<io::Result<()>> {
+        if !self.requested {
+            let (response, receiver) = tokio::sync::oneshot::channel();
+            if self.send_request(Some(response)).is_err() {
+                return Poll::Ready(Err(io::Error::new(
+                    io::ErrorKind::BrokenPipe,
+                    "pty EOF delivery task stopped",
+                )));
+            }
+            self.response = Some(receiver);
+        }
+
+        let Some(response) = self.response.as_mut() else {
+            return Poll::Ready(Ok(()));
+        };
+        match Pin::new(response).poll(cx) {
+            Poll::Pending => Poll::Pending,
+            Poll::Ready(Ok(result)) => {
+                self.response = None;
+                Poll::Ready(result)
+            }
+            Poll::Ready(Err(_closed)) => {
+                self.response = None;
+                Poll::Ready(Err(io::Error::new(
+                    io::ErrorKind::BrokenPipe,
+                    "pty EOF delivery task stopped",
+                )))
+            }
+        }
+    }
 }
 
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-enum EofProgress {
-    Continue,
-    WouldBlock,
-    Complete,
+impl Drop for DeferredEof {
+    fn drop(&mut self) {
+        if !self.requested {
+            // Sending a oneshot request is synchronous and lossless. The task
+            // owns its own master dup, so it can await readiness after this
+            // public writer and its AsyncFd have gone away.
+            let _ = self.send_request(None);
+        }
+    }
 }
 
 /// Exactly-once progress for the two-byte terminal EOF gesture. Keeping byte
-/// accounting outside `AsyncFd` makes partial and `WouldBlock` transitions
-/// directly testable without relying on a kernel buffer's timing or capacity.
+/// accounting behind the [`EofSink`] readiness boundary makes partial and
+/// `WouldBlock` transitions directly testable without relying on a kernel
+/// buffer's timing or capacity.
 #[derive(Debug)]
 struct EofSequence {
     bytes: [u8; 2],
@@ -298,7 +346,7 @@ impl EofSequence {
         &self.bytes[self.written..]
     }
 
-    fn record_write(&mut self, result: io::Result<usize>) -> io::Result<EofProgress> {
+    fn record_write(&mut self, result: io::Result<usize>) -> io::Result<bool> {
         match result {
             Ok(0) => Err(io::Error::new(
                 io::ErrorKind::WriteZero,
@@ -306,18 +354,50 @@ impl EofSequence {
             )),
             Ok(written) if written <= self.remaining().len() => {
                 self.written += written;
-                Ok(if self.written == self.bytes.len() {
-                    EofProgress::Complete
-                } else {
-                    EofProgress::Continue
-                })
+                Ok(self.written == self.bytes.len())
             }
             Ok(_) => Err(io::Error::other(
                 "pty EOF writer reported more bytes than requested",
             )),
-            Err(error) if error.kind() == io::ErrorKind::WouldBlock => Ok(EofProgress::WouldBlock),
             Err(error) => Err(error),
         }
+    }
+}
+
+trait EofSink: Send + 'static {
+    fn poll_write(&mut self, cx: &mut Context<'_>, data: &[u8]) -> Poll<io::Result<usize>>;
+}
+
+struct AsyncFdEofSink {
+    master: AsyncFd<std::fs::File>,
+}
+
+fn poll_async_fd_write(
+    master: &mut AsyncFd<std::fs::File>,
+    cx: &mut Context<'_>,
+    data: &[u8],
+) -> Poll<io::Result<usize>> {
+    loop {
+        let mut guard = match master.poll_write_ready(cx) {
+            Poll::Ready(Ok(guard)) => guard,
+            Poll::Ready(Err(error)) => return Poll::Ready(Err(error)),
+            Poll::Pending => return Poll::Pending,
+        };
+        match guard.try_io(|inner| {
+            let mut file: &std::fs::File = inner.get_ref();
+            file.write(data)
+        }) {
+            Ok(result) => return Poll::Ready(result),
+            // A stale readiness observation maps a real `WouldBlock` to
+            // `Pending`; dropping the guard re-arms the reactor wait.
+            Err(_would_block) => continue,
+        }
+    }
+}
+
+impl EofSink for AsyncFdEofSink {
+    fn poll_write(&mut self, cx: &mut Context<'_>, data: &[u8]) -> Poll<io::Result<usize>> {
+        poll_async_fd_write(&mut self.master, cx, data)
     }
 }
 
@@ -373,65 +453,39 @@ impl AsyncPtyMaster {
     fn new_writer(fd: OwnedFd, eof_fd: OwnedFd, eof: u8) -> io::Result<Self> {
         let mut writer = Self::new(fd, "writer")?;
         set_nonblocking(&eof_fd)?;
-        let eof_master = AsyncFd::new(std::fs::File::from(eof_fd))?;
-        let (request, receiver) = tokio::sync::oneshot::channel();
-        tokio::spawn(deferred_eof_loop(eof_master, eof, receiver));
-        writer.deferred_eof = Some(DeferredEof {
-            request: Some(request),
-            response: None,
-            requested: false,
-        });
+        let sink = AsyncFdEofSink {
+            master: AsyncFd::new(std::fs::File::from(eof_fd))?,
+        };
+        let (deferred_eof, request) = DeferredEof::channel();
+        tokio::spawn(deferred_eof_loop(sink, eof, request));
+        writer.deferred_eof = Some(deferred_eof);
         Ok(writer)
     }
 
     fn poll_write_raw(&mut self, cx: &mut Context<'_>, data: &[u8]) -> Poll<io::Result<usize>> {
-        loop {
-            let mut guard = match self.master.poll_write_ready(cx) {
-                Poll::Ready(Ok(guard)) => guard,
-                Poll::Ready(Err(e)) => return Poll::Ready(Err(e)),
-                Poll::Pending => return Poll::Pending,
-            };
-            match guard.try_io(|inner| {
-                let mut file: &std::fs::File = inner.get_ref();
-                file.write(data)
-            }) {
-                Ok(result) => return Poll::Ready(result),
-                // `WouldBlock`: readiness consumed, loop to re-arm the wait.
-                Err(_would_block) => continue,
-            }
-        }
+        poll_async_fd_write(&mut self.master, cx, data)
     }
 }
 
-async fn deferred_eof_loop(
-    master: AsyncFd<std::fs::File>,
+async fn deferred_eof_loop<S: EofSink>(
+    sink: S,
     eof: u8,
     request: tokio::sync::oneshot::Receiver<DeferredEofResponse>,
 ) {
     let Ok(response) = request.await else {
         return;
     };
-    let result = deliver_eof(master, eof).await;
+    let result = deliver_eof(sink, eof).await;
     if let Some(response) = response {
         let _ = response.send(result);
     }
 }
 
-async fn deliver_eof(master: AsyncFd<std::fs::File>, eof: u8) -> io::Result<()> {
+async fn deliver_eof<S: EofSink>(mut sink: S, eof: u8) -> io::Result<()> {
     let mut sequence = EofSequence::new(eof);
     loop {
-        let mut guard = master.writable().await?;
-        let result = guard.try_io(|inner| {
-            let mut file: &std::fs::File = inner.get_ref();
-            file.write(sequence.remaining())
-        });
-        let progress = match result {
-            Ok(result) => sequence.record_write(result)?,
-            // `try_io` consumed the stale readiness and re-arms the next
-            // `writable().await`; the sequence remains byte-for-byte unchanged.
-            Err(_would_block) => EofProgress::WouldBlock,
-        };
-        if progress == EofProgress::Complete {
+        let result = poll_fn(|cx| sink.poll_write(cx, sequence.remaining())).await;
+        if sequence.record_write(result)? {
             return Ok(());
         }
     }
@@ -499,48 +553,7 @@ impl AsyncWrite for AsyncPtyMaster {
         let Some(eof) = this.deferred_eof.as_mut() else {
             return Poll::Ready(Ok(()));
         };
-        if !eof.requested {
-            let (response, receiver) = tokio::sync::oneshot::channel();
-            if eof.send_request(Some(response)).is_err() {
-                return Poll::Ready(Err(io::Error::new(
-                    io::ErrorKind::BrokenPipe,
-                    "pty EOF delivery task stopped",
-                )));
-            }
-            eof.response = Some(receiver);
-        }
-
-        let Some(response) = eof.response.as_mut() else {
-            return Poll::Ready(Ok(()));
-        };
-        match Pin::new(response).poll(cx) {
-            Poll::Pending => Poll::Pending,
-            Poll::Ready(Ok(result)) => {
-                eof.response = None;
-                Poll::Ready(result)
-            }
-            Poll::Ready(Err(_closed)) => {
-                eof.response = None;
-                Poll::Ready(Err(io::Error::new(
-                    io::ErrorKind::BrokenPipe,
-                    "pty EOF delivery task stopped",
-                )))
-            }
-        }
-    }
-}
-
-impl Drop for AsyncPtyMaster {
-    fn drop(&mut self) {
-        let Some(eof) = self.deferred_eof.as_mut() else {
-            return;
-        };
-        if !eof.requested {
-            // Sending a oneshot request is synchronous and lossless. The task
-            // owns its own master dup, so it can await readiness after this
-            // public writer and its AsyncFd have gone away.
-            let _ = eof.send_request(None);
-        }
+        eof.poll_shutdown(cx)
     }
 }
 
@@ -812,9 +825,11 @@ impl<R: FnOnce(u32)> Drop for PtySpawnRollback<R> {
 #[cfg(test)]
 mod tests {
     use std::cell::{Cell, RefCell};
+    use std::collections::VecDeque;
     use std::path::{Path, PathBuf};
     use std::sync::Arc;
     use std::sync::atomic::{AtomicU32, Ordering};
+    use std::task::Waker;
     use std::time::{Duration, Instant};
 
     use super::*;
@@ -852,52 +867,228 @@ mod tests {
     /// timing out with no pidfile written.
     const ESCAPEE_TEST: &str = "sys::pty::imp::tests::setsid_escapee_process";
 
-    #[test]
-    fn deferred_eof_sequence_survives_partial_write_and_would_block() {
-        let mut sequence = EofSequence::new(0x04);
+    #[derive(Clone, Copy)]
+    enum ScriptedEofStep {
+        Write(usize),
+        WouldBlock,
+        Error(io::ErrorKind),
+    }
 
-        assert_eq!(
-            sequence.record_write(Ok(1)).expect("accept first byte"),
-            EofProgress::Continue
-        );
-        assert_eq!(sequence.remaining(), &[0x04]);
-        assert_eq!(
-            sequence
-                .record_write(Err(io::Error::from(io::ErrorKind::WouldBlock)))
-                .expect("WouldBlock is a readiness transition"),
-            EofProgress::WouldBlock
-        );
-        assert_eq!(
-            sequence.remaining(),
-            &[0x04],
-            "WouldBlock must not consume the remaining EOF byte"
-        );
-        assert_eq!(
-            sequence.record_write(Ok(1)).expect("accept final byte"),
-            EofProgress::Complete
-        );
-        assert!(sequence.remaining().is_empty());
+    struct ScriptedEofState {
+        steps: VecDeque<ScriptedEofStep>,
+        written: Vec<u8>,
+        released: bool,
+        waker: Option<Waker>,
+        polls: usize,
+    }
+
+    struct ScriptedEofControl {
+        state: std::sync::Mutex<ScriptedEofState>,
+        blocked: std::sync::Mutex<Option<tokio::sync::oneshot::Sender<()>>>,
+    }
+
+    impl ScriptedEofControl {
+        fn release(&self) {
+            let waker = {
+                let mut state = self.state.lock().expect("scripted EOF state poisoned");
+                state.released = true;
+                state.waker.take()
+            };
+            if let Some(waker) = waker {
+                waker.wake();
+            }
+        }
+
+        fn written(&self) -> Vec<u8> {
+            self.state
+                .lock()
+                .expect("scripted EOF state poisoned")
+                .written
+                .clone()
+        }
+
+        fn polls(&self) -> usize {
+            self.state
+                .lock()
+                .expect("scripted EOF state poisoned")
+                .polls
+        }
+    }
+
+    struct ScriptedEofSink {
+        control: Arc<ScriptedEofControl>,
+    }
+
+    impl EofSink for ScriptedEofSink {
+        fn poll_write(&mut self, cx: &mut Context<'_>, data: &[u8]) -> Poll<io::Result<usize>> {
+            loop {
+                let mut state = self
+                    .control
+                    .state
+                    .lock()
+                    .expect("scripted EOF state poisoned");
+                state.polls += 1;
+                let step = *state
+                    .steps
+                    .front()
+                    .expect("scripted EOF sink exhausted before completion");
+                match step {
+                    ScriptedEofStep::Write(written) => {
+                        assert!(written <= data.len(), "scripted write exceeds input");
+                        state.written.extend_from_slice(&data[..written]);
+                        state.steps.pop_front();
+                        return Poll::Ready(Ok(written));
+                    }
+                    ScriptedEofStep::WouldBlock if !state.released => {
+                        state.waker = Some(cx.waker().clone());
+                        drop(state);
+                        if let Some(blocked) = self
+                            .control
+                            .blocked
+                            .lock()
+                            .expect("scripted EOF blocked signal poisoned")
+                            .take()
+                        {
+                            let _ = blocked.send(());
+                        }
+                        return Poll::Pending;
+                    }
+                    ScriptedEofStep::WouldBlock => {
+                        state.released = false;
+                        state.steps.pop_front();
+                    }
+                    ScriptedEofStep::Error(kind) => {
+                        state.steps.pop_front();
+                        return Poll::Ready(Err(io::Error::from(kind)));
+                    }
+                }
+            }
+        }
+    }
+
+    type ScriptedDeferredEof = (
+        DeferredEof,
+        Arc<ScriptedEofControl>,
+        tokio::sync::oneshot::Receiver<()>,
+        tokio::task::JoinHandle<()>,
+    );
+
+    fn scripted_deferred_eof(
+        steps: impl IntoIterator<Item = ScriptedEofStep>,
+    ) -> ScriptedDeferredEof {
+        let (blocked, reached_block) = tokio::sync::oneshot::channel();
+        let control = Arc::new(ScriptedEofControl {
+            state: std::sync::Mutex::new(ScriptedEofState {
+                steps: steps.into_iter().collect(),
+                written: Vec::new(),
+                released: false,
+                waker: None,
+                polls: 0,
+            }),
+            blocked: std::sync::Mutex::new(Some(blocked)),
+        });
+        let (deferred, request) = DeferredEof::channel();
+        let task = tokio::spawn(deferred_eof_loop(
+            ScriptedEofSink {
+                control: Arc::clone(&control),
+            },
+            0x04,
+            request,
+        ));
+        (deferred, control, reached_block, task)
     }
 
     #[tokio::test]
-    async fn explicit_eof_request_suppresses_drop_fallback() {
-        let (request, receiver) = tokio::sync::oneshot::channel();
-        let mut deferred = DeferredEof {
-            request: Some(request),
-            response: None,
-            requested: false,
-        };
-        let (ack, _ack_receiver) = tokio::sync::oneshot::channel();
+    async fn dropped_writer_rearms_after_partial_write_and_would_block() {
+        let (deferred, control, reached_block, task) = scripted_deferred_eof([
+            ScriptedEofStep::Write(1),
+            ScriptedEofStep::WouldBlock,
+            ScriptedEofStep::Write(1),
+        ]);
 
-        assert_eq!(deferred.send_request(Some(ack)), Ok(true));
+        // This is the production Drop owner: destroying it sends the request
+        // that wakes `deferred_eof_loop`; no test calls `deliver_eof` directly.
+        drop(deferred);
+        tokio::time::timeout(Duration::from_secs(1), reached_block)
+            .await
+            .expect("Drop request must reach the forced WouldBlock")
+            .expect("scripted sink must report WouldBlock");
+        assert!(
+            !task.is_finished(),
+            "the deferred task must remain pending until readiness is re-armed"
+        );
+        assert_eq!(control.written(), [0x04]);
+
+        control.release();
+        tokio::time::timeout(Duration::from_secs(1), task)
+            .await
+            .expect("released deferred EOF must complete in bounded time")
+            .expect("deferred EOF task must not panic");
         assert_eq!(
-            deferred.send_request(None),
-            Ok(false),
-            "a completed or in-flight explicit shutdown owns the sole request"
+            control.written(),
+            [0x04, 0x04],
+            "partial progress must resume at the remaining byte and emit VEOF exactly once"
         );
         assert!(
-            receiver.await.expect("receive the sole request").is_some(),
-            "the request carrying explicit acknowledgement must win"
+            control.polls() >= 3,
+            "partial, pending, and resumed polls ran"
+        );
+    }
+
+    #[tokio::test]
+    async fn successful_explicit_shutdown_ack_suppresses_drop_fallback() {
+        let (mut deferred, control, reached_block, task) = scripted_deferred_eof([
+            ScriptedEofStep::Write(1),
+            ScriptedEofStep::WouldBlock,
+            ScriptedEofStep::Write(1),
+        ]);
+        let finish = tokio::spawn(async move {
+            let result = poll_fn(|cx| deferred.poll_shutdown(cx)).await;
+            // The public writer drops immediately after `finish()` returns.
+            drop(deferred);
+            result
+        });
+
+        tokio::time::timeout(Duration::from_secs(1), reached_block)
+            .await
+            .expect("explicit shutdown must reach the forced WouldBlock")
+            .expect("scripted sink must report WouldBlock");
+        control.release();
+        tokio::time::timeout(Duration::from_secs(1), finish)
+            .await
+            .expect("explicit shutdown acknowledgement must be bounded")
+            .expect("explicit shutdown task must not panic")
+            .expect("successful sink delivery must acknowledge finish");
+        tokio::time::timeout(Duration::from_secs(1), task)
+            .await
+            .expect("deferred EOF task must finish after acknowledgement")
+            .expect("deferred EOF task must not panic");
+        assert_eq!(
+            control.written(),
+            [0x04, 0x04],
+            "Drop after successful finish must not enqueue a fallback VEOF"
+        );
+    }
+
+    #[tokio::test]
+    async fn explicit_shutdown_preserves_the_sink_error() {
+        let (mut deferred, control, _reached_block, task) =
+            scripted_deferred_eof([ScriptedEofStep::Error(io::ErrorKind::PermissionDenied)]);
+
+        let error = poll_fn(|cx| deferred.poll_shutdown(cx))
+            .await
+            .expect_err("the sink failure must reach explicit finish");
+        assert_eq!(error.kind(), io::ErrorKind::PermissionDenied);
+        drop(deferred);
+        tokio::time::timeout(Duration::from_secs(1), task)
+            .await
+            .expect("failed deferred EOF task must terminate")
+            .expect("deferred EOF task must not panic");
+        assert!(control.written().is_empty());
+        assert_eq!(
+            control.polls(),
+            1,
+            "Drop must not retry a failed explicit EOF"
         );
     }
 
