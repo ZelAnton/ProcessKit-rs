@@ -539,36 +539,72 @@ async fn conpty_drop_delivers_eof_after_the_child_resumes_reading() {
 
 #[cfg(unix)]
 #[tokio::test]
-#[ignore = "spawns a real Unix PTY child, stops it, and fills the line discipline"]
+#[ignore = "spawns a real Unix PTY child and fills the line discipline"]
 async fn unix_pty_drop_delivers_eof_after_the_child_resumes_reading() {
-    // The background helper resumes the stopped shell without involving the
-    // writer task. READY proves the child reached the deliberate no-read state;
-    // the bounded write timeout below separately proves the PTY actually applied
-    // backpressure before Drop becomes the verdict under test.
+    let side_channel = tempfile::tempdir().expect("create Unix PTY side-channel directory");
+    let ready_marker = side_channel.path().join("ready");
+    let no_read_marker = side_channel.path().join("no-read");
+    let release_marker = side_channel.path().join("release");
+    let ready_arg = ready_marker
+        .to_str()
+        .expect("Unix temporary path must be UTF-8");
+    let no_read_arg = no_read_marker
+        .to_str()
+        .expect("Unix temporary path must be UTF-8");
+    let release_arg = release_marker
+        .to_str()
+        .expect("Unix temporary path must be UTF-8");
+
+    // Completing the redirected shell builtin closes its fd, so observing the
+    // exact READY file proves publication without depending on the PTY output
+    // pump. A second marker then confirms that the child entered a phase with no
+    // PTY reads. Only this test can create the separate release marker.
     let child = Command::new("sh").args([
         "-c",
-        "printf 'READY\\n'; (sleep 2; kill -CONT $$) & kill -STOP $$; \
+        "printf 'READY\\n' > \"$1\"; : > \"$2\"; \
+         while [ ! -e \"$3\" ]; do sleep 0.01; done; \
          cat >/dev/null; printf 'EOF\\n'",
+        "processkit-pty-side-channel",
+        ready_arg,
+        no_read_arg,
+        release_arg,
     ]);
     let mut process = JobRunner::new()
         .start(&child.use_pty().keep_stdin_open())
         .await
         .expect("start drop-EOF Unix PTY child");
-    process
-        .wait_for_output(|tail| tail.contains("READY"), Duration::from_secs(10))
-        .await
-        .expect("child must publish the no-read precondition");
+    poll_until(
+        Duration::from_secs(10),
+        Duration::from_millis(10),
+        "the child to publish and close its READY side channel",
+        || std::fs::read(&ready_marker).is_ok_and(|bytes| bytes == b"READY\n"),
+    )
+    .await;
+    assert_eq!(
+        std::fs::read(&ready_marker).expect("read published READY marker"),
+        b"READY\n"
+    );
+    poll_until(
+        Duration::from_secs(10),
+        Duration::from_millis(10),
+        "the child to enter its side-channel-gated no-read phase",
+        || no_read_marker.is_file(),
+    )
+    .await;
+
     let mut stdin = process.take_stdin().expect("Unix PTY stdin writer");
     let payload = vec![b'x'; 16 * 1024 * 1024];
     let backpressured = tokio::time::timeout(Duration::from_millis(500), stdin.write(&payload))
         .await
         .is_err();
     drop(payload);
-    drop(stdin);
     assert!(
         backpressured,
-        "precondition failed: the stopped child did not fill the PTY line discipline"
+        "precondition failed: the side-channel-gated child did not fill the PTY line discipline"
     );
+    drop(stdin);
+    std::fs::write(&release_marker, b"release")
+        .expect("release the child only after dropping the PTY writer");
 
     let result = completes_within(
         Duration::from_secs(20),
