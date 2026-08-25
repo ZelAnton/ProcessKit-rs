@@ -147,6 +147,11 @@ mod guides {
     #[doc = include_str!("../docs/whats-next.md")]
     mod docs_whats_next {}
 
+    /// `docs/runtime-neutral-v4-roadmap.md`.
+    #[doc(hidden)]
+    #[doc = include_str!("../docs/runtime-neutral-v4-roadmap.md")]
+    mod docs_runtime_neutral_v4_roadmap {}
+
     /// `docs/dotnet-version.md`.
     #[doc(hidden)]
     #[doc = include_str!("../docs/dotnet-version.md")]
