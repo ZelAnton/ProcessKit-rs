@@ -351,8 +351,13 @@ impl fmt::Debug for Stdin {
 /// Available from [`RunningProcess::take_stdin`](crate::RunningProcess::take_stdin)
 /// when the command was built with
 /// [`Command::keep_stdin_open`](crate::Command::keep_stdin_open). Write
-/// incrementally, then call [`finish`](Self::finish) to send EOF — dropping the
-/// writer (or the process handle) without finishing closes stdin too.
+/// incrementally, then call [`finish`](Self::finish) to send EOF. Dropping the
+/// writer requests the same EOF: a live PTY backend retains that request across
+/// temporary write backpressure and completes it after the child resumes reading;
+/// a regular pipe closes with the writer. [`finish`](Self::finish) is the
+/// awaitable form and reports delivery errors. Neither form can promise delivery
+/// after the process session or its async runtime is already irreversibly torn
+/// down; dropping the whole process handle tears the child tree down instead.
 ///
 /// **Avoid the full-duplex deadlock.** A child's stdout pipe has a finite OS
 /// buffer; once it fills, the child blocks on *writing* stdout until something
@@ -503,7 +508,7 @@ impl ProcessStdin {
         self.sink.flush().await
     }
 
-    /// Close stdin, signalling EOF to the child.
+    /// Close stdin, signalling EOF to the child and awaiting its delivery.
     ///
     /// # Errors
     ///

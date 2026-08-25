@@ -4,6 +4,7 @@
 //! is retained (as the merged reader and the stdin writer); terminal echo is
 //! disabled so a written secret is not echoed back into the merged output.
 
+use std::future::Future;
 use std::io;
 use std::io::{Read, Write};
 use std::os::fd::{FromRawFd, OwnedFd};
@@ -240,8 +241,84 @@ fn set_nonblocking(fd: &OwnedFd) -> io::Result<()> {
 #[derive(Debug)]
 struct AsyncPtyMaster {
     master: AsyncFd<std::fs::File>,
-    eof_byte: Option<u8>,
-    eof_written: usize,
+    deferred_eof: Option<DeferredEof>,
+}
+
+/// The public writer owns only this lossless request handle; the reactor task
+/// owns the fd and the in-progress VEOF sequence, so dropping the writer cannot
+/// discard a partial write or a readiness wait.
+#[derive(Debug)]
+struct DeferredEof {
+    request: Option<tokio::sync::oneshot::Sender<DeferredEofResponse>>,
+    response: Option<tokio::sync::oneshot::Receiver<io::Result<()>>>,
+    requested: bool,
+}
+
+type DeferredEofResponse = Option<tokio::sync::oneshot::Sender<io::Result<()>>>;
+
+impl DeferredEof {
+    fn send_request(&mut self, response: DeferredEofResponse) -> Result<bool, ()> {
+        if self.requested {
+            return Ok(false);
+        }
+        self.requested = true;
+        let Some(request) = self.request.take() else {
+            return Err(());
+        };
+        request.send(response).map_err(|_| ())?;
+        Ok(true)
+    }
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum EofProgress {
+    Continue,
+    WouldBlock,
+    Complete,
+}
+
+/// Exactly-once progress for the two-byte terminal EOF gesture. Keeping byte
+/// accounting outside `AsyncFd` makes partial and `WouldBlock` transitions
+/// directly testable without relying on a kernel buffer's timing or capacity.
+#[derive(Debug)]
+struct EofSequence {
+    bytes: [u8; 2],
+    written: usize,
+}
+
+impl EofSequence {
+    fn new(eof: u8) -> Self {
+        Self {
+            bytes: [eof, eof],
+            written: 0,
+        }
+    }
+
+    fn remaining(&self) -> &[u8] {
+        &self.bytes[self.written..]
+    }
+
+    fn record_write(&mut self, result: io::Result<usize>) -> io::Result<EofProgress> {
+        match result {
+            Ok(0) => Err(io::Error::new(
+                io::ErrorKind::WriteZero,
+                "failed to deliver pty EOF",
+            )),
+            Ok(written) if written <= self.remaining().len() => {
+                self.written += written;
+                Ok(if self.written == self.bytes.len() {
+                    EofProgress::Complete
+                } else {
+                    EofProgress::Continue
+                })
+            }
+            Ok(_) => Err(io::Error::other(
+                "pty EOF writer reported more bytes than requested",
+            )),
+            Err(error) if error.kind() == io::ErrorKind::WouldBlock => Ok(EofProgress::WouldBlock),
+            Err(error) => Err(error),
+        }
+    }
 }
 
 /// Clone one of the PTY master's ownership-bearing fds. Keeping the operation
@@ -273,7 +350,7 @@ impl AsyncPtyMaster {
     /// `target` names this registration (`reader` / `writer`) for the same
     /// test-only fault seam [`clone_master`] uses — the reactor registration is
     /// the other genuinely fallible step after the child already exists.
-    fn new(fd: OwnedFd, eof_byte: Option<u8>, target: &'static str) -> io::Result<Self> {
+    fn new(fd: OwnedFd, target: &'static str) -> io::Result<Self> {
         #[cfg(not(test))]
         let _ = target;
         set_nonblocking(&fd)?;
@@ -289,9 +366,22 @@ impl AsyncPtyMaster {
         }
         Ok(Self {
             master: AsyncFd::new(file)?,
-            eof_byte,
-            eof_written: 0,
+            deferred_eof: None,
         })
+    }
+
+    fn new_writer(fd: OwnedFd, eof_fd: OwnedFd, eof: u8) -> io::Result<Self> {
+        let mut writer = Self::new(fd, "writer")?;
+        set_nonblocking(&eof_fd)?;
+        let eof_master = AsyncFd::new(std::fs::File::from(eof_fd))?;
+        let (request, receiver) = tokio::sync::oneshot::channel();
+        tokio::spawn(deferred_eof_loop(eof_master, eof, receiver));
+        writer.deferred_eof = Some(DeferredEof {
+            request: Some(request),
+            response: None,
+            requested: false,
+        });
+        Ok(writer)
     }
 
     fn poll_write_raw(&mut self, cx: &mut Context<'_>, data: &[u8]) -> Poll<io::Result<usize>> {
@@ -309,6 +399,40 @@ impl AsyncPtyMaster {
                 // `WouldBlock`: readiness consumed, loop to re-arm the wait.
                 Err(_would_block) => continue,
             }
+        }
+    }
+}
+
+async fn deferred_eof_loop(
+    master: AsyncFd<std::fs::File>,
+    eof: u8,
+    request: tokio::sync::oneshot::Receiver<DeferredEofResponse>,
+) {
+    let Ok(response) = request.await else {
+        return;
+    };
+    let result = deliver_eof(master, eof).await;
+    if let Some(response) = response {
+        let _ = response.send(result);
+    }
+}
+
+async fn deliver_eof(master: AsyncFd<std::fs::File>, eof: u8) -> io::Result<()> {
+    let mut sequence = EofSequence::new(eof);
+    loop {
+        let mut guard = master.writable().await?;
+        let result = guard.try_io(|inner| {
+            let mut file: &std::fs::File = inner.get_ref();
+            file.write(sequence.remaining())
+        });
+        let progress = match result {
+            Ok(result) => sequence.record_write(result)?,
+            // `try_io` consumed the stale readiness and re-arms the next
+            // `writable().await`; the sequence remains byte-for-byte unchanged.
+            Err(_would_block) => EofProgress::WouldBlock,
+        };
+        if progress == EofProgress::Complete {
+            return Ok(());
         }
     }
 }
@@ -355,7 +479,7 @@ impl AsyncWrite for AsyncPtyMaster {
         data: &[u8],
     ) -> Poll<io::Result<usize>> {
         let this = self.get_mut();
-        if this.eof_written > 0 {
+        if this.deferred_eof.as_ref().is_some_and(|eof| eof.requested) {
             return Poll::Ready(Err(io::Error::new(
                 io::ErrorKind::BrokenPipe,
                 "pty stdin writer closed",
@@ -372,42 +496,50 @@ impl AsyncWrite for AsyncPtyMaster {
 
     fn poll_shutdown(self: Pin<&mut Self>, cx: &mut Context<'_>) -> Poll<io::Result<()>> {
         let this = self.get_mut();
-        let Some(eof) = this.eof_byte else {
+        let Some(eof) = this.deferred_eof.as_mut() else {
             return Poll::Ready(Ok(()));
         };
-        // A PTY master has no half-close. Two configured VEOF characters cover
-        // both canonical-mode states: the first flushes an unterminated final
-        // line, and the second arrives at an empty line and yields EOF.
-        let sequence = [eof, eof];
-        while this.eof_written < sequence.len() {
-            let offset = this.eof_written;
-            match this.poll_write_raw(cx, &sequence[offset..]) {
-                Poll::Ready(Ok(0)) => {
-                    return Poll::Ready(Err(io::Error::new(
-                        io::ErrorKind::WriteZero,
-                        "failed to deliver pty EOF",
-                    )));
-                }
-                Poll::Ready(Ok(written)) => this.eof_written += written,
-                Poll::Ready(Err(error)) => return Poll::Ready(Err(error)),
-                Poll::Pending => return Poll::Pending,
+        if !eof.requested {
+            let (response, receiver) = tokio::sync::oneshot::channel();
+            if eof.send_request(Some(response)).is_err() {
+                return Poll::Ready(Err(io::Error::new(
+                    io::ErrorKind::BrokenPipe,
+                    "pty EOF delivery task stopped",
+                )));
+            }
+            eof.response = Some(receiver);
+        }
+
+        let Some(response) = eof.response.as_mut() else {
+            return Poll::Ready(Ok(()));
+        };
+        match Pin::new(response).poll(cx) {
+            Poll::Pending => Poll::Pending,
+            Poll::Ready(Ok(result)) => {
+                eof.response = None;
+                Poll::Ready(result)
+            }
+            Poll::Ready(Err(_closed)) => {
+                eof.response = None;
+                Poll::Ready(Err(io::Error::new(
+                    io::ErrorKind::BrokenPipe,
+                    "pty EOF delivery task stopped",
+                )))
             }
         }
-        Poll::Ready(Ok(()))
     }
 }
 
 impl Drop for AsyncPtyMaster {
     fn drop(&mut self) {
-        let Some(eof) = self.eof_byte else {
+        let Some(eof) = self.deferred_eof.as_mut() else {
             return;
         };
-        if self.eof_written < 2 {
-            // Drop cannot await readiness. A two-byte non-blocking write normally
-            // succeeds immediately; `finish()`/bulk stdin use poll_shutdown for
-            // the reliable path, while plain drop remains best-effort.
-            let mut file: &std::fs::File = self.master.get_ref();
-            let _ = file.write(&[eof, eof][self.eof_written..]);
+        if !eof.requested {
+            // Sending a oneshot request is synchronous and lossless. The task
+            // owns its own master dup, so it can await readiness after this
+            // public writer and its AsyncFd have gone away.
+            let _ = eof.send_request(None);
         }
     }
 }
@@ -509,13 +641,17 @@ where
     // pool with a read+write thread apiece. The `EofOnEio` wrapper is unchanged —
     // the end-of-session `EIO` still surfaces from `poll_read` as a clean EOF.
     let master_w = clone_master(&master, "writer")?;
+    // The deferred EOF task owns this dup independently of the public writer;
+    // it stays reactor-registered until the terminal gesture completes or the
+    // runtime/session is irrecoverably torn down.
+    let master_eof = clone_master(&master, "writer-eof")?;
     // A third dup, retained by `PtyChild` solely for the live-resize ioctl. It
     // stays a plain blocking-view owned fd (never wrapped in `AsyncFd`); sharing
     // the master's open file description it inherits the `O_NONBLOCK` the
     // reader/writer set, which is irrelevant to an ioctl.
     let master_resize = clone_master(&master, "resize")?;
-    let reader: PtyReader = Box::new(EofOnEio(AsyncPtyMaster::new(master, None, "reader")?));
-    let writer: PtyWriter = Box::new(AsyncPtyMaster::new(master_w, Some(eof_byte), "writer")?);
+    let reader: PtyReader = Box::new(EofOnEio(AsyncPtyMaster::new(master, "reader")?));
+    let writer: PtyWriter = Box::new(AsyncPtyMaster::new_writer(master_w, master_eof, eof_byte)?);
 
     Ok(PtySpawn {
         // Setup is complete: take the child out of the guard so no rollback can
@@ -715,6 +851,55 @@ mod tests {
     /// path and `fn setsid_escapee_process` — a mismatch surfaces as the pid poll
     /// timing out with no pidfile written.
     const ESCAPEE_TEST: &str = "sys::pty::imp::tests::setsid_escapee_process";
+
+    #[test]
+    fn deferred_eof_sequence_survives_partial_write_and_would_block() {
+        let mut sequence = EofSequence::new(0x04);
+
+        assert_eq!(
+            sequence.record_write(Ok(1)).expect("accept first byte"),
+            EofProgress::Continue
+        );
+        assert_eq!(sequence.remaining(), &[0x04]);
+        assert_eq!(
+            sequence
+                .record_write(Err(io::Error::from(io::ErrorKind::WouldBlock)))
+                .expect("WouldBlock is a readiness transition"),
+            EofProgress::WouldBlock
+        );
+        assert_eq!(
+            sequence.remaining(),
+            &[0x04],
+            "WouldBlock must not consume the remaining EOF byte"
+        );
+        assert_eq!(
+            sequence.record_write(Ok(1)).expect("accept final byte"),
+            EofProgress::Complete
+        );
+        assert!(sequence.remaining().is_empty());
+    }
+
+    #[tokio::test]
+    async fn explicit_eof_request_suppresses_drop_fallback() {
+        let (request, receiver) = tokio::sync::oneshot::channel();
+        let mut deferred = DeferredEof {
+            request: Some(request),
+            response: None,
+            requested: false,
+        };
+        let (ack, _ack_receiver) = tokio::sync::oneshot::channel();
+
+        assert_eq!(deferred.send_request(Some(ack)), Ok(true));
+        assert_eq!(
+            deferred.send_request(None),
+            Ok(false),
+            "a completed or in-flight explicit shutdown owns the sole request"
+        );
+        assert!(
+            receiver.await.expect("receive the sole request").is_some(),
+            "the request carrying explicit acknowledgement must win"
+        );
+    }
 
     /// A pty spawn's options — the launch seam sets nothing else for these tests.
     fn pty_options() -> SpawnOptions {

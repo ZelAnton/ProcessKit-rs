@@ -17,7 +17,7 @@ use std::os::windows::io::FromRawHandle;
 use std::pin::Pin;
 use std::sync::{
     Arc,
-    atomic::{AtomicU64, Ordering},
+    atomic::{AtomicU8, AtomicU64, Ordering},
 };
 use std::task::{Context, Poll};
 use std::thread::JoinHandle;
@@ -1121,6 +1121,7 @@ impl WriterFailure {
 #[derive(Default)]
 struct WriterShared {
     first_failure: std::sync::Mutex<Option<WriterFailure>>,
+    close_state: AtomicU8,
 }
 
 impl WriterShared {
@@ -1143,12 +1144,45 @@ impl WriterShared {
             .clone()
             .map(WriterFailure::into_io_error)
     }
+
+    fn request_close(&self, tx: &tokio::sync::mpsc::Sender<WriterCommand>) {
+        if self
+            .close_state
+            .compare_exchange(
+                WRITER_CLOSE_OPEN,
+                WRITER_CLOSE_REQUESTED,
+                Ordering::AcqRel,
+                Ordering::Acquire,
+            )
+            .is_ok()
+        {
+            // This command is only a wake-up, not the ownership of the request.
+            // A full queue may reject it, but the bridge then necessarily has
+            // accepted FIFO work to drain and observes the monotonic latch after
+            // each command.
+            let _ = tx.try_send(WriterCommand::WakeClose);
+        }
+    }
+
+    fn close_requested(&self) -> bool {
+        self.close_state.load(Ordering::Acquire) == WRITER_CLOSE_REQUESTED
+    }
+
+    fn mark_close_terminal(&self) {
+        self.close_state
+            .store(WRITER_CLOSE_TERMINAL, Ordering::Release);
+    }
 }
+
+const WRITER_CLOSE_OPEN: u8 = 0;
+const WRITER_CLOSE_REQUESTED: u8 = 1;
+const WRITER_CLOSE_TERMINAL: u8 = 2;
 
 enum WriterCommand {
     Write(Vec<u8>),
     Flush(tokio::sync::oneshot::Sender<Result<(), WriterFailure>>),
-    Shutdown(Option<tokio::sync::oneshot::Sender<Result<(), WriterFailure>>>),
+    Shutdown(tokio::sync::oneshot::Sender<Result<(), WriterFailure>>),
+    WakeClose,
 }
 
 /// Run the synchronous half of the writer bridge. Commands are processed FIFO,
@@ -1162,15 +1196,39 @@ fn writer_bridge_loop<W>(
 ) where
     W: std::io::Write,
 {
-    while let Some(command) = rx.blocking_recv() {
-        let (result, response) = match command {
-            WriterCommand::Write(chunk) => (writer.write_all(&chunk), None),
-            WriterCommand::Flush(response) => (writer.flush(), Some(response)),
+    loop {
+        // A dropped writer first latches the request and only then attempts a
+        // wake-up. Waiting for an empty queue here keeps EOF behind every command
+        // accepted before Drop, including a flush whose waiter was cancelled.
+        if shared.close_requested() && rx.is_empty() {
+            let result = writer.write_all(CONPTY_EOF).and_then(|()| writer.flush());
+            shared.mark_close_terminal();
+            if let Err(error) = result {
+                shared.record_failure(WriterFailure::capture(error));
+                break;
+            }
+            continue;
+        }
+
+        let Some(command) = rx.blocking_recv() else {
+            break;
+        };
+        let (result, response, closes) = match command {
+            WriterCommand::Write(chunk) => (writer.write_all(&chunk), None, false),
+            WriterCommand::Flush(response) => (writer.flush(), Some(response), false),
             WriterCommand::Shutdown(response) => (
                 writer.write_all(CONPTY_EOF).and_then(|()| writer.flush()),
-                response,
+                Some(response),
+                true,
             ),
+            WriterCommand::WakeClose => (Ok(()), None, false),
         };
+
+        if closes {
+            // Success and failure are both terminal for this session's EOF
+            // attempt; retrying could duplicate a partially accepted gesture.
+            shared.mark_close_terminal();
+        }
 
         match result {
             Ok(()) => {
@@ -1179,6 +1237,7 @@ fn writer_bridge_loop<W>(
                 }
             }
             Err(error) => {
+                shared.mark_close_terminal();
                 let failure = shared.record_failure(WriterFailure::capture(error));
                 if let Some(response) = response {
                     let _ = response.send(Err(failure));
@@ -1327,7 +1386,7 @@ fn writer_control_future(
         let (response_tx, response_rx) = tokio::sync::oneshot::channel();
         let command = match kind {
             WriterControlKind::Flush => WriterCommand::Flush(response_tx),
-            WriterControlKind::Shutdown => WriterCommand::Shutdown(Some(response_tx)),
+            WriterControlKind::Shutdown => WriterCommand::Shutdown(response_tx),
         };
         tx.send(command)
             .await
@@ -1522,12 +1581,10 @@ impl Drop for ChannelWriter {
             .expect("pty writer state mutex poisoned");
         state.reserve = None;
         state.control = None;
-        if !self.shutdown {
-            // Drop has no async error channel. Reserve one bounded queue slot if
-            // immediately available; an exited or stalled child may make this
-            // best-effort EOF impossible, while `PtyChild` still owns the session.
-            let _ = self.tx.try_send(WriterCommand::Shutdown(None));
-        }
+        // The monotonic request survives a full data queue. `try_send` inside
+        // `request_close` is only a wake-up for the empty-queue race; the bridge
+        // owns delivery and performs it exactly once after all accepted FIFO work.
+        self.shared.request_close(&self.tx);
     }
 }
 
@@ -1563,6 +1620,7 @@ mod tests {
         released: std::sync::Mutex<bool>,
         changed: std::sync::Condvar,
         bytes_written: std::sync::atomic::AtomicUsize,
+        bytes: std::sync::Mutex<Vec<u8>>,
     }
 
     impl StallControl {
@@ -1597,6 +1655,11 @@ mod tests {
             self.control
                 .bytes_written
                 .fetch_add(buf.len(), Ordering::Relaxed);
+            self.control
+                .bytes
+                .lock()
+                .expect("recorded-byte mutex poisoned")
+                .extend_from_slice(buf);
             Ok(buf.len())
         }
 
@@ -1645,6 +1708,7 @@ mod tests {
             released: std::sync::Mutex::new(false),
             changed: std::sync::Condvar::new(),
             bytes_written: std::sync::atomic::AtomicUsize::new(0),
+            bytes: std::sync::Mutex::new(Vec::new()),
         });
         let (started_tx, started_rx) = std::sync::mpsc::sync_channel(1);
         let mut pending = test_writer_bridge(StalledWriter {
@@ -1695,6 +1759,81 @@ mod tests {
             control.bytes_written.load(Ordering::Relaxed),
             (WRITER_QUEUE_DEPTH + 1) * WRITER_CHUNK_BYTES + CONPTY_EOF.len(),
             "the timed-out reservation must not retain or later submit caller bytes"
+        );
+        assert_eq!(
+            control
+                .bytes
+                .lock()
+                .expect("recorded-byte mutex poisoned")
+                .windows(CONPTY_EOF.len())
+                .filter(|window| *window == CONPTY_EOF)
+                .count(),
+            1,
+            "successful explicit shutdown followed by Drop must emit EOF once"
+        );
+    }
+
+    #[tokio::test]
+    async fn dropped_writer_delivers_eof_after_a_full_bounded_queue() {
+        use tokio::io::AsyncWriteExt;
+
+        let control = Arc::new(StallControl {
+            released: std::sync::Mutex::new(false),
+            changed: std::sync::Condvar::new(),
+            bytes_written: std::sync::atomic::AtomicUsize::new(0),
+            bytes: std::sync::Mutex::new(Vec::new()),
+        });
+        let (started_tx, started_rx) = std::sync::mpsc::sync_channel(1);
+        let mut pending = test_writer_bridge(StalledWriter {
+            control: Arc::clone(&control),
+            started: Some(started_tx),
+        });
+        let mut writer = pending.writer.take().expect("test async writer");
+        let keepalive = pending.keepalive.take().expect("test keepalive");
+        let thread = pending.thread.take().expect("test writer thread");
+        let chunk = vec![b'x'; WRITER_CHUNK_BYTES];
+
+        writer.write_all(&chunk).await.expect("start stalled write");
+        started_rx
+            .recv_timeout(Duration::from_secs(1))
+            .expect("writer thread must enter the injected stall");
+        for _ in 0..WRITER_QUEUE_DEPTH {
+            writer.write_all(&chunk).await.expect("fill bounded queue");
+        }
+        assert_eq!(
+            writer.tx.capacity(),
+            0,
+            "the regression must force the exact full-queue precondition"
+        );
+
+        // `WakeClose` cannot occupy a slot here. The latch, not that best-effort
+        // wake-up, must carry the request until the bridge drains accepted data.
+        drop(writer);
+        control.release();
+        let expected = (WRITER_QUEUE_DEPTH + 1) * WRITER_CHUNK_BYTES + CONPTY_EOF.len();
+        tokio::time::timeout(Duration::from_secs(2), async {
+            while control.bytes_written.load(Ordering::Acquire) != expected {
+                tokio::task::yield_now().await;
+            }
+        })
+        .await
+        .expect("deferred EOF must complete after releasing backpressure");
+        drop(keepalive);
+        join_writer_bridge(thread).await;
+
+        let bytes = control.bytes.lock().expect("recorded-byte mutex poisoned");
+        assert_eq!(
+            &bytes[..expected - CONPTY_EOF.len()],
+            vec![b'x'; expected - CONPTY_EOF.len()]
+        );
+        assert_eq!(&bytes[expected - CONPTY_EOF.len()..], CONPTY_EOF);
+        assert_eq!(
+            bytes
+                .windows(CONPTY_EOF.len())
+                .filter(|window| *window == CONPTY_EOF)
+                .count(),
+            1,
+            "the full-queue fallback must deliver exactly one EOF gesture"
         );
     }
 

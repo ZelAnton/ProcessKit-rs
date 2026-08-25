@@ -485,6 +485,105 @@ async fn pty_finish_sends_console_eof_without_closing_the_session() {
     );
 }
 
+#[cfg(windows)]
+#[tokio::test]
+#[ignore = "spawns a real ConPTY child and deliberately fills its stdin bridge"]
+async fn conpty_drop_delivers_eof_after_the_child_resumes_reading() {
+    let child = Command::new("powershell").args([
+        "-NoProfile",
+        "-Command",
+        "[Console]::Error.Write('READY'); [Console]::Error.Flush(); \
+         Start-Sleep -Seconds 2; while ($null -ne [Console]::In.ReadLine()) {}; \
+         [Console]::Out.WriteLine('EOF')",
+    ]);
+    let mut process = JobRunner::new()
+        .start(&child.use_pty().keep_stdin_open())
+        .await
+        .expect("start drop-EOF ConPTY child");
+    process
+        .wait_for_output(|tail| tail.contains("READY"), Duration::from_secs(10))
+        .await
+        .expect("child must publish the no-read precondition");
+    let mut stdin = process.take_stdin().expect("ConPTY stdin writer");
+    // Each bridge-sized chunk ends with Enter. Therefore whichever complete
+    // chunks were accepted before cancellation leave Ctrl-Z at the beginning of
+    // a fresh console line, where ConPTY recognizes it as EOF.
+    let mut payload = Vec::with_capacity(16 * 1024 * 1024);
+    for _ in 0..2048 {
+        payload.extend(std::iter::repeat_n(b'x', 8191));
+        payload.push(b'\r');
+    }
+    let backpressured = tokio::time::timeout(Duration::from_millis(500), stdin.write(&payload))
+        .await
+        .is_err();
+    drop(payload);
+    drop(stdin);
+    assert!(
+        backpressured,
+        "precondition failed: the sleeping child did not fill the bounded bridge and OS input pipe"
+    );
+
+    let result = completes_within(
+        Duration::from_secs(20),
+        "ConPTY deferred Drop EOF",
+        process.output_string(),
+    )
+    .await
+    .expect("child must resume, drain accepted input, observe EOF, and exit");
+    assert!(result.is_success(), "drop-EOF child failed: {result:?}");
+    assert!(
+        result.stdout().contains("EOF"),
+        "child resumed but never observed deferred EOF: {result:?}"
+    );
+}
+
+#[cfg(unix)]
+#[tokio::test]
+#[ignore = "spawns a real Unix PTY child, stops it, and fills the line discipline"]
+async fn unix_pty_drop_delivers_eof_after_the_child_resumes_reading() {
+    // The background helper resumes the stopped shell without involving the
+    // writer task. READY proves the child reached the deliberate no-read state;
+    // the bounded write timeout below separately proves the PTY actually applied
+    // backpressure before Drop becomes the verdict under test.
+    let child = Command::new("sh").args([
+        "-c",
+        "printf 'READY\\n'; (sleep 2; kill -CONT $$) & kill -STOP $$; \
+         cat >/dev/null; printf 'EOF\\n'",
+    ]);
+    let mut process = JobRunner::new()
+        .start(&child.use_pty().keep_stdin_open())
+        .await
+        .expect("start drop-EOF Unix PTY child");
+    process
+        .wait_for_output(|tail| tail.contains("READY"), Duration::from_secs(10))
+        .await
+        .expect("child must publish the no-read precondition");
+    let mut stdin = process.take_stdin().expect("Unix PTY stdin writer");
+    let payload = vec![b'x'; 16 * 1024 * 1024];
+    let backpressured = tokio::time::timeout(Duration::from_millis(500), stdin.write(&payload))
+        .await
+        .is_err();
+    drop(payload);
+    drop(stdin);
+    assert!(
+        backpressured,
+        "precondition failed: the stopped child did not fill the PTY line discipline"
+    );
+
+    let result = completes_within(
+        Duration::from_secs(20),
+        "Unix PTY deferred Drop EOF",
+        process.output_string(),
+    )
+    .await
+    .expect("child must resume, drain accepted input, observe EOF, and exit");
+    assert!(result.is_success(), "drop-EOF child failed: {result:?}");
+    assert!(
+        result.stdout().contains("EOF"),
+        "child resumed but never observed deferred EOF: {result:?}"
+    );
+}
+
 #[cfg(unix)]
 #[tokio::test]
 #[ignore = "spawns a real pseudo-terminal and delivers canonical EOF"]
