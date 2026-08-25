@@ -106,8 +106,9 @@ containment layer.
 
 ## Goals
 
-- Provide a documented Tokio-free dependency path for capture, streaming,
-  stdin, cancellation, readiness, pipelines, supervision, PTY, and containment.
+- Provide a documented Tokio-free dependency path for the mandatory v4.0
+  async-io baseline defined below; every baseline capability is release-blocking,
+  not an `Unsupported` escape hatch.
 - Preserve v3's observable result, error, buffering, decoding, line-normalization,
   tracing privacy, and teardown behavior unless a migration note explicitly
   records a deliberate v4 change.
@@ -122,12 +123,47 @@ containment layer.
 - Leave room for additional backends without committing v4.0 to every async I/O
   model in the Rust ecosystem.
 
+### v4.0 async-io parity contract
+
+This section is the authoritative feature-parity boundary for the first
+Tokio-free backend. Other phases and release gates refer back to it rather than
+redefining parity independently.
+
+The **mandatory baseline** is release-blocking for `processkit-async-io`:
+
+- ordinary pipe/inherit/null process launch; text and byte capture; reusable and
+  interactive stdin; decoded lines, raw output, events, tees, bounded buffers,
+  and backpressure;
+- live child and process-group lifecycle: wait/try-wait, adopt, explicit kill,
+  kill-on-drop, timeout, inactivity timeout, cancellation, graceful-to-hard
+  escalation, and confirmed reap;
+- retries, TCP readiness, pipelines, and supervision;
+- platform containment, process control, stats, and limits wherever v3 supports
+  the corresponding operation and its existing feature is enabled;
+- backend-independent scripted, recording, mock, tracing/metrics, JSON/report,
+  and record/replay surfaces when their existing feature is enabled.
+
+For every mandatory item, v4.0 requires the same documented result, error,
+partial-capture, cancellation-precedence, and teardown contract on Tokio and
+async-io. A mandatory operation returning backend-specific `Unsupported` blocks
+the release.
+
+The **deferred optional capabilities** for the async-io backend are PTY/ConPTY,
+the `merge_stderr_in_pipe` transport, and runtime-native raw-command/child escape
+hatches. v4.0 may ship those as explicit pre-spawn `Unsupported` operations on
+async-io only. The Tokio backend retains its v3 behavior, the migration guide
+must list each gap, and no fallback may silently replace its semantics. Closing
+these gaps is post-v4 work and does not reopen the mandatory baseline.
+
 ## Non-goals
 
 - Implementing the refactor in this roadmap task. v3 source, manifests, public
   API, dependency graph, and runtime behavior remain unchanged.
 - Supporting every executor in v4.0. The first non-Tokio target is the
   readiness-based async-io ecosystem.
+- Requiring async-io parity for PTY/ConPTY, merged-pipe transport, or native raw
+  runtime escape hatches in v4.0; they are the explicitly deferred capabilities
+  in the authoritative parity contract above.
 - Designing an in-house cross-platform process reactor or child reaper before
   the official backend spikes show it is necessary.
 - Making runtime selection a global singleton or ambient “current runtime”.
@@ -346,9 +382,12 @@ The contracts are deliberately narrow:
 
 ### `NetProbe`
 
-- TCP readiness is optional because process capture does not require networking.
-- Absence produces the existing structured `Unsupported` class before a probe
-  task is started.
+- The capability is optional for third-party or deliberately minimal backends
+  because process capture does not require networking. It is mandatory for both
+  official v4.0 backends under the async-io parity contract.
+- A non-official backend's absence produces the existing structured
+  `Unsupported` class before a probe task is started; the official Tokio and
+  async-io backends must instead pass the readiness contract suite.
 - Connect cancellation closes the in-flight connection attempt and joins any
   helper task.
 - HTTP or custom probes remain policies layered above this primitive rather than
@@ -408,6 +447,11 @@ prove:
 - exact pipe EOF and backpressure behavior matches the Tokio backend;
 - the dependency graph and public API remain Tokio-free;
 - smol and async-std hosts pass the same behavioral suite.
+
+The implementation is release-ready only when it satisfies the mandatory
+baseline in the v4.0 async-io parity contract. The three deferred optional
+capabilities may remain explicit pre-spawn gaps; no other capability may use
+that exception.
 
 If `async-process` fails one of those gates, the next option is a small
 ProcessKit-owned adapter around async-io plus the platform wait primitives. That
@@ -540,18 +584,24 @@ core still has a Tokio-free build and public surface.
 
 **Exit criteria:** the common contract suite passes under smol and async-std;
 the packaged dependency graph is Tokio-free; real containment and kill-on-drop
-tests pass on supported hosts; unsupported capabilities fail before spawn.
+tests pass on supported hosts; the backend primitives needed by the mandatory
+baseline have no `Unsupported` gap. Phase 5 need not complete the higher-level
+orchestrators assigned to Phase 6.
 
 ### Phase 6 — move common orchestrators (3–5 weeks)
 
 Migrate pumps, stdin feeders, deadlines/inactivity, retries, readiness,
-pipelines, supervision, PTY, merged pipes, and statistics one subsystem at a
-time. Each subsystem must pass on both backends before the next becomes the
-default core implementation.
+pipelines, supervision, and statistics one subsystem at a time. Each mandatory
+subsystem must pass on both backends before the next becomes the default core
+implementation. Extract PTY and merged pipes through the same core boundaries,
+but require runtime behavior only on Tokio for v4.0; async-io either implements
+them or returns the parity contract's pre-spawn `Unsupported` result.
 
 **Exit criteria:** every public execution path uses core orchestration; no
 adapter contains a copied policy state machine; partial captures and teardown
-errors match the conformance contract on both backends.
+errors match the conformance contract on both backends; the complete mandatory
+baseline passes on Tokio and async-io. Only the parity contract's three deferred
+optional capabilities may still report pre-spawn `Unsupported` on async-io.
 
 ### Phase 7 — conformance, CI, and performance (2–3 weeks)
 
@@ -582,12 +632,12 @@ The matrix is a release gate, not a best-effort dashboard.
 | Axis | Required v4 coverage |
 |---|---|
 | Backend | Tokio; async-io with smol host; async-io with async-std host; both official backends in one binary. |
-| Windows | Job Object launch, suspended rollback edges, nested-job behavior, ordinary pipes, merged pipes, ConPTY, kill-on-drop, graceful-to-hard escalation. |
-| Linux | cgroup v2 and forced process-group fallback; ordinary pipes, PTY, merged pipes, adoption, limits/stats where enabled. |
+| Windows | On both backends: Job Object launch, suspended rollback edges, nested-job behavior, ordinary pipes, kill-on-drop, and graceful-to-hard escalation. On Tokio: merged pipes and ConPTY; on async-io: implementation or the asserted deferred-gap result. |
+| Linux | On both backends: cgroup v2 and forced process-group fallback, ordinary pipes, adoption, and limits/stats where enabled. On Tokio: PTY and merged pipes; on async-io: implementation or the asserted deferred-gap result. |
 | FreeBSD | Process reaper plus its process-group bookkeeping; adoption, signals, graceful and hard teardown. |
-| macOS/other supported Unix | POSIX process-group behavior and its documented scope; PTY and pipe coverage where supported. |
-| Contract suite | Capture text/bytes, streaming/events, stdin, tee, backpressure, EOF, timeout, inactivity, cancellation, retry, probes, pipelines, supervision, drop, partial diagnostics, reap confirmation. |
-| Features | Default, no-default, each additive feature, supported feature powerset, and both adapter dependencies together. |
+| macOS/other supported Unix | On both backends: POSIX process-group behavior and its documented scope plus ordinary pipes. On Tokio: PTY where supported; on async-io: implementation or the asserted deferred-gap result. |
+| Contract suite | Every mandatory-baseline operation: capture text/bytes, streaming/events, stdin, tee, backpressure, EOF, timeout, inactivity, cancellation, retry, probes, pipelines, supervision, drop, partial diagnostics, containment and reap confirmation. |
+| Features | Default, no-default, each additive feature, supported feature powerset, and both adapter dependencies together; mandatory-baseline features pass on both backends, while each deferred optional async-io gap is asserted as pre-spawn `Unsupported`. |
 | Toolchain | Manifest MSRV plus stable fmt/clippy/test/doc; adapter crates use the same MSRV unless an ADR records otherwise. |
 | Dependency proof | `cargo tree` (including all target-specific normal dependencies) demonstrates no Tokio packages in the core + async-io consumer fixture. |
 | Public API proof | `cargo-public-api`/rustdoc inspection finds no `tokio::*` path in `processkit`; Tokio paths appear only in the Tokio adapter. |
@@ -625,10 +675,13 @@ v4.0 is ready only when all of the following are true:
   process and kill-on-drop tests on supported hosts.
 - Every backend preserves the current platform mechanism's containment scope and
   the Windows suspended/assign/resume invariant.
-- Capture, streaming, stdin, cancellation, timeout, pipeline, supervisor, PTY,
-  merged-pipe, readiness, stats, limits, mock, and record/replay support either
-  reach documented parity or have an explicit, pre-spawn `Unsupported` entry in
-  the migration guide. Silent degradation is not acceptable.
+- Every capability in the authoritative v4.0 async-io mandatory baseline has
+  documented parity on Tokio and async-io; `Unsupported` for a mandatory
+  operation is release-blocking.
+- PTY/ConPTY, `merge_stderr_in_pipe`, and runtime-native raw escape hatches are
+  the only permitted async-io parity gaps. Each remaining gap fails explicitly
+  before spawn and is listed in the migration guide; silent fallback is not
+  acceptable.
 - `ProcessKit` and its live public types are non-generic over the runtime and
   retain their ratified `Send`/`Sync` properties.
 - Both official backends can coexist and run in one binary without global
@@ -643,11 +696,11 @@ v4.0 is ready only when all of the following are true:
 1. **v4 alpha:** after the Tokio baseline and async-io vertical path both pass
    containment, dependency, and public-API gates. Feature parity may still be
    incomplete and is listed explicitly.
-2. **v4 beta:** after common orchestrators and the CI matrix pass on both
-   backends. No known safety or teardown semantic gap remains.
+2. **v4 beta:** after the mandatory baseline's common orchestrators and CI matrix
+   pass on both backends. No known safety or teardown semantic gap remains.
 3. **v4 release candidate:** after downstream migrations, performance gates,
-   platform ignored tests, and documentation are complete. Only release-blocking
-   fixes may change public API.
+   platform ignored tests, documentation, and the explicit deferred-gap list are
+   complete. Only release-blocking fixes may change public API.
 4. **v4.0:** after an RC soak with no unresolved containment, reap, cancellation,
    or dependency-proof failures.
 
@@ -660,8 +713,8 @@ activity.
 ## Decisions required before broad implementation
 
 - Ratify public and crate names and the backend-author API's SemVer boundary.
-- Confirm whether v4.0 promises all current optional features on both official
-  backends or allows explicit, temporary adapter-specific gaps.
+- Set the post-v4 delivery order for PTY/ConPTY, merged-pipe, and native raw
+  async-io support without reclassifying the v4.0 mandatory baseline.
 - Confirm the minimum supported async-process/async-io versions and the executor
   injection API after the vertical spike.
 - Define the stable process identity/raw-handle contract needed by adoption and
