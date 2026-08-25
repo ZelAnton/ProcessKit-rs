@@ -18,7 +18,14 @@ to a dated version section.
 -
 
 ### Fixed
--
+
+- Preserve a dropped interactive PTY stdin's EOF request across temporary
+  backpressure. Unix now completes a partial two-byte VEOF gesture from a
+  reactor-owned master duplicate, and the Windows ConPTY bridge latches Drop
+  independently of its bounded FIFO data queue; a successful explicit
+  `finish()` still reports its acknowledgement and suppresses any duplicate EOF.
+  Delivery remains conditional on the process session and async runtime still
+  being live enough to make progress.
 
 ## [3.3.4] - 2026-08-22
 

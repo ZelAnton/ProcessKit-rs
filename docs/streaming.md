@@ -418,11 +418,15 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
 ```
 
 `ProcessStdin` offers `write(&[u8])`, `write_line(&str)` (terminal Enter + flush),
-`flush()`, and `finish()` (EOF). Dropping the writer — or the whole
-`RunningProcess` — closes stdin too; `finish()` just makes the EOF explicit
-and awaitable. `write_line` sends `\n` to a pipe or Unix PTY and `\r` to a
-Windows ConPTY, where a lone LF is Ctrl-J rather than the Enter key; use `write`
-when you need byte-exact input.
+`flush()`, and `finish()` (EOF). Dropping the writer requests the same EOF: while
+the PTY session and its async runtime remain live, the backend retains that
+request through temporary input backpressure and delivers it after the child
+resumes reading. `finish()` makes delivery explicit and awaitable, including its
+I/O error; dropping has no error channel. Dropping the whole `RunningProcess`
+tears the child tree down, so neither EOF form promises delivery after the
+session/runtime is already irreversibly ending. `write_line` sends `\n` to a pipe
+or Unix PTY and `\r` to a Windows ConPTY, where a lone LF is Ctrl-J rather than
+the Enter key; use `write` when you need byte-exact input.
 
 **Avoid the full-duplex deadlock.** A child's stdout pipe has a finite OS
 buffer; once it fills, the child blocks *writing* stdout until something reads
