@@ -116,20 +116,35 @@ impl Drop for PipelineTerminalConfirmationTestGuard {
 }
 
 #[cfg(test)]
-fn suppress_pipeline_terminal_confirmation(
+fn configure_pipeline_terminal_confirmation_for_test(
     budget: Duration,
+    suppress: bool,
 ) -> PipelineTerminalConfirmationTestGuard {
     PIPELINE_TERMINAL_CONFIRMATION_TEST_CONFIG.with(|slot| {
         assert!(
             slot.replace(Some(PipelineTerminalConfirmationTestConfig {
                 budget,
-                suppress: true,
+                suppress,
             }))
             .is_none(),
             "pipeline terminal-confirmation seam already armed on this thread"
         );
     });
     PipelineTerminalConfirmationTestGuard
+}
+
+#[cfg(test)]
+fn override_pipeline_terminal_confirmation_budget(
+    budget: Duration,
+) -> PipelineTerminalConfirmationTestGuard {
+    configure_pipeline_terminal_confirmation_for_test(budget, false)
+}
+
+#[cfg(test)]
+fn suppress_pipeline_terminal_confirmation(
+    budget: Duration,
+) -> PipelineTerminalConfirmationTestGuard {
+    configure_pipeline_terminal_confirmation_for_test(budget, true)
 }
 
 fn pipeline_terminal_confirmation_budget() -> Duration {
@@ -4372,7 +4387,10 @@ mod tests {
         session
             .chain_state
             .store(crate::running::TS_TIMED_OUT, Ordering::Release);
-        let error = tokio::time::timeout(Duration::from_secs(5), session.finish())
+        let confirmation_budget = Duration::from_millis(100);
+        let finish_bound = confirmation_budget + Duration::from_secs(5);
+        let _confirmation = override_pipeline_terminal_confirmation_budget(confirmation_budget);
+        let error = tokio::time::timeout(finish_bound, session.finish())
             .await
             .expect("teardown failure must bound pipeline finish")
             .expect_err("an unconfirmed live-chain timeout must fail closed");
