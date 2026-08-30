@@ -4202,22 +4202,23 @@ mod tests {
         // Drive both timeout boundaries explicitly. Tokio's paused clock normally
         // auto-advances when the executor is otherwise idle, but an OS-backed PTY
         // wait can keep the macOS process driver externally armed and suppress
-        // that heuristic. Explicit advancement preserves the hermetic timing
-        // premise on every platform without shortening either production budget.
+        // that heuristic. Advancing in bounded steps also lets each timeout arm
+        // before the next step; one large advance can otherwise race past the
+        // second timeout before escalation has installed it.
         let failure = {
             let teardown =
                 run.graceful_teardown(grace, crate::sys::SIGTERM_RAW, TeardownCause::Cancellation);
             let clock = async {
-                tokio::task::yield_now().await;
-                tokio::time::advance(grace).await;
-                tokio::task::yield_now().await;
-                tokio::time::advance(PUMP_TEARDOWN).await;
+                loop {
+                    tokio::task::yield_now().await;
+                    tokio::time::advance(Duration::from_millis(100)).await;
+                }
             };
             tokio::pin!(teardown);
             tokio::select! {
                 biased;
                 failure = &mut teardown => failure,
-                () = clock => teardown.await,
+                () = clock => unreachable!("the clock driver never completes"),
             }
         };
         let failure =

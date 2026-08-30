@@ -298,10 +298,11 @@ fn recycled_during_adoption(pid: i32) -> io::Error {
 /// - **Linux / Android** — `/proc/<pid>/stat` field 3 (state); live is any state
 ///   other than `Z` (zombie) or `X`/`x` (dead).
 /// - **macOS / the other Apple targets** — `proc_pidinfo(PROC_PIDTBSDINFO)`'s
-///   `pbi_status`; live is `SIDL`/`SRUN`/`SSLEEP`/`SSTOP`, never `SZOMB`. Apple
-///   can remove a zombie from the ordinary proc lookup before its parent reaps
-///   it, so a short fill is followed by a non-reaping `waitid(WNOWAIT)` probe
-///   when the pid names one of this process's children.
+///   `pbi_status` plus `PROC_FLAG_INEXIT`; live is
+///   `SIDL`/`SRUN`/`SSLEEP`/`SSTOP` only when the process is not already exiting.
+///   Apple can remove a zombie from the ordinary proc lookup before its parent
+///   reaps it, so a short fill is followed by a non-reaping `waitid(WNOWAIT)`
+///   probe when the pid names one of this process's children.
 /// - **the BSDs (and any other unix)** — no wired-up state reader (the same
 ///   per-OS `sysctl(KERN_PROC)` divergence that blocks `read_identity` there), so
 ///   the state is always unknown: delivery `EPERM` keeps its pre-existing
@@ -321,6 +322,14 @@ pub(crate) enum ProcessState {
     Unknown,
 }
 
+// Darwin exposes this public `proc_bsdinfo::pbi_flags` bit in
+// `<sys/proc_info.h>`, but the Rust libc bindings do not currently name it.
+// It is the transition state between signal delivery and `SZOMB`: treating it
+// as live would turn macOS's zombie-only `killpg` EPERM into a false teardown
+// failure during that window.
+#[cfg(target_vendor = "apple")]
+const PROC_FLAG_INEXIT: u32 = 4;
+
 #[cfg(any(target_os = "linux", target_os = "android"))]
 pub(crate) fn process_state(pid: i32) -> ProcessState {
     // `/proc/<pid>/stat` field 3 is the state char. A successful read that is
@@ -339,12 +348,13 @@ pub(crate) fn process_state(pid: i32) -> ProcessState {
 #[cfg(target_vendor = "apple")]
 pub(crate) fn process_state(pid: i32) -> ProcessState {
     // `proc_pidinfo(PROC_PIDTBSDINFO)` fills a `proc_bsdinfo` whose `pbi_status` is
-    // the BSD run state. A full-size fill whose status is a live value
-    // (SIDL/SRUN/SSLEEP/SSTOP — never SZOMB) is a genuinely-alive process. A
-    // short/failed read may mean either gone or unreadable. In particular, Apple
-    // removes an exited child from this ordinary proc lookup while its wait
-    // status is still owned by the parent, so `waitid(WNOWAIT)` supplies the
-    // missing non-reaping child-state verdict below.
+    // the BSD run state and whose `PROC_FLAG_INEXIT` bit covers the transition
+    // before that state becomes `SZOMB`. A full-size fill whose status is a live
+    // value (SIDL/SRUN/SSLEEP/SSTOP) and which is not already exiting is a
+    // genuinely-alive process. A short/failed read may mean either gone or
+    // unreadable. In particular, Apple removes an exited child from this ordinary
+    // proc lookup while its wait status is still owned by the parent, so
+    // `waitid(WNOWAIT)` supplies the missing non-reaping child-state verdict below.
     // SAFETY: `proc_bsdinfo` is plain-old-data (integers and byte arrays), for
     // which an all-zero bit pattern is a valid initialized value.
     let mut info: libc::proc_bsdinfo = unsafe { std::mem::zeroed() };
@@ -361,6 +371,9 @@ pub(crate) fn process_state(pid: i32) -> ProcessState {
         )
     };
     if got == want {
+        if info.pbi_flags & PROC_FLAG_INEXIT != 0 {
+            return ProcessState::ZombieOrDead;
+        }
         return match info.pbi_status {
             libc::SIDL | libc::SRUN | libc::SSLEEP | libc::SSTOP => ProcessState::Live,
             libc::SZOMB => ProcessState::ZombieOrDead,
