@@ -76,9 +76,9 @@ rustdoc-args = ["--cfg", "docsrs"]
 # ours); warn-level here becomes a hard error under CI's `-D warnings`.
 [lints.rust]
 missing_debug_implementations = "warn"
-# All `unsafe` lives in explicit `unsafe {}` blocks inside safe fns (the FFI in
-# `sys/`); there are no `unsafe fn` today. Deny the day someone adds one and
-# forgets to keep that discipline. (`missing_docs` is enforced lib-scoped in
+# Unsafe functions carry contracts that their callers must uphold. Keep unsafe
+# operations within them in explicit `unsafe {}` blocks so each use remains
+# locally reviewable. (`missing_docs` is enforced lib-scoped in
 # `src/lib.rs` so it doesn't burden examples/tests.)
 unsafe_op_in_unsafe_fn = "deny"
 # Neither `cfg(fuzzing)` nor `cfg(loom)` is a Cargo feature; both are set via
