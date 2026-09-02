@@ -380,21 +380,26 @@ impl Job {
     }
 
     /// Spawn `cmd` under a pseudo-terminal as a member of this job — the
-    /// [`Command::use_pty`](crate::Command::use_pty) backend. `env` is the child's
-    /// resolved environment for the Windows raw-`CreateProcessW` path (ignored on
-    /// Unix, whose pty child keeps the tokio `Command`'s env). The child joins the
-    /// **same** job as [`spawn`](Self::spawn), so containment is unchanged.
+    /// [`Command::use_pty`](crate::Command::use_pty) backend. Windows receives the
+    /// resolved environment for its raw `CreateProcessW` path; Unix keeps the
+    /// tokio `Command`'s environment. The child joins the **same** job as
+    /// [`spawn`](Self::spawn), so containment is unchanged.
     #[cfg(feature = "pty")]
     pub(crate) fn spawn_pty(
         &self,
         cmd: &mut Command,
         opts: &SpawnOptions,
-        env: Option<Vec<(std::ffi::OsString, std::ffi::OsString)>>,
+        #[cfg(windows)] env: Option<Vec<(std::ffi::OsString, std::ffi::OsString)>>,
     ) -> io::Result<pty::PtySpawn> {
         // The launch seam routes here only for `use_pty`; the flag on the options
         // records that intent for the platform backend.
         debug_assert!(opts.use_pty, "spawn_pty requires SpawnOptions::use_pty");
-        self.0.spawn_pty(cmd, opts, env)
+        #[cfg(windows)]
+        {
+            return self.0.spawn_pty(cmd, opts, env);
+        }
+        #[cfg(not(windows))]
+        self.0.spawn_pty(cmd, opts)
     }
 
     /// The undo [`spawn_pty`](Self::spawn_pty) hands its guard, exposed so the
