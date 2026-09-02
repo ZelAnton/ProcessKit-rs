@@ -16,6 +16,7 @@
 //! inside one shared kill-on-drop [`ProcessGroup`].
 
 use std::future::Future;
+use std::ops::ControlFlow;
 use std::pin::Pin;
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{Arc, Mutex};
@@ -199,6 +200,27 @@ enum GateOutcome {
     /// [`ErrorReason::Predicate`](crate::ErrorReason::Predicate) rather than a
     /// restart/give-up verdict.
     PredicateError(crate::error::PredicateError),
+}
+
+/// The incarnation context consumed by [`Supervisor::gate_restart`]. A
+/// completed result can be clean (`Always` still restarts it) or crashed; a
+/// runner failure has no result for `stop_when` or healthy-uptime accounting.
+#[derive(Clone, Copy)]
+enum RestartAttempt<'a> {
+    Result {
+        result: &'a ProcessResult<String>,
+        crashed: bool,
+    },
+    Failed(&'a crate::Error),
+}
+
+/// The owned terminal value retained while [`Supervisor::gate_restart`]
+/// decides whether supervision ends or continues. Result-bearing attempts
+/// report a [`SupervisionOutcome`]; a runner failure remains the authoritative
+/// error unless an interrupt or predicate error supersedes it.
+enum GateTerminal {
+    Result(ProcessResult<String>),
+    Failed(crate::Error),
 }
 
 /// The capture policy to apply to each incarnation: respect an explicit
@@ -1980,51 +2002,30 @@ impl<R: ProcessRunner> Supervisor<R> {
                             StopReason::PolicySatisfied,
                         ));
                     }
-                    match self
+                    let gate = self
                         .gate_restart(
-                            &result,
-                            crashed,
+                            RestartAttempt::Result {
+                                result: &result,
+                                crashed,
+                            },
                             &mut restarts,
                             &mut backoff_restarts,
                             &mut storm,
                             factor,
                             &shared,
                         )
-                        .await
-                    {
-                        GateOutcome::GaveUp => {
-                            shared.emit(SupervisionEvent::GaveUp { attempt });
-                            return Ok(self.outcome(
-                                result,
-                                restarts,
-                                liveness_kills,
-                                &storm,
-                                StopReason::GaveUp,
-                            ));
-                        }
-                        GateOutcome::Exhausted => {
-                            return Ok(self.outcome(
-                                result,
-                                restarts,
-                                liveness_kills,
-                                &storm,
-                                StopReason::RestartsExhausted,
-                            ));
-                        }
-                        GateOutcome::Cancelled => return Err(self.cancelled_err(&command)),
-                        GateOutcome::Stopped => {
-                            return Ok(self.outcome(
-                                result,
-                                restarts,
-                                liveness_kills,
-                                &storm,
-                                StopReason::Stopped,
-                            ));
-                        }
-                        GateOutcome::Restart => shared.set_restarts(restarts),
-                        GateOutcome::PredicateError(source) => {
-                            return Err(crate::Error::predicate("give_up_when", source));
-                        }
+                        .await;
+                    if let ControlFlow::Break(outcome) = self.apply_gate_outcome(
+                        gate,
+                        GateTerminal::Result(result),
+                        attempt,
+                        restarts,
+                        liveness_kills,
+                        &storm,
+                        &command,
+                        &shared,
+                    ) {
+                        return outcome;
                     }
                 }
                 Incarnation::LivenessFailed { uptime } => {
@@ -2063,51 +2064,30 @@ impl<R: ProcessRunner> Supervisor<R> {
                             StopReason::Unhealthy,
                         ));
                     }
-                    match self
+                    let gate = self
                         .gate_restart(
-                            &result,
-                            /* crashed */ true,
+                            RestartAttempt::Result {
+                                result: &result,
+                                crashed: true,
+                            },
                             &mut restarts,
                             &mut backoff_restarts,
                             &mut storm,
                             factor,
                             &shared,
                         )
-                        .await
-                    {
-                        GateOutcome::GaveUp => {
-                            shared.emit(SupervisionEvent::GaveUp { attempt });
-                            return Ok(self.outcome(
-                                result,
-                                restarts,
-                                liveness_kills,
-                                &storm,
-                                StopReason::GaveUp,
-                            ));
-                        }
-                        GateOutcome::Exhausted => {
-                            return Ok(self.outcome(
-                                result,
-                                restarts,
-                                liveness_kills,
-                                &storm,
-                                StopReason::RestartsExhausted,
-                            ));
-                        }
-                        GateOutcome::Cancelled => return Err(self.cancelled_err(&command)),
-                        GateOutcome::Stopped => {
-                            return Ok(self.outcome(
-                                result,
-                                restarts,
-                                liveness_kills,
-                                &storm,
-                                StopReason::Stopped,
-                            ));
-                        }
-                        GateOutcome::Restart => shared.set_restarts(restarts),
-                        GateOutcome::PredicateError(source) => {
-                            return Err(crate::Error::predicate("give_up_when", source));
-                        }
+                        .await;
+                    if let ControlFlow::Break(outcome) = self.apply_gate_outcome(
+                        gate,
+                        GateTerminal::Result(result),
+                        attempt,
+                        restarts,
+                        liveness_kills,
+                        &storm,
+                        &command,
+                        &shared,
+                    ) {
+                        return outcome;
                     }
                 }
                 Incarnation::LivenessError { source } => {
@@ -2161,57 +2141,28 @@ impl<R: ProcessRunner> Supervisor<R> {
                     if !wants_restart {
                         return Err(err);
                     }
-                    if let Some(classifier) = &self.give_up_when {
-                        match classifier(&GiveUpAttempt::Failed(&err)) {
-                            // Classified permanent: surface the spawn failure.
-                            Ok(true) => {
-                                shared.emit(SupervisionEvent::GaveUp { attempt });
-                                return Err(err);
-                            }
-                            // Not permanent — retried below, exactly as an
-                            // infallible `give_up_when` returning `false` does.
-                            Ok(false) => {}
-                            // A fallible `try_give_up_when` erred: abort with the
-                            // predicate's own error instead of the spawn failure.
-                            Err(source) => {
-                                return Err(crate::Error::predicate("give_up_when", source));
-                            }
-                        }
+                    let gate = self
+                        .gate_restart(
+                            RestartAttempt::Failed(&err),
+                            &mut restarts,
+                            &mut backoff_restarts,
+                            &mut storm,
+                            factor,
+                            &shared,
+                        )
+                        .await;
+                    if let ControlFlow::Break(outcome) = self.apply_gate_outcome(
+                        gate,
+                        GateTerminal::Failed(err),
+                        attempt,
+                        restarts,
+                        liveness_kills,
+                        &storm,
+                        &command,
+                        &shared,
+                    ) {
+                        return outcome;
                     }
-                    if self.max_restarts.is_some_and(|max| restarts >= max) {
-                        return Err(err);
-                    }
-                    // A spawn-side failure carries no run duration, so it never
-                    // counts as healthy — the escalation keeps climbing.
-                    match self.storm_gate(&mut storm, &shared).await {
-                        Wake::Cancelled => return Err(self.cancelled_err(&command)),
-                        Wake::Stopped => {
-                            return Ok(self.outcome(
-                                self.stopped_result(),
-                                restarts,
-                                liveness_kills,
-                                &storm,
-                                StopReason::Stopped,
-                            ));
-                        }
-                        Wake::Elapsed => {}
-                    }
-                    match self.sleep_backoff(backoff_restarts, factor, &shared).await {
-                        Wake::Cancelled => return Err(self.cancelled_err(&command)),
-                        Wake::Stopped => {
-                            return Ok(self.outcome(
-                                self.stopped_result(),
-                                restarts,
-                                liveness_kills,
-                                &storm,
-                                StopReason::Stopped,
-                            ));
-                        }
-                        Wake::Elapsed => {}
-                    }
-                    restarts = restarts.saturating_add(1);
-                    backoff_restarts = backoff_restarts.saturating_add(1);
-                    shared.set_restarts(restarts);
                 }
             }
         }
@@ -2270,26 +2221,33 @@ impl<R: ProcessRunner> Supervisor<R> {
     }
 
     /// The shared restart gate reached by a restart-eligible incarnation — a real
-    /// crash, a clean run restarted under [`Always`](RestartPolicy::Always), or a
-    /// liveness kill (`crashed == true`). Consults, in order:
-    /// [`give_up_when`](Self::give_up_when) (crashes only),
+    /// crash, a clean run restarted under [`Always`](RestartPolicy::Always), a
+    /// liveness kill, or a runner failure with no completed result. Consults, in
+    /// order: [`give_up_when`](Self::give_up_when) (failures only),
     /// [`max_restarts`](Self::max_restarts), the E3 healthy-uptime reset, the
-    /// [failure-storm guard](Self::storm_pause) (crashes only), and the backoff
-    /// sleep; then advances the restart counters. Factoring it here keeps the
-    /// `Ran(Ok)` and `LivenessFailed` arms from drifting apart.
+    /// [failure-storm guard](Self::storm_pause) (failures only), and the backoff
+    /// sleep; then advances the restart counters. A runner failure never reaches
+    /// `stop_when` or the uptime reset because it has no result to inspect.
     #[allow(clippy::too_many_arguments)]
     async fn gate_restart(
         &self,
-        result: &ProcessResult<String>,
-        crashed: bool,
+        attempt: RestartAttempt<'_>,
         restarts: &mut u32,
         backoff_restarts: &mut u32,
         storm: &mut StormState,
         factor: f64,
         shared: &SessionShared,
     ) -> GateOutcome {
-        if crashed && let Some(classifier) = &self.give_up_when {
-            match classifier(&GiveUpAttempt::Crashed(result)) {
+        let failure = match attempt {
+            RestartAttempt::Result {
+                result,
+                crashed: true,
+            } => Some(GiveUpAttempt::Crashed(result)),
+            RestartAttempt::Failed(err) => Some(GiveUpAttempt::Failed(err)),
+            RestartAttempt::Result { crashed: false, .. } => None,
+        };
+        if let (Some(failure), Some(classifier)) = (failure.as_ref(), &self.give_up_when) {
+            match classifier(failure) {
                 Ok(true) => return GateOutcome::GaveUp,
                 // Not permanent — restart per policy, as infallible `false` does.
                 Ok(false) => {}
@@ -2310,11 +2268,14 @@ impl<R: ProcessRunner> Supervisor<R> {
         // uptime floor — rather than "any clean exit resets" — avoids a footgun:
         // under Always, an instantly-exiting `exit 0` loop would otherwise reset
         // every iteration and spin at the base delay.
-        let healthy = result.duration() >= self.max_backoff;
+        let healthy = match attempt {
+            RestartAttempt::Result { result, .. } => result.duration() >= self.max_backoff,
+            RestartAttempt::Failed(_) => false,
+        };
         if healthy {
             *backoff_restarts = 0;
         }
-        if crashed {
+        if failure.is_some() {
             match self.storm_gate(storm, shared).await {
                 Wake::Cancelled => return GateOutcome::Cancelled,
                 Wake::Stopped => return GateOutcome::Stopped,
@@ -2329,6 +2290,61 @@ impl<R: ProcessRunner> Supervisor<R> {
         *restarts = restarts.saturating_add(1);
         *backoff_restarts = backoff_restarts.saturating_add(1);
         GateOutcome::Restart
+    }
+
+    /// Map every restart-gate verdict to either the next loop iteration or its
+    /// terminal caller-facing value. Keeping this exhaustive match in one place
+    /// prevents result, liveness, and runner-failure paths from drifting when a
+    /// new [`GateOutcome`] is introduced.
+    #[allow(clippy::too_many_arguments)]
+    fn apply_gate_outcome(
+        &self,
+        gate: GateOutcome,
+        terminal: GateTerminal,
+        attempt: u32,
+        restarts: u32,
+        liveness_kills: u32,
+        storm: &StormState,
+        command: &Command,
+        shared: &SessionShared,
+    ) -> ControlFlow<Result<SupervisionOutcome>> {
+        let terminal_result = |terminal: GateTerminal, reason| match terminal {
+            GateTerminal::Result(result) => {
+                Ok(self.outcome(result, restarts, liveness_kills, storm, reason))
+            }
+            GateTerminal::Failed(err) => Err(err),
+        };
+
+        match gate {
+            GateOutcome::GaveUp => {
+                shared.emit(SupervisionEvent::GaveUp { attempt });
+                ControlFlow::Break(terminal_result(terminal, StopReason::GaveUp))
+            }
+            GateOutcome::Exhausted => {
+                ControlFlow::Break(terminal_result(terminal, StopReason::RestartsExhausted))
+            }
+            GateOutcome::Cancelled => ControlFlow::Break(Err(self.cancelled_err(command))),
+            GateOutcome::Stopped => {
+                let result = match terminal {
+                    GateTerminal::Result(result) => result,
+                    GateTerminal::Failed(_) => self.stopped_result(),
+                };
+                ControlFlow::Break(Ok(self.outcome(
+                    result,
+                    restarts,
+                    liveness_kills,
+                    storm,
+                    StopReason::Stopped,
+                )))
+            }
+            GateOutcome::Restart => {
+                shared.set_restarts(restarts);
+                ControlFlow::Continue(())
+            }
+            GateOutcome::PredicateError(source) => {
+                ControlFlow::Break(Err(crate::Error::predicate("give_up_when", source)))
+            }
+        }
     }
 
     /// The synthetic [`ProcessResult`] for an incarnation a liveness check
@@ -3766,6 +3782,252 @@ mod tests {
         }
     }
 
+    #[derive(Clone, Copy, Debug, PartialEq, Eq)]
+    enum GateCase {
+        Restart,
+        GaveUp,
+        Exhausted,
+        Cancelled,
+        Stopped,
+        PredicateError,
+    }
+
+    #[derive(Clone, Copy, Debug, PartialEq, Eq)]
+    enum RestartAttemptCase {
+        Result,
+        Liveness,
+        Failed,
+    }
+
+    const GATE_CASES: &[GateCase] = &[
+        GateCase::Restart,
+        GateCase::GaveUp,
+        GateCase::Exhausted,
+        GateCase::Cancelled,
+        GateCase::Stopped,
+        GateCase::PredicateError,
+    ];
+    const RESTART_ATTEMPT_CASES: &[RestartAttemptCase] = &[
+        RestartAttemptCase::Result,
+        RestartAttemptCase::Liveness,
+        RestartAttemptCase::Failed,
+    ];
+
+    #[tokio::test(start_paused = true)]
+    async fn restart_gate_uses_one_ordered_policy_for_every_attempt_shape() {
+        for &attempt_case in RESTART_ATTEMPT_CASES {
+            for &gate_case in GATE_CASES {
+                let token = crate::CancellationToken::new();
+                if gate_case == GateCase::Cancelled {
+                    token.cancel();
+                }
+                let command = Command::new("fake").cancel_on(token);
+                let mut supervisor = Supervisor::new(command)
+                    .with_runner(SeqRunner::new(vec![]))
+                    .backoff(Duration::ZERO, 1.0)
+                    .jitter(false);
+                supervisor = match gate_case {
+                    GateCase::GaveUp => supervisor.give_up_when(|_| true),
+                    GateCase::Exhausted => supervisor.max_restarts(0),
+                    GateCase::PredicateError => supervisor
+                        .try_give_up_when(|_| Err::<bool, _>(PredicateBoom("gate-matrix"))),
+                    GateCase::Restart | GateCase::Cancelled | GateCase::Stopped => supervisor,
+                };
+
+                let shared = SessionShared::new();
+                if gate_case == GateCase::Stopped {
+                    shared.stop.cancel();
+                }
+                let mut events = shared.subscribe();
+                let result = fail(7).expect("scripted crash result");
+                let liveness = supervisor.liveness_kill_result(Duration::from_millis(50));
+                let failed = spawn_err().expect_err("scripted runner failure");
+                let attempt = match attempt_case {
+                    RestartAttemptCase::Result => RestartAttempt::Result {
+                        result: &result,
+                        crashed: true,
+                    },
+                    RestartAttemptCase::Liveness => RestartAttempt::Result {
+                        result: &liveness,
+                        crashed: true,
+                    },
+                    RestartAttemptCase::Failed => RestartAttempt::Failed(&failed),
+                };
+                let mut restarts = 0;
+                let mut backoff_restarts = 0;
+                let mut storm = StormState::new();
+
+                let outcome = supervisor
+                    .gate_restart(
+                        attempt,
+                        &mut restarts,
+                        &mut backoff_restarts,
+                        &mut storm,
+                        1.0,
+                        &shared,
+                    )
+                    .await;
+
+                match (gate_case, outcome) {
+                    (GateCase::Restart, GateOutcome::Restart)
+                    | (GateCase::GaveUp, GateOutcome::GaveUp)
+                    | (GateCase::Exhausted, GateOutcome::Exhausted)
+                    | (GateCase::Cancelled, GateOutcome::Cancelled)
+                    | (GateCase::Stopped, GateOutcome::Stopped) => {}
+                    (GateCase::PredicateError, GateOutcome::PredicateError(source)) => {
+                        let boom = source
+                            .downcast_ref::<PredicateBoom>()
+                            .expect("the gate retains the classifier error");
+                        assert_eq!(boom.0, "gate-matrix");
+                    }
+                    (_, _) => panic!("wrong gate outcome for {attempt_case:?}/{gate_case:?}"),
+                }
+
+                let expected_restarts = u32::from(gate_case == GateCase::Restart);
+                assert_eq!(
+                    restarts, expected_restarts,
+                    "{attempt_case:?}/{gate_case:?}"
+                );
+                assert_eq!(
+                    backoff_restarts, expected_restarts,
+                    "{attempt_case:?}/{gate_case:?}"
+                );
+                let events: Vec<_> = std::iter::from_fn(|| events.try_recv().ok()).collect();
+                let crosses_backoff = matches!(
+                    gate_case,
+                    GateCase::Restart | GateCase::Cancelled | GateCase::Stopped
+                );
+                assert_eq!(
+                    events,
+                    if crosses_backoff {
+                        vec![SupervisionEvent::RestartScheduled {
+                            restart: 1,
+                            delay: Duration::ZERO,
+                        }]
+                    } else {
+                        vec![]
+                    },
+                    "{attempt_case:?}/{gate_case:?}"
+                );
+            }
+        }
+    }
+
+    #[test]
+    fn gate_outcome_mapping_preserves_terminal_values_events_and_live_counters() {
+        for &attempt_case in RESTART_ATTEMPT_CASES {
+            for &gate_case in GATE_CASES {
+                let supervisor = supervise(SeqRunner::new(vec![]));
+                let command = supervisor.command.clone();
+                let shared = SessionShared::new();
+                let mut events = shared.subscribe();
+                let storm = StormState {
+                    score: 0.0,
+                    last_failure_at: None,
+                    pauses: 2,
+                };
+                let terminal = match attempt_case {
+                    RestartAttemptCase::Result => {
+                        GateTerminal::Result(fail(7).expect("scripted crash result"))
+                    }
+                    RestartAttemptCase::Liveness => GateTerminal::Result(
+                        supervisor.liveness_kill_result(Duration::from_millis(50)),
+                    ),
+                    RestartAttemptCase::Failed => {
+                        GateTerminal::Failed(spawn_err().expect_err("scripted runner failure"))
+                    }
+                };
+                let gate = match gate_case {
+                    GateCase::Restart => GateOutcome::Restart,
+                    GateCase::GaveUp => GateOutcome::GaveUp,
+                    GateCase::Exhausted => GateOutcome::Exhausted,
+                    GateCase::Cancelled => GateOutcome::Cancelled,
+                    GateCase::Stopped => GateOutcome::Stopped,
+                    GateCase::PredicateError => {
+                        GateOutcome::PredicateError(Box::new(PredicateBoom("mapping-matrix")))
+                    }
+                };
+                let liveness_kills = u32::from(attempt_case == RestartAttemptCase::Liveness) * 2;
+
+                let control = supervisor.apply_gate_outcome(
+                    gate,
+                    terminal,
+                    3,
+                    4,
+                    liveness_kills,
+                    &storm,
+                    &command,
+                    &shared,
+                );
+
+                if gate_case == GateCase::Restart {
+                    assert!(
+                        matches!(control, ControlFlow::Continue(())),
+                        "{attempt_case:?}/{gate_case:?}"
+                    );
+                    assert_eq!(shared.snapshot().restarts(), 4);
+                } else {
+                    assert_eq!(shared.snapshot().restarts(), 0);
+                    let returned = match control {
+                        ControlFlow::Break(returned) => returned,
+                        ControlFlow::Continue(()) => {
+                            panic!("terminal gate continued for {attempt_case:?}/{gate_case:?}")
+                        }
+                    };
+                    match gate_case {
+                        GateCase::GaveUp | GateCase::Exhausted
+                            if attempt_case == RestartAttemptCase::Failed =>
+                        {
+                            let err = returned.expect_err("runner failure remains authoritative");
+                            assert!(matches!(err.reason(), crate::ErrorReason::Spawn { .. }));
+                        }
+                        GateCase::Cancelled => {
+                            let err = returned.expect_err("cancel is terminal");
+                            assert!(matches!(err.reason(), crate::ErrorReason::Cancelled { .. }));
+                        }
+                        GateCase::PredicateError => {
+                            let err = returned.expect_err("predicate failure is terminal");
+                            assert_predicate_error(&err, "give_up_when", "mapping-matrix");
+                        }
+                        GateCase::GaveUp | GateCase::Exhausted | GateCase::Stopped => {
+                            let outcome = returned.expect("result-bearing gate outcome");
+                            let expected_reason = match gate_case {
+                                GateCase::GaveUp => StopReason::GaveUp,
+                                GateCase::Exhausted => StopReason::RestartsExhausted,
+                                GateCase::Stopped => StopReason::Stopped,
+                                _ => unreachable!(),
+                            };
+                            assert_eq!(outcome.stopped, expected_reason);
+                            assert_eq!(outcome.restarts, 4);
+                            assert_eq!(outcome.storm_pauses, 2);
+                            assert_eq!(outcome.liveness_kills, liveness_kills);
+                            assert_eq!(
+                                outcome.final_result.code(),
+                                if attempt_case == RestartAttemptCase::Result {
+                                    Some(7)
+                                } else {
+                                    None
+                                }
+                            );
+                        }
+                        GateCase::Restart => unreachable!(),
+                    }
+                }
+
+                let events: Vec<_> = std::iter::from_fn(|| events.try_recv().ok()).collect();
+                assert_eq!(
+                    events,
+                    if gate_case == GateCase::GaveUp {
+                        vec![SupervisionEvent::GaveUp { attempt: 3 }]
+                    } else {
+                        vec![]
+                    },
+                    "{attempt_case:?}/{gate_case:?}"
+                );
+            }
+        }
+    }
+
     #[tokio::test]
     async fn try_stop_when_error_aborts_supervision() {
         // The error reaches the caller as a typed `Predicate` error, not a stop
@@ -3954,6 +4216,28 @@ mod tests {
             .expect("supervision");
         assert_eq!(outcome.restarts, 1);
         assert_eq!(outcome.stopped, StopReason::PolicySatisfied);
+    }
+
+    #[tokio::test]
+    async fn spawn_error_uses_the_restart_gate_without_a_stop_when_result() {
+        let stop_checks = Arc::new(AtomicU32::new(0));
+        let observed = Arc::clone(&stop_checks);
+        let outcome = supervise(SeqRunner::new(vec![spawn_err(), ok()]))
+            .stop_when(move |_| {
+                observed.fetch_add(1, Ordering::SeqCst);
+                false
+            })
+            .run()
+            .await
+            .expect("the spawn error is retried and the next result completes");
+
+        assert_eq!(outcome.restarts, 1);
+        assert_eq!(outcome.stopped, StopReason::PolicySatisfied);
+        assert_eq!(
+            stop_checks.load(Ordering::SeqCst),
+            1,
+            "stop_when only receives the completed second incarnation"
+        );
     }
 
     #[tokio::test]
