@@ -298,7 +298,7 @@ impl ProcessGroup {
         {
             self.job
                 .spawn_pty(cmd, opts, env)
-                .map_err(|source| Error::spawn(program_name(cmd), source));
+                .map_err(|source| Error::spawn(program_name(cmd), source))
         }
         #[cfg(not(windows))]
         self.job
