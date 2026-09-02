@@ -1220,7 +1220,17 @@ fn hard_kill_primitive_with(
     cgroup_kill_exists: impl FnOnce(&Path) -> bool,
     pidfd_probe: impl FnOnce(i32) -> io::Result<()>,
 ) -> Option<HardKillPrimitive> {
-    if cgroup_kill_exists(&cgroup_dir.join("cgroup.kill")) {
+    hard_kill_primitive_from(
+        cgroup_kill_exists(&cgroup_dir.join("cgroup.kill")),
+        pidfd_probe,
+    )
+}
+
+fn hard_kill_primitive_from(
+    cgroup_kill_available: bool,
+    pidfd_probe: impl FnOnce(i32) -> io::Result<()>,
+) -> Option<HardKillPrimitive> {
+    if cgroup_kill_available {
         return Some(HardKillPrimitive::CgroupKill);
     }
     pidfd_probe(std::process::id() as i32)
@@ -1230,6 +1240,74 @@ fn hard_kill_primitive_with(
 
 fn hard_kill_primitive(cgroup_dir: &Path) -> Option<HardKillPrimitive> {
     hard_kill_primitive_with(cgroup_dir, Path::exists, |pid| pidfd_open(pid).map(drop))
+}
+
+/// Read-only prediction of whether a child created under `parent` will expose
+/// `cgroup.kill`.
+///
+/// Every non-root cgroup on a supporting kernel exposes the file, so the
+/// parent's own file is normally authoritative. The hierarchy root is the one
+/// exception: it cannot be killed and therefore has no `cgroup.kill`, while its
+/// children do. In that case the kernel release is the only read-only answer
+/// when the root has no existing child to inspect. An existing child remains
+/// useful evidence for vendor backports to pre-5.14 kernels.
+fn child_cgroup_kill_available(root: &Path, parent: &Path) -> bool {
+    if parent.join("cgroup.kill").exists() {
+        return true;
+    }
+    if parent != root {
+        return false;
+    }
+    root_has_cgroup_kill_child(root) || kernel_supports_cgroup_kill()
+}
+
+fn root_has_cgroup_kill_child(root: &Path) -> bool {
+    let Ok(entries) = std::fs::read_dir(root) else {
+        return false;
+    };
+    entries
+        .filter_map(Result::ok)
+        .any(|entry| entry.path().join("cgroup.kill").exists())
+}
+
+fn kernel_supports_cgroup_kill() -> bool {
+    std::fs::read_to_string("/proc/sys/kernel/osrelease")
+        .is_ok_and(|release| kernel_release_supports_cgroup_kill(release.trim()))
+}
+
+fn kernel_release_supports_cgroup_kill(release: &str) -> bool {
+    let mut components = release.split('.');
+    let Some(major) = components.next().and_then(parse_kernel_version_component) else {
+        return false;
+    };
+    let Some(minor) = components.next().and_then(parse_kernel_version_component) else {
+        return false;
+    };
+    (major, minor) >= (5, 14)
+}
+
+fn parse_kernel_version_component(component: &str) -> Option<u32> {
+    let digit_count = component
+        .as_bytes()
+        .iter()
+        .take_while(|byte| byte.is_ascii_digit())
+        .count();
+    component.get(..digit_count)?.parse().ok()
+}
+
+fn predicted_hard_kill_primitive(root: &Path, parent: &Path) -> Option<HardKillPrimitive> {
+    predicted_hard_kill_primitive_with(root, parent, child_cgroup_kill_available, |pid| {
+        pidfd_open(pid).map(drop)
+    })
+}
+
+fn predicted_hard_kill_primitive_with(
+    root: &Path,
+    parent: &Path,
+    child_cgroup_kill_probe: impl FnOnce(&Path, &Path) -> bool,
+    pidfd_probe: impl FnOnce(i32) -> io::Result<()>,
+) -> Option<HardKillPrimitive> {
+    hard_kill_primitive_from(child_cgroup_kill_probe(root, parent), pidfd_probe)
 }
 
 fn hard_kill_unavailable() -> io::Error {
@@ -1265,20 +1343,23 @@ fn access_ok(path: &Path, mode: libc::c_int) -> bool {
 ///
 /// Reports [`Mechanism::CgroupV2`] when a cgroup v2 hierarchy is mounted
 /// ([`cgroup2_root`]), this process's own cgroup dir ([`cgroup2_self_dir`]) would
-/// accept a new leaf ([`dir_allows_subdir_creation`]), and that leaf can be torn
-/// down by either `cgroup.kill` or pidfd-backed member signalling. These are the
-/// same gates `Cgroup::create` applies; otherwise this reports
+/// accept a new leaf ([`dir_allows_subdir_creation`]), and that prospective leaf
+/// can be torn down by either `cgroup.kill` or pidfd-backed member signalling.
+/// Creation verifies the same capability against the child it actually made;
+/// otherwise this reports
 /// [`Mechanism::ProcessGroup`] (the POSIX process-group fallback). The cgroup
-/// branch is **best-effort**: it predicts the child cgroup's interface from its
-/// parent and probes permissions rather than creating the leaf, so a later
-/// `mkdir` refusal or a changed interface view can still make `Job::new` fall back.
+/// branch is **best-effort**: at the hierarchy root, which has no `cgroup.kill`
+/// of its own, it predicts the child's interface from the kernel release or an
+/// existing child. A later `mkdir` refusal or changed interface view can still
+/// make `Job::new` fall back.
 pub(crate) fn detect_mechanism() -> Mechanism {
     let Some(root) = cgroup2_root() else {
         return Mechanism::ProcessGroup;
     };
     match cgroup2_self_dir(&root) {
         Ok(parent)
-            if dir_allows_subdir_creation(&parent) && hard_kill_primitive(&parent).is_some() =>
+            if dir_allows_subdir_creation(&parent)
+                && predicted_hard_kill_primitive(&root, &parent).is_some() =>
         {
             Mechanism::CgroupV2
         }
@@ -1753,12 +1834,6 @@ impl Cgroup {
         // can never disagree on *where* this process's cgroup is.
         let parent = cgroup2_self_dir(root)?;
 
-        // Do not select a backend whose Drop path has no usable hard-kill
-        // primitive. This is also the read-only detection gate; checking it before
-        // mkdir keeps the public host query aligned with the real choice. A
-        // cgroup.kill prediction is verified against the created directory below.
-        let predicted_hard_kill = hard_kill_primitive(&parent).ok_or_else(hard_kill_unavailable)?;
-
         // Without limits, no controllers are enabled — `cgroup.kill` needs none,
         // and that sidesteps the "no internal processes" rule. Even *with* limits,
         // the controllers are enabled in the PARENT's `cgroup.subtree_control` (see
@@ -1802,14 +1877,12 @@ impl Cgroup {
         })?;
         let cg = Cgroup::at(path);
 
-        // pidfd support is process-wide and the successful probe above is the
-        // capability proof. `cgroup.kill`, however, belongs to the cgroup itself:
-        // verify the interface the kernel populated in the directory we will own.
-        // If the parent's view changed, pidfd gets one chance to preserve the
-        // backend before the empty directory is removed and Job::new falls back.
-        if predicted_hard_kill == HardKillPrimitive::CgroupKill
-            && hard_kill_primitive(&cg.path).is_none()
-        {
+        // This created non-root cgroup is the authoritative capability gate.
+        // The hierarchy root deliberately has no `cgroup.kill` of its own even
+        // when every child exposes it, so checking the parent before `mkdir`
+        // would reject a backend with working atomic teardown. If this child has
+        // neither primitive, remove it before Job::new falls back to a pgroup.
+        if hard_kill_primitive(&cg.path).is_none() {
             let _ = std::fs::remove_dir(&cg.path);
             return Err(hard_kill_unavailable());
         }
@@ -5296,8 +5369,9 @@ mod detect_mechanism_tests {
     use std::path::Path;
 
     use super::{
-        HardKillPrimitive, Job, cgroup2_root, cgroup2_self_dir, detect_mechanism,
-        dir_allows_subdir_creation, hard_kill_primitive_with,
+        HardKillPrimitive, Job, cgroup2_root, cgroup2_self_dir, child_cgroup_kill_available,
+        detect_mechanism, dir_allows_subdir_creation, hard_kill_primitive_with,
+        kernel_release_supports_cgroup_kill, predicted_hard_kill_primitive_with,
     };
     use crate::Mechanism;
 
@@ -5377,6 +5451,51 @@ mod detect_mechanism_tests {
         );
 
         assert_eq!(primitive, None);
+    }
+
+    #[test]
+    fn hierarchy_root_without_cgroup_kill_predicts_and_creates_a_killable_child() {
+        let nanos = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .map(|duration| duration.as_nanos())
+            .unwrap_or(0);
+        let root = std::env::temp_dir().join(format!(
+            "processkit-root-kill-probe-{}-{nanos}",
+            std::process::id()
+        ));
+        let existing_child = root.join("existing-child");
+        let created_child = root.join("created-child");
+        std::fs::create_dir_all(&existing_child).expect("create existing child stand-in");
+        std::fs::write(existing_child.join("cgroup.kill"), b"")
+            .expect("seed existing child's cgroup.kill");
+
+        assert!(
+            !root.join("cgroup.kill").exists(),
+            "the hierarchy root deliberately has no cgroup.kill"
+        );
+        let predicted =
+            predicted_hard_kill_primitive_with(&root, &root, child_cgroup_kill_available, |_| {
+                Err(io::Error::from(io::ErrorKind::PermissionDenied))
+            });
+
+        std::fs::create_dir(&created_child).expect("create prospective child stand-in");
+        std::fs::write(created_child.join("cgroup.kill"), b"")
+            .expect("seed created child's cgroup.kill");
+        let created = hard_kill_primitive_with(&created_child, Path::exists, |_| {
+            Err(io::Error::from(io::ErrorKind::PermissionDenied))
+        });
+        let _ = std::fs::remove_dir_all(&root);
+
+        assert_eq!(predicted, Some(HardKillPrimitive::CgroupKill));
+        assert_eq!(created, Some(HardKillPrimitive::CgroupKill));
+    }
+
+    #[test]
+    fn kernel_release_predicts_cgroup_kill_for_mainline_versions() {
+        assert!(!kernel_release_supports_cgroup_kill("5.13.19"));
+        assert!(kernel_release_supports_cgroup_kill("5.14.0"));
+        assert!(kernel_release_supports_cgroup_kill("6.17.0-rc1"));
+        assert!(!kernel_release_supports_cgroup_kill("not-a-release"));
     }
 
     #[test]
