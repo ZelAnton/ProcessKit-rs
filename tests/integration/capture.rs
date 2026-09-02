@@ -952,6 +952,30 @@ async fn output_bytes_returns_raw_stdout() {
     assert!(text.contains("first") && text.contains("second"));
 }
 
+#[cfg(unix)]
+#[tokio::test]
+#[ignore = "spawns a real subprocess with a grandchild holding both output pipes open"]
+async fn output_bytes_bounds_hanging_stdout_and_stderr_with_one_teardown_budget() {
+    // The background sleeper inherits both pipes after its shell parent exits,
+    // reproducing the leaked-grandchild case without keeping the direct child
+    // alive. One shared PUMP_TEARDOWN lets this finish in roughly five seconds;
+    // the old sequential stdout-then-stderr waits needed two budgets.
+    let start = Instant::now();
+    let result = Command::new("sh")
+        .args(["-c", "sleep 30 & printf 'ready'; exit 0"])
+        .output_bytes()
+        .await
+        .expect("a leaked output writer must be bounded, not fail the capture");
+
+    assert!(result.is_success(), "result: {result:?}");
+    assert_eq!(result.stdout(), b"ready");
+    assert!(
+        start.elapsed() < Duration::from_secs(8),
+        "stdout/stderr teardown exceeded one PUMP_TEARDOWN budget: {:?}",
+        start.elapsed()
+    );
+}
+
 #[tokio::test]
 #[ignore = "spawns a real subprocess fed stdin it never reads"]
 async fn early_exiting_child_does_not_fail_a_large_stdin_feed() {

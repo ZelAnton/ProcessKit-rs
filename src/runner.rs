@@ -1141,10 +1141,15 @@ async fn launch_pty(
     stdin_reservation: Option<crate::stdin::StdinReservation>,
 ) -> Result<RunningProcess> {
     // The Windows raw-`CreateProcessW` path needs the fully-resolved env (it
-    // bypasses `std`'s env handling); ignored on Unix.
-    let env = command.resolved_pty_env();
+    // bypasses `std`'s env handling). Unix keeps the environment already
+    // applied to `tokio_cmd`, so it must not materialize a Windows env block.
+    #[cfg(windows)]
     let pty = group
-        .spawn_pty_with_options(&mut tokio_cmd, &opts, env)
+        .spawn_pty_with_options(&mut tokio_cmd, &opts, command.resolved_pty_env())
+        .map_err(|e| map_spawn_error(command, e))?;
+    #[cfg(not(windows))]
+    let pty = group
+        .spawn_pty_with_options(&mut tokio_cmd, &opts)
         .map_err(|e| map_spawn_error(command, e))?;
     // A child now exists: commit the reservation so a one-shot source is consumed
     // for good (see `launch`).

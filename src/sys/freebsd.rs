@@ -968,15 +968,13 @@ impl Job {
     }
 
     /// Spawn `cmd` under a pseudo-terminal, reusing this backend's normal spawn path
-    /// (and therefore both containment layers). `env` is unused here — the Unix pty
-    /// child keeps the tokio `Command`'s env; it exists only to match the
-    /// cross-platform seam.
+    /// (and therefore both containment layers). The Unix pty child keeps the
+    /// tokio `Command`'s environment.
     #[cfg(feature = "pty")]
     pub(crate) fn spawn_pty(
         &self,
         cmd: &mut Command,
         opts: &crate::sys::SpawnOptions,
-        _env: Option<Vec<(std::ffi::OsString, std::ffi::OsString)>>,
     ) -> io::Result<crate::sys::pty::PtySpawn> {
         // Carries the spare the spawn's kill-on-drop re-arm displaced over to the
         // rollback. Both closures run inside this one call, on this thread, and the

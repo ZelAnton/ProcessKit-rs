@@ -123,34 +123,10 @@ fn read_identity(pid: i32) -> Option<u64> {
 /// The Apple reader — see the identity-token doc above the Linux `read_identity`.
 #[cfg(target_vendor = "apple")]
 fn read_identity(pid: i32) -> Option<u64> {
-    // `proc_pidinfo(PROC_PIDTBSDINFO)` fills a `proc_bsdinfo` whose
-    // `pbi_start_tvsec`/`pbi_start_tvusec` is the process creation time (stable
-    // across `exec`, distinct for a recycled pid). Fold it into microseconds.
-    // SAFETY: `proc_bsdinfo` is plain-old-data (integers and byte arrays), for
-    // which an all-zero bit pattern is a valid initialized value.
-    let mut info: libc::proc_bsdinfo = unsafe { std::mem::zeroed() };
-    let want = std::mem::size_of::<libc::proc_bsdinfo>() as libc::c_int;
-    // SAFETY: `proc_pidinfo` writes at most `want` bytes into `info`; a valid
-    // pointer and a matching buffer size are its only preconditions.
-    let got = unsafe {
-        libc::proc_pidinfo(
-            pid,
-            libc::PROC_PIDTBSDINFO,
-            0,
-            std::ptr::addr_of_mut!(info).cast::<libc::c_void>(),
-            want,
-        )
-    };
-    // A full-size fill is success; 0 / -1 (gone, EPERM) or a short read is not a
-    // usable identity — report `None` so the caller defers to the liveness probe.
-    if got != want {
-        return None;
-    }
-    Some(
-        info.pbi_start_tvsec
-            .saturating_mul(1_000_000)
-            .saturating_add(info.pbi_start_tvusec),
-    )
+    fill_bsdinfo(pid)
+        .ok()
+        .flatten()
+        .map(|info| bsdinfo_start_time(&info))
 }
 
 /// The BSDs (and any other unix): no wired-up reader, so identity is always
@@ -347,30 +323,13 @@ pub(crate) fn process_state(pid: i32) -> ProcessState {
 /// The Apple reader — see the doc above the Linux [`process_state`].
 #[cfg(target_vendor = "apple")]
 pub(crate) fn process_state(pid: i32) -> ProcessState {
-    // `proc_pidinfo(PROC_PIDTBSDINFO)` fills a `proc_bsdinfo` whose `pbi_status` is
-    // the BSD run state and whose `PROC_FLAG_INEXIT` bit covers the transition
-    // before that state becomes `SZOMB`. A full-size fill whose status is a live
-    // value (SIDL/SRUN/SSLEEP/SSTOP) and which is not already exiting is a
-    // genuinely-alive process. A short/failed read may mean either gone or
-    // unreadable. In particular, Apple removes an exited child from this ordinary
-    // proc lookup while its wait status is still owned by the parent, so
-    // `waitid(WNOWAIT)` supplies the missing non-reaping child-state verdict below.
-    // SAFETY: `proc_bsdinfo` is plain-old-data (integers and byte arrays), for
-    // which an all-zero bit pattern is a valid initialized value.
-    let mut info: libc::proc_bsdinfo = unsafe { std::mem::zeroed() };
-    let want = std::mem::size_of::<libc::proc_bsdinfo>() as libc::c_int;
-    // SAFETY: `proc_pidinfo` writes at most `want` bytes into `info`; a valid
-    // pointer and a matching buffer size are its only preconditions.
-    let got = unsafe {
-        libc::proc_pidinfo(
-            pid,
-            libc::PROC_PIDTBSDINFO,
-            0,
-            std::ptr::addr_of_mut!(info).cast::<libc::c_void>(),
-            want,
-        )
-    };
-    if got == want {
+    // A full-size fill whose status is a live value (SIDL/SRUN/SSLEEP/SSTOP) and
+    // which is not already exiting is a genuinely-alive process. A short/failed
+    // read may mean either gone or unreadable. In particular, Apple removes an
+    // exited child from this ordinary proc lookup while its wait status is still
+    // owned by the parent, so `waitid(WNOWAIT)` supplies the missing non-reaping
+    // child-state verdict below.
+    if let Some(info) = fill_bsdinfo(pid).ok().flatten() {
         if info.pbi_flags & PROC_FLAG_INEXIT != 0 {
             return ProcessState::ZombieOrDead;
         }
@@ -503,10 +462,9 @@ fn read_member_info(pid: i32) -> Option<MemberInfo> {
 }
 
 /// One `proc_pidinfo(PROC_PIDTBSDINFO)` fill for `pid`, distinguishing **gone**
-/// from **can't look** — the single `proc_bsdinfo` read shared by the group
-/// member snapshot ([`read_member_info`]) and the standalone
-/// [`process_info`](crate::process_info) query, so neither carries an independent
-/// copy of the syscall dance.
+/// from **can't look** — the single `proc_bsdinfo` read shared by Apple's identity,
+/// liveness, and member-metadata readers, so none carries an independent copy of
+/// the syscall dance.
 ///
 /// `Ok(Some(info))` on a full-size fill (the process exists and is readable),
 /// `Ok(None)` when the errno is `ESRCH` (no such process — an honest negative),
@@ -514,14 +472,14 @@ fn read_member_info(pid: i32) -> Option<MemberInfo> {
 /// not inspect — so the standalone query never reads "not allowed to look" as
 /// "dead"; the group-snapshot caller collapses both `Ok(None)` and `Err` back to
 /// "skip this pid").
-#[cfg(all(feature = "process-control", target_vendor = "apple"))]
+#[cfg(target_vendor = "apple")]
 fn fill_bsdinfo(pid: i32) -> io::Result<Option<libc::proc_bsdinfo>> {
     // SAFETY: `proc_bsdinfo` is plain-old-data (integers and byte arrays), for
-    // which an all-zero bit pattern is a valid initialized value.
+    // which an all-zero bit pattern is a valid initialized value. `proc_pidinfo`
+    // writes at most `want` bytes into `info`; a valid pointer and a matching
+    // buffer size are its only preconditions.
     let mut info: libc::proc_bsdinfo = unsafe { std::mem::zeroed() };
     let want = std::mem::size_of::<libc::proc_bsdinfo>() as libc::c_int;
-    // SAFETY: `proc_pidinfo` writes at most `want` bytes into `info`; a valid
-    // pointer and a matching buffer size are its only preconditions.
     let got = unsafe {
         libc::proc_pidinfo(
             pid,
@@ -545,21 +503,26 @@ fn fill_bsdinfo(pid: i32) -> io::Result<Option<libc::proc_bsdinfo>> {
     }
 }
 
+/// Fold an Apple process creation timestamp into the microsecond identity token
+/// used by [`read_identity`] and [`build_member_info`].
+#[cfg(target_vendor = "apple")]
+fn bsdinfo_start_time(info: &libc::proc_bsdinfo) -> u64 {
+    info.pbi_start_tvsec
+        .saturating_mul(1_000_000)
+        .saturating_add(info.pbi_start_tvusec)
+}
+
 /// Assemble a [`MemberInfo`] from a filled `proc_bsdinfo`: `pbi_ppid`, the short
 /// `pbi_comm` image name, and the creation time folded to microseconds since the
 /// Unix epoch — shared by [`read_member_info`] and [`process_info`] so the field
 /// mapping exists once.
 #[cfg(all(feature = "process-control", target_vendor = "apple"))]
 fn build_member_info(pid: u32, info: &libc::proc_bsdinfo) -> MemberInfo {
-    let start_time = info
-        .pbi_start_tvsec
-        .saturating_mul(1_000_000)
-        .saturating_add(info.pbi_start_tvusec);
     MemberInfo::new(
         pid,
         Some(info.pbi_ppid),
         comm_to_string(&info.pbi_comm),
-        Some(start_time),
+        Some(bsdinfo_start_time(info)),
     )
 }
 

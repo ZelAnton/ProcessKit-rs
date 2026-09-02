@@ -266,6 +266,31 @@ struct StageOutcome {
     stderr_truncated: bool,
 }
 
+impl StageOutcome {
+    #[allow(clippy::too_many_arguments)]
+    fn new(
+        program: impl Into<String>,
+        outcome: Outcome,
+        stderr: impl Into<String>,
+        unchecked: bool,
+        ok_codes: Vec<i32>,
+        timeout: Option<Duration>,
+        torn_down: bool,
+        stderr_truncated: bool,
+    ) -> Self {
+        Self {
+            program: program.into(),
+            outcome,
+            stderr: stderr.into(),
+            unchecked,
+            ok_codes,
+            timeout,
+            torn_down,
+            stderr_truncated,
+        }
+    }
+}
+
 /// A live session's independently-owned view of one stage's capture.
 ///
 /// The stage task remains the sole consumer. This clone exists only so a bounded
@@ -321,19 +346,19 @@ impl RetainedStageCapture {
         let (stderr, stderr_truncated) = tracker.stderr_snapshot();
         (
             self.index,
-            StageOutcome {
-                program: self.program.clone(),
+            StageOutcome::new(
+                self.program.clone(),
                 // This outcome never escapes the retained teardown error: it is
                 // only a carrier through the ordinary pipefail fold so stage
                 // ordering and unchecked attribution stay single-sourced.
-                outcome: Outcome::Signalled(None),
+                Outcome::Signalled(None),
                 stderr,
-                unchecked: self.unchecked,
-                ok_codes: self.ok_codes.clone(),
-                timeout: self.timeout,
+                self.unchecked,
+                self.ok_codes.clone(),
+                self.timeout,
                 torn_down,
                 stderr_truncated,
-            },
+            ),
         )
     }
 }
@@ -870,47 +895,28 @@ impl Pipeline {
         let mut inner_tasks: tokio::task::JoinSet<Result<(usize, StageOutcome)>> =
             tokio::task::JoinSet::new();
         let mut inner_captures = Vec::with_capacity(inner_count);
-        for (index, ((mut process, unchecked), stage)) in
-            running.into_iter().zip(self.stages.iter()).enumerate()
-        {
-            let program = process.program_name().to_owned();
-            let ok_codes = stage.ok_codes_vec();
-            let timeout = stage.configured_timeout();
-            let tracker = process.prepare_line_capture()?;
-            inner_captures.push(RetainedStageCapture {
-                index,
-                program: program.clone(),
-                unchecked,
-                ok_codes: ok_codes.clone(),
-                timeout,
-                tracker: Arc::new(std::sync::Mutex::new(RetainedCapture::Lines(tracker))),
-            });
-            let teardown = teardown.clone();
-            let teardown_cause = teardown_cause.clone();
-            let terminal = terminal.clone();
-            inner_tasks.spawn(async move {
-                let result = finish_inner_stage(
-                    process,
+        spawn_inner_stages(
+            running,
+            &self.stages[..self.stages.len() - 1],
+            &teardown,
+            &teardown_cause,
+            &terminal,
+            &mut inner_tasks,
+            InnerStageErrorReaction::TriggerTeardown,
+            |index, outcome| (index, outcome),
+            |index, process, program, ok_codes, timeout, unchecked| {
+                let tracker = process.prepare_line_capture()?;
+                inner_captures.push(RetainedStageCapture {
                     index,
-                    program,
-                    ok_codes,
-                    timeout,
+                    program: program.to_owned(),
                     unchecked,
-                    teardown.clone(),
-                    teardown_cause.clone(),
-                    terminal,
-                )
-                .await;
-                if let Err(error) = &result {
-                    trigger_pipeline_teardown(
-                        &teardown,
-                        &teardown_cause,
-                        pipeline_error_teardown_cause(error),
-                    );
-                }
-                result
-            });
-        }
+                    ok_codes: ok_codes.to_vec(),
+                    timeout,
+                    tracker: Arc::new(std::sync::Mutex::new(RetainedCapture::Lines(tracker))),
+                });
+                Ok(())
+            },
+        )?;
 
         // Standing teardown killer: fans a hard kill across every stage's sub-group
         // the instant `teardown` fires, so a failing inner stage tears the *whole*
@@ -1092,13 +1098,13 @@ impl Pipeline {
         let teardown_failure: PipelineTeardownFailure = Arc::default();
 
         // Drain concurrently: a stderr-chatty inner stage must not block on a full pipe.
-        let (mut last, last_unchecked) = running.pop().expect("a pipeline has at least two stages");
-        let last_stage = self
-            .stages
-            .last()
-            .expect("a pipeline has at least two stages");
-        let last_ok_codes = last_stage.ok_codes_vec();
-        let last_timeout = last_stage.configured_timeout();
+        let DetachedLast {
+            handle: mut last,
+            program: _last_program,
+            ok_codes: last_ok_codes,
+            timeout: last_timeout,
+            unchecked: last_unchecked,
+        } = self.detach_last(&mut running);
         // Prepare the last stage's capture before moving it into a task. The
         // tracker remains in this future's frame, so a chain-wide timeout can
         // salvage its retained prefix after the task is dropped.
@@ -1116,34 +1122,17 @@ impl Pipeline {
         let inner_count = running.len();
         let terminal = PipelineTerminalState::new(inner_count + 1);
         let mut tasks: tokio::task::JoinSet<Result<Joined<T>>> = tokio::task::JoinSet::new();
-        for (index, ((process, unchecked), stage)) in
-            running.into_iter().zip(self.stages.iter()).enumerate()
-        {
-            let program = process.program_name().to_owned();
-            let ok_codes = stage.ok_codes_vec();
-            let timeout = stage.configured_timeout();
-            let teardown = teardown.clone();
-            let teardown_cause = teardown_cause.clone();
-            let terminal = terminal.clone();
-            tasks.spawn(async move {
-                // `finish_inner_stage` is the shared classify-and-teardown body,
-                // reused by `start`'s streaming inner drains — so both paths blame
-                // a stage and fire proactive teardown identically.
-                let (index, outcome) = finish_inner_stage(
-                    process,
-                    index,
-                    program,
-                    ok_codes,
-                    timeout,
-                    unchecked,
-                    teardown,
-                    teardown_cause,
-                    terminal,
-                )
-                .await?;
-                Ok(Joined::Inner(index, outcome))
-            });
-        }
+        spawn_inner_stages(
+            running,
+            &self.stages[..self.stages.len() - 1],
+            &teardown,
+            &teardown_cause,
+            &terminal,
+            &mut tasks,
+            InnerStageErrorReaction::DeferToDrain,
+            |index, outcome| Joined::Inner(index, outcome),
+            |_index, _process, _program, _ok_codes, _timeout, _unchecked| Ok(()),
+        )?;
         // The last stage of a buffering capture is driven by its own drain, exactly
         // like an inner stage — so it gets the same latch, armed at its *exit*
         // through the capture's `at_exit` seam. Nothing else observes it here (this
@@ -1437,16 +1426,16 @@ impl Pipeline {
         let last_truncated = last_result.truncated();
         let (last_total_lines, last_total_bytes) =
             (last_result.total_lines(), last_result.total_bytes());
-        let last_outcome = StageOutcome {
-            program: last_result.program().to_owned(),
-            outcome: last_result.outcome(),
-            stderr: last_result.stderr().to_owned(),
-            unchecked: last_unchecked,
-            ok_codes: last_ok_codes,
-            timeout: last_timeout,
-            torn_down: last_torn_down,
-            stderr_truncated: last_truncated,
-        };
+        let last_outcome = StageOutcome::new(
+            last_result.program().to_owned(),
+            last_result.outcome(),
+            last_result.stderr().to_owned(),
+            last_unchecked,
+            last_ok_codes,
+            last_timeout,
+            last_torn_down,
+            last_truncated,
+        );
         let last_stdout = last_result.into_stdout();
         stages.push(last_outcome);
 
@@ -2119,16 +2108,16 @@ impl PipelineSession {
         // the last. Sorting by index needs no `expect` for a missing slot.
         inner.sort_by_key(|(index, _)| *index);
         let mut stages: Vec<StageOutcome> = inner.into_iter().map(|(_, outcome)| outcome).collect();
-        stages.push(StageOutcome {
-            program: self.last_program.clone(),
-            outcome: last_finished.outcome,
-            stderr: last_finished.stderr,
-            unchecked: self.last_unchecked,
-            ok_codes: self.last_ok_codes.clone(),
-            timeout: self.last_timeout,
-            torn_down: last_torn_down,
-            stderr_truncated: last_finished.stderr_truncated,
-        });
+        stages.push(StageOutcome::new(
+            self.last_program.clone(),
+            last_finished.outcome,
+            last_finished.stderr,
+            self.last_unchecked,
+            self.last_ok_codes.clone(),
+            self.last_timeout,
+            last_torn_down,
+            last_finished.stderr_truncated,
+        ));
 
         // Reuse the exact pipefail attribution. The last stage's real stdout was
         // already streamed to the caller, so fold with a unit payload and surface
@@ -2851,6 +2840,75 @@ fn spawn_last_stage_watcher(
     })
 }
 
+#[derive(Clone, Copy)]
+enum InnerStageErrorReaction {
+    /// The streaming path has no central drain to backstop a task error.
+    TriggerTeardown,
+    /// The buffering path's unordered drain observes and reacts to task errors.
+    DeferToDrain,
+}
+
+/// Prepare and spawn every non-final stage through the same finisher used by the
+/// buffering and streaming pipeline paths. The caller chooses how a raw task
+/// error is surfaced because `capture` has a central unordered drain while
+/// `start` must make each background task self-report.
+#[allow(clippy::too_many_arguments)]
+fn spawn_inner_stages<T, M, P>(
+    running: Vec<(RunningProcess, bool)>,
+    stages: &[Command],
+    teardown: &tokio_util::sync::CancellationToken,
+    teardown_cause: &PipelineTeardownCause,
+    terminal: &PipelineTerminalConfirmation,
+    tasks: &mut tokio::task::JoinSet<Result<T>>,
+    error_reaction: InnerStageErrorReaction,
+    map: M,
+    mut prepare: P,
+) -> Result<()>
+where
+    T: Send + 'static,
+    M: Fn(usize, StageOutcome) -> T + Clone + Send + 'static,
+    P: FnMut(usize, &mut RunningProcess, &str, &[i32], Option<Duration>, bool) -> Result<()>,
+{
+    for (index, ((mut process, unchecked), stage)) in
+        running.into_iter().zip(stages.iter()).enumerate()
+    {
+        let program = process.program_name().to_owned();
+        let ok_codes = stage.ok_codes_vec();
+        let timeout = stage.configured_timeout();
+        prepare(index, &mut process, &program, &ok_codes, timeout, unchecked)?;
+
+        let teardown = teardown.clone();
+        let teardown_cause = teardown_cause.clone();
+        let terminal = terminal.clone();
+        let map = map.clone();
+        tasks.spawn(async move {
+            let result = finish_inner_stage(
+                process,
+                index,
+                program,
+                ok_codes,
+                timeout,
+                unchecked,
+                teardown.clone(),
+                teardown_cause.clone(),
+                terminal,
+            )
+            .await;
+            if matches!(error_reaction, InnerStageErrorReaction::TriggerTeardown)
+                && let Err(error) = &result
+            {
+                trigger_pipeline_teardown(
+                    &teardown,
+                    &teardown_cause,
+                    pipeline_error_teardown_cause(error),
+                );
+            }
+            result.map(|(index, outcome)| map(index, outcome))
+        });
+    }
+    Ok(())
+}
+
 /// Drive one already-launched **non-last** stage to its [`Finished`] and fold it
 /// into a positioned [`StageOutcome`], firing `teardown` on its first *checked*
 /// failure (the proactive-teardown trigger). The shared classify-and-teardown body
@@ -2915,7 +2973,7 @@ async fn finish_inner_stage(
     }
     Ok((
         index,
-        StageOutcome {
+        StageOutcome::new(
             program,
             outcome,
             stderr,
@@ -2924,7 +2982,7 @@ async fn finish_inner_stage(
             timeout,
             torn_down,
             stderr_truncated,
-        },
+        ),
     ))
 }
 
@@ -2955,16 +3013,16 @@ fn partial_pipeline_finished(
     let mut stages: Vec<StageOutcome> = inner.into_iter().map(|(_, outcome)| outcome).collect();
 
     if let Some((Ok(last_finished), last_torn_down)) = last_res {
-        stages.push(StageOutcome {
-            program: last_program.to_owned(),
-            outcome: last_finished.outcome,
-            stderr: last_finished.stderr,
-            unchecked: last_unchecked,
-            ok_codes: last_ok_codes.to_vec(),
-            timeout: last_timeout,
-            torn_down: last_torn_down,
-            stderr_truncated: last_finished.stderr_truncated,
-        });
+        stages.push(StageOutcome::new(
+            last_program,
+            last_finished.outcome,
+            last_finished.stderr,
+            last_unchecked,
+            last_ok_codes.to_vec(),
+            last_timeout,
+            last_torn_down,
+            last_finished.stderr_truncated,
+        ));
     } else if let Some((_, Some(retained_last), torn_down)) = retained {
         stages.push(retained_last.retained_outcome(torn_down).1);
     }
