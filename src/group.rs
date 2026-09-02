@@ -651,11 +651,12 @@ impl ProcessGroup {
     /// `SIGKILL` with `EPERM` while still **alive** is surfaced as an `Err` — the
     /// containment gap is reported, not hidden. The one `EPERM` that is *not*
     /// surfaced is the harmless one: on those platforms `killpg` also returns
-    /// `EPERM` for a group whose only member is an unreaped **zombie** (dead), and
-    /// the two are indistinguishable from the errno alone, so the target's actual
-    /// run state is checked after the `EPERM` (`proc_pidinfo` on macOS, the
-    /// `/proc/<pid>/stat` state field on the Linux fallback) and only a
-    /// genuinely-alive, non-zombie member fails the call. On the **BSDs other than
+    /// `EPERM` for a group whose only member is an unreaped **zombie** (dead). On
+    /// macOS the group is enumerated and the error surfaces only when a member both
+    /// rejects a direct signal-0 permission probe and is still live according to
+    /// `proc_pidinfo`; the group-level errno and a live-looking leader alone are
+    /// not enough. The Linux fallback checks the tracked leader's state through
+    /// `/proc/<pid>/stat`. On the **BSDs other than
     /// FreeBSD**, where no
     /// process-state reader is wired up, a delivery `EPERM` stays swallowed
     /// (best-effort), so a privileged child can still outlive `kill_all` there.
@@ -731,10 +732,11 @@ impl ProcessGroup {
     /// - an **`EPERM`** surfaces when it hit a **live, non-zombie** member (a
     ///   `sudo`/setuid child that rejects the signal — the genuine containment gap),
     ///   on the cgroup mechanism, the process-group mechanism and the FreeBSD process
-    ///   reaper alike (the latter two check the target's run state after the `EPERM` —
-    ///   `proc_pidinfo` on macOS, the `/proc/<pid>/stat` state field on the Linux
-    ///   fallback, the kernel's zombie flag in the reaper's `PROC_REAP_GETPIDS`
-    ///   listing on FreeBSD — exactly as [`kill_all`](Self::kill_all) does). The one
+    ///   reaper alike. macOS enumerates the group and requires both a member-specific
+    ///   signal-0 permission denial and a live `proc_pidinfo` state; the Linux
+    ///   fallback checks its tracked leader through `/proc/<pid>/stat`; and FreeBSD
+    ///   uses the kernel's zombie flag in the reaper's `PROC_REAP_GETPIDS` listing —
+    ///   exactly as [`kill_all`](Self::kill_all) does. The one
     ///   `EPERM` deliberately swallowed is the harmless zombie-only case;
     /// - an **`ESRCH`** (the member already exited) is always a benign no-op success.
     ///
