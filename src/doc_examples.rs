@@ -230,4 +230,16 @@ mod tests {
             "every narrative docs/*.md include must have a matching mod docs_* declaration"
         );
     }
+
+    #[test]
+    fn harness_gate_is_owned_by_doc_examples() {
+        let manifest_dir = Path::new(env!("CARGO_MANIFEST_DIR"));
+        let lib_source =
+            fs::read_to_string(manifest_dir.join("src/lib.rs")).expect("read crate root source");
+
+        assert!(
+            lib_source.contains("#[cfg(any(test, doc))]\nmod doc_examples;"),
+            "lib.rs must keep the doc_examples module feature-independent; its feature gate belongs in src/doc_examples.rs"
+        );
+    }
 }
