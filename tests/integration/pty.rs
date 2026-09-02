@@ -17,11 +17,9 @@
 
 use std::time::Duration;
 
-#[cfg(unix)]
-use processkit::Stdin;
 #[cfg(windows)]
 use processkit::wait_any;
-use processkit::{Command, ErrorReason, JobRunner, ProcessRunner, StdioMode};
+use processkit::{Command, ErrorReason, JobRunner, ProcessRunner, Stdin, StdioMode};
 
 use crate::common::{completes_within, poll_until};
 
@@ -67,6 +65,32 @@ fn prompt_responder() -> Command {
     } else {
         Command::new("sh").args(["-c", "read line; printf 'reply:%s\\n' \"$line\""])
     }
+}
+
+#[cfg(windows)]
+async fn assert_conpty_bulk_line_source(stdin: Stdin, label: &str) {
+    let child = Command::new("powershell").args([
+        "-NoProfile",
+        "-NonInteractive",
+        "-Command",
+        "$first = [Console]::In.ReadLine(); if ($null -eq $first) { exit 41 }; \
+         $second = [Console]::In.ReadLine(); if ($null -eq $second) { exit 42 }; \
+         $eof = [Console]::In.ReadLine(); if ($null -ne $eof) { exit 43 }; \
+         [Console]::Out.WriteLine(\"bulk:$first|$second\")",
+    ]);
+    let result = completes_within(
+        Duration::from_secs(20),
+        label,
+        JobRunner::new().output_string(&child.stdin(stdin).use_pty()),
+    )
+    .await
+    .expect("bulk ConPTY input must complete cooked reads and deliver EOF");
+
+    assert!(result.is_success(), "bulk ConPTY child failed: {result:?}");
+    assert!(
+        result.stdout().contains("bulk:alpha|beta"),
+        "success marker requires two complete cooked lines followed by EOF: {result:?}"
+    );
 }
 
 /// A child that writes an **un-terminated** prompt (`passphrase: `, no newline),
@@ -483,6 +507,25 @@ async fn pty_finish_sends_console_eof_without_closing_the_session() {
         "the child must consume one line and then observe EOF: {:?}",
         result.stdout()
     );
+}
+
+#[cfg(windows)]
+#[tokio::test]
+#[ignore = "spawns real ConPTY children and exercises cooked console input"]
+async fn conpty_bulk_line_sources_complete_cooked_reads() {
+    assert_conpty_bulk_line_source(
+        Stdin::from_iter_lines(["alpha", "beta"]),
+        "ConPTY eager bulk lines",
+    )
+    .await;
+    assert_conpty_bulk_line_source(
+        Stdin::from_lines(tokio_stream::iter(vec![
+            "alpha".to_owned(),
+            "beta".to_owned(),
+        ])),
+        "ConPTY streaming bulk lines",
+    )
+    .await;
 }
 
 #[cfg(windows)]
