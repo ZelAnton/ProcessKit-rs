@@ -527,13 +527,15 @@ impl Job {
             &info,
             EXTENDED_LIMIT_AXIS,
         );
+        #[cfg(feature = "limits")]
         if let Err(source) = extended_result {
-            #[cfg(feature = "limits")]
             if let Some(kind) = extended_limit_kind(limits) {
                 return Err(limit_application_error(kind, source));
             }
             return Err(source);
         }
+        #[cfg(not(feature = "limits"))]
+        extended_result?;
 
         // CPU quota is a separate info class. The hard cap is expressed in 1/100 of
         // a percent of *total* system CPU (1..=10000), so convert our per-core

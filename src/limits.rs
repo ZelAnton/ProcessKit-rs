@@ -183,6 +183,7 @@ struct LimitApplicationContext {
 
 #[cfg(feature = "limits")]
 impl LimitApplicationError {
+    #[cfg(any(windows, target_os = "linux"))]
     fn new(kind: LimitKind, source: io::Error, context: Option<LimitApplicationContext>) -> Self {
         Self {
             kind,
@@ -217,7 +218,7 @@ impl std::error::Error for LimitApplicationError {
 /// Attach the axis that a limit-capable backend could identify as the failing
 /// one while retaining the original OS error for display and source-chain
 /// inspection.
-#[cfg(feature = "limits")]
+#[cfg(all(feature = "limits", any(windows, target_os = "linux")))]
 pub(crate) fn limit_application_error(kind: LimitKind, source: io::Error) -> io::Error {
     io::Error::new(
         source.kind(),
