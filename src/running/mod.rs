@@ -1850,14 +1850,14 @@ impl RunningProcess {
         at_exit(self.exit_observation(&outcome));
         let outcome = outcome?;
         self.observe_stdin_task().await;
-        // Bound the stdout drain: a surviving grandchild can hold stdout open past
-        // the child's death; an unbounded read would park forever.
-        if let Some(out_task) = self.stdout_pump.take() {
-            let abort = out_task.abort_handle();
-            if tokio::time::timeout(PUMP_TEARDOWN, out_task).await.is_err() {
-                abort.abort();
-            }
-        }
+        // Bound both output drains together: a surviving grandchild can hold either
+        // pipe open past the child's death, but one shared budget must cover the
+        // whole teardown just like the line-oriented finishers.
+        let pumps: Vec<_> = [self.stdout_pump.take(), self.stderr_pump.take()]
+            .into_iter()
+            .flatten()
+            .collect();
+        join_pumps(pumps).await;
         // The `out_buf` bytes are consistent even on the abort path: the mutex
         // orders every push, and a push never spans the task's only await
         // (`pipe.read`), so the lock here sees whole writes. The overflow/seen
@@ -1867,7 +1867,6 @@ impl RunningProcess {
         // documented best-effort-prefix-on-teardown contract.
         let mut stdout = std::mem::take(&mut *out_buf.lock().expect("stdout buffer poisoned"));
         clamp_dropoldest_tail(&mut stdout, stdout_cap, stdout_mode);
-        join_pumps(self.stderr_pump.take().into_iter().collect()).await;
         // Re-observe stdin after the pumps drained: a writer that failed inside
         // the teardown window is only visible now (see `finalize_stdin_task`).
         self.finalize_stdin_task().await;

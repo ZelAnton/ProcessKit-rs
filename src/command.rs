@@ -2648,11 +2648,10 @@ impl Command {
     /// matches a customized-env pipe run). UTF-8 keys are folded with the same
     /// ASCII-only case rule as [`env_key_eq`]; opaque keys retain their exact
     /// encoded bytes. The resulting canonical-key order also supplies the sorted
-    /// Unicode environment block `CreateProcessW` requires. Computed
-    /// cross-platform to keep the spawn seam uniform; only the Windows backend
-    /// consumes it (on Unix the pty child keeps `build_tokio`'s env, applied by
-    /// `std`).
-    #[cfg(feature = "pty")]
+    /// Unicode environment block `CreateProcessW` requires. Computed only on
+    /// Windows, where the raw ConPTY spawn consumes it (on Unix the pty child
+    /// keeps `build_tokio`'s env, applied by `std`).
+    #[cfg(all(feature = "pty", windows))]
     pub(crate) fn resolved_pty_env(&self) -> Option<Vec<(OsString, OsString)>> {
         let env_ops = self.spawn_env_ops();
         if !self.env_clear && self.inherit_env.is_none() && env_ops.is_empty() {
@@ -3938,13 +3937,13 @@ pub(crate) fn redacted_env_names(
 /// and opaque `OsStr` encodings remain distinct so PTY resolution cannot merge
 /// names that [`env_key_eq`] would keep separate.
 #[derive(Eq, Ord, PartialEq, PartialOrd)]
-#[cfg(any(windows, feature = "pty"))]
+#[cfg(windows)]
 enum WindowsEnvKey {
     Utf8(Vec<u8>),
     Opaque(Vec<u8>),
 }
 
-#[cfg(any(windows, feature = "pty"))]
+#[cfg(windows)]
 fn windows_env_key(key: &OsStr) -> WindowsEnvKey {
     if let Some(key) = key.to_str() {
         let mut folded = key.as_bytes().to_vec();

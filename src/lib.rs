@@ -298,18 +298,7 @@ mod digest;
 // `--all-features` (see the module's own doc comment). Under `cfg(test)`, the
 // sanity test stays available to ordinary `cargo test` with any feature
 // configuration, including default and `--no-default-features`.
-#[cfg(any(
-    test,
-    all(
-        feature = "process-control",
-        feature = "stats",
-        feature = "limits",
-        feature = "mock",
-        feature = "tracing",
-        feature = "record",
-        feature = "json"
-    )
-))]
+#[cfg(any(test, doc))]
 mod doc_examples;
 mod doubles;
 mod error;

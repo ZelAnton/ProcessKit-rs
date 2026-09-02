@@ -1439,7 +1439,7 @@ mod tests {
             let _fault = Faults::new()
                 .fail_every(Site::PtyMasterClone, Some("writer"), libc::EIO)
                 .arm();
-            let result = job.spawn_pty(&mut idle_command(), &pty_options(), None);
+            let result = job.spawn_pty(&mut idle_command(), &pty_options());
             assert!(
                 result.is_err(),
                 "the injected master-clone fault must surface as an error"
@@ -1514,7 +1514,7 @@ mod tests {
             .args(["-c", "sleep 300 & echo $! > \"$PK_PIDFILE\"; wait"])
             .env("PK_PIDFILE", &file);
         let spawn = job
-            .spawn_pty(&mut command, &pty_options(), None)
+            .spawn_pty(&mut command, &pty_options())
             .expect("pty spawn");
         let pid = spawn.pid.expect("the pty child reports a pid");
         let descendant = published_pid(&file, "the forked descendant").await;
@@ -1575,7 +1575,7 @@ mod tests {
             .env(ESCAPEE_FLAG, "1")
             .env(ESCAPEE_PIDFILE, &file);
         let spawn = job
-            .spawn_pty(&mut command, &pty_options(), None)
+            .spawn_pty(&mut command, &pty_options())
             .expect("pty spawn");
         let pid = spawn.pid.expect("the pty child reports a pid");
         let escapee = published_pid(&file, "the setsid escapee").await;
