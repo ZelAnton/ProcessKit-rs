@@ -1377,7 +1377,9 @@ type InvocationCallback = Box<dyn Fn(&str) + Send + Sync>;
 /// A [`ProcessRunner`] that never spawns a process: it renders each command
 /// via [`Command::command_line`] — reusing the crate's own display quoting,
 /// not a hand-rolled shell-escaper — and returns a synthetic successful
-/// result for every valid verb. It still validates stdin through the shared
+/// result for every valid verb. A command whose cancellation token is already
+/// cancelled returns [`ErrorReason::Cancelled`](crate::ErrorReason::Cancelled)
+/// before validation or recording. It still validates stdin through the shared
 /// runner path, so an incompatible stdin setup is rejected before its line is
 /// rendered. The seam behind a tool's own `--dry-run`/`--echo` mode: production
 /// code keeps calling the same [`ProcessRunner`], just wired to this double
@@ -1515,17 +1517,23 @@ fn synthetic_success_code(command: &Command) -> i32 {
 #[async_trait::async_trait]
 impl ProcessRunner for DryRunRunner {
     /// Record `command`'s rendered line and return a synthetic successful
-    /// result — no process spawned, no output to fake. Invalid stdin
-    /// configurations are rejected before recording.
+    /// result — no process spawned, no output to fake. An already-cancelled
+    /// token short-circuits with [`ErrorReason::Cancelled`](crate::ErrorReason::Cancelled)
+    /// before stdin validation or recording; invalid stdin configurations are
+    /// rejected before recording otherwise.
     async fn output_string(&self, command: &Command) -> Result<ProcessResult<String>> {
+        let program = command.program().to_string_lossy().into_owned();
+        if let Some(token) = command.cancel_token()
+            && token.is_cancelled()
+        {
+            return Err(crate::error::ErrorReason::Cancelled { program }.into());
+        }
         // Validate through the same launch boundary as live and scripted runs.
         // Dropping this uncommitted reservation leaves a one-shot source available
         // for a later real run.
         let _stdin_reservation = crate::runner::take_stdin_for_run(command)?;
         if !command.stdout_is_piped() {
-            return Err(crate::error::stdout_not_piped_error(
-                &command.program_name(),
-            ));
+            return Err(crate::error::stdout_not_piped_error(&program));
         }
         self.record(command);
         Ok(ProcessResult::new(
@@ -1542,8 +1550,17 @@ impl ProcessRunner for DryRunRunner {
     /// live handle whose (empty) output flows through the same pump
     /// machinery a scripted [`start`](ScriptedRunner::start) uses, so
     /// `stdout_lines`/`finish` behave consistently with the rest of the seam.
-    /// Invalid stdin configurations are rejected before recording.
+    /// An already-cancelled token short-circuits with
+    /// [`ErrorReason::Cancelled`](crate::ErrorReason::Cancelled) before stdin
+    /// validation or recording; invalid stdin configurations are rejected
+    /// before recording otherwise.
     async fn start(&self, command: &Command) -> Result<crate::RunningProcess> {
+        let program = command.program().to_string_lossy().into_owned();
+        if let Some(token) = command.cancel_token()
+            && token.is_cancelled()
+        {
+            return Err(crate::error::ErrorReason::Cancelled { program }.into());
+        }
         // Keep validation identical to `output_string`; the reservation drops
         // uncommitted because a dry run never starts a child.
         let _stdin_reservation = crate::runner::take_stdin_for_run(command)?;
@@ -2532,6 +2549,45 @@ mod tests {
             matches!(err.reason(), crate::error::ErrorReason::Cancelled { .. }),
             "got {err:?}"
         );
+    }
+
+    #[tokio::test]
+    async fn dry_run_already_cancelled_skips_stdin_recording_and_callback() {
+        use std::sync::{
+            Arc,
+            atomic::{AtomicUsize, Ordering},
+        };
+
+        let token = crate::CancellationToken::new();
+        token.cancel();
+        let callback_calls = Arc::new(AtomicUsize::new(0));
+        let callback_calls_ref = Arc::clone(&callback_calls);
+        let runner = DryRunRunner::new().on_invocation(move |_| {
+            callback_calls_ref.fetch_add(1, Ordering::SeqCst);
+        });
+        let source = crate::Stdin::from_reader(&b"payload"[..]);
+        let command = Command::new("tool").stdin(source.clone()).cancel_on(token);
+
+        for verb in ["output_string", "start"] {
+            let error = if verb == "output_string" {
+                runner.output_string(&command).await.unwrap_err()
+            } else {
+                runner.start(&command).await.unwrap_err()
+            };
+            assert!(
+                matches!(error.reason(), crate::error::ErrorReason::Cancelled { .. }),
+                "{verb} must return cancellation, got {error:?}"
+            );
+        }
+        assert!(runner.commands().is_empty());
+        assert_eq!(callback_calls.load(Ordering::SeqCst), 0);
+
+        // The cancelled calls did not reserve the one-shot source; a later
+        // non-cancelled call can still validate it successfully.
+        runner
+            .output_string(&Command::new("tool").stdin(source))
+            .await
+            .expect("pre-cancelled calls must leave stdin untouched");
     }
 
     #[cfg(feature = "pty")]

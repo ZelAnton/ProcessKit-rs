@@ -1933,20 +1933,19 @@ fn suspend_or_resume_thread(
 /// leader (both best-effort, with a `TerminateJobObject` backstop), whereas a
 /// false positive would freeze a foreign process or divert a console event onto a
 /// stranger's group — so uncertainty must resolve to "leave it alone".
+///
+/// The query handle is owned by an RAII wrapper so every early return and every
+/// successful query closes the process reference exactly once.
 fn process_is_in_job(pid: u32, job: HANDLE) -> bool {
     // Least-privilege: `IsProcessInJob` only needs query access.
-    // SAFETY: opens the process by id; returns null on failure (e.g. exited).
-    let handle = unsafe { OpenProcess(PROCESS_QUERY_LIMITED_INFORMATION, 0, pid) };
-    if handle.is_null() {
+    let Ok(handle) = QueryProcessHandle::open(pid) else {
         return false;
-    }
+    };
     let mut in_job: i32 = 0;
     // SAFETY: `handle` is a valid process handle from OpenProcess just above,
     // `job` is our live job handle, and `in_job` is an owned out-param. Returns 0
     // on failure, leaving `in_job` untouched (still 0 → treated as not-a-member).
-    let ok = unsafe { IsProcessInJob(handle, job, &mut in_job) };
-    // SAFETY: handle came from OpenProcess; closed exactly once.
-    unsafe { CloseHandle(handle) };
+    let ok = unsafe { IsProcessInJob(handle.as_raw(), job, &mut in_job) };
     ok != 0 && in_job != 0
 }
 
@@ -2043,6 +2042,51 @@ fn collect_process_metadata<C: ProcessSnapshotCursor>(
     Ok(map)
 }
 
+/// An owned `PROCESS_QUERY_LIMITED_INFORMATION` handle opened by process id.
+/// Keeping this ownership in one RAII type closes the handle on every return
+/// path of the identity, metrics, and process-control readers.
+struct QueryProcessHandle(HANDLE);
+
+impl QueryProcessHandle {
+    fn open(pid: u32) -> io::Result<Self> {
+        // SAFETY: limited-information access; returns null on failure (e.g. gone).
+        let handle = unsafe { OpenProcess(PROCESS_QUERY_LIMITED_INFORMATION, 0, pid) };
+        if handle.is_null() {
+            Err(io::Error::last_os_error())
+        } else {
+            Ok(Self(handle))
+        }
+    }
+
+    fn as_raw(&self) -> HANDLE {
+        self.0
+    }
+}
+
+impl Drop for QueryProcessHandle {
+    fn drop(&mut self) {
+        // SAFETY: this wrapper is the sole owner of the handle returned by
+        // `OpenProcess`, so it closes that handle exactly once.
+        unsafe { CloseHandle(self.0) };
+    }
+}
+
+/// Read a process's creation, kernel, and user CPU `FILETIME`s in one place.
+/// `None` means `GetProcessTimes` failed for the still-valid query handle.
+#[cfg(any(feature = "stats", feature = "process-control"))]
+fn process_times(handle: HANDLE) -> Option<(FILETIME, FILETIME, FILETIME)> {
+    let mut creation = FILETIME {
+        dwLowDateTime: 0,
+        dwHighDateTime: 0,
+    };
+    let mut exit = creation;
+    let mut kernel = creation;
+    let mut user = creation;
+    // SAFETY: valid process handle; all four out params are owned locals.
+    let ok = unsafe { GetProcessTimes(handle, &mut creation, &mut exit, &mut kernel, &mut user) };
+    (ok != 0).then_some((creation, kernel, user))
+}
+
 /// The process-creation `FILETIME` of `pid` as its raw
 /// [`MemberInfo`] start-time token (100-ns units since
 /// 1601-01-01 UTC), or `None` if the process is gone / unqueryable. Fixed at spawn
@@ -2052,37 +2096,19 @@ fn collect_process_metadata<C: ProcessSnapshotCursor>(
 /// which has no `stats` dependency.)
 #[cfg(feature = "process-control")]
 fn process_start_time(pid: u32) -> Option<u64> {
-    // SAFETY: limited-information access; returns null on failure (e.g. gone).
-    let handle = unsafe { OpenProcess(PROCESS_QUERY_LIMITED_INFORMATION, 0, pid) };
-    if handle.is_null() {
-        return None;
-    }
-    let units = creation_time_units(handle);
-    // SAFETY: handle came from OpenProcess and is closed exactly once.
-    unsafe { CloseHandle(handle) };
-    units
+    let handle = QueryProcessHandle::open(pid).ok()?;
+    creation_time_units(handle.as_raw())
 }
 
 /// Read a live process's creation `FILETIME` as its raw 100-ns identity token
 /// from an already-open query-limited `handle`. `None` if `GetProcessTimes` fails.
 ///
-/// The single `GetProcessTimes` + [`filetime_units`] decode shared by
-/// [`process_start_time`] (which opens a fresh per-pid handle) and [`process_info`]
-/// (which reuses the handle it already opened as its existence oracle, avoiding a
-/// second `OpenProcess` and the recycle window between two opens), so the two can
-/// never decode the creation time differently.
+/// The [`process_times`] read and [`filetime_units`] decode are shared by
+/// [`process_start_time`], [`process_info`], and the `stats` readers, so no
+/// consumer can decode the creation time differently from the others.
 #[cfg(feature = "process-control")]
 fn creation_time_units(handle: HANDLE) -> Option<u64> {
-    let mut creation = FILETIME {
-        dwLowDateTime: 0,
-        dwHighDateTime: 0,
-    };
-    let mut exit = creation;
-    let mut kernel = creation;
-    let mut user = creation;
-    // SAFETY: valid handle; all four out params are owned locals.
-    let ok = unsafe { GetProcessTimes(handle, &mut creation, &mut exit, &mut kernel, &mut user) };
-    (ok != 0).then(|| filetime_units(creation))
+    process_times(handle).map(|(creation, _, _)| filetime_units(creation))
 }
 
 /// Identity + best-effort metadata for an **arbitrary** pid — the Windows backend
@@ -2106,22 +2132,21 @@ fn creation_time_units(handle: HANDLE) -> Option<u64> {
 /// per-field `Option` contract).
 #[cfg(feature = "process-control")]
 pub(crate) fn process_info(pid: u32) -> io::Result<Option<MemberInfo>> {
-    // SAFETY: opens by pid with the narrowest query right; null on failure.
-    let handle = unsafe { OpenProcess(PROCESS_QUERY_LIMITED_INFORMATION, 0, pid) };
-    if handle.is_null() {
-        let err = io::Error::last_os_error();
-        // `ERROR_INVALID_PARAMETER` is the sole "no such pid" answer — a negative
-        // result, not an error. Every other failure (`ERROR_ACCESS_DENIED` on a
-        // protected process, …) leaves existence undetermined, so it surfaces as
-        // `Err` and is never read as "dead".
-        if err.raw_os_error() == Some(ERROR_INVALID_PARAMETER as i32) {
-            return Ok(None);
+    let handle = match QueryProcessHandle::open(pid) {
+        Ok(handle) => handle,
+        Err(err) => {
+            // `ERROR_INVALID_PARAMETER` is the sole "no such pid" answer — a negative
+            // result, not an error. Every other failure (`ERROR_ACCESS_DENIED` on a
+            // protected process, …) leaves existence undetermined, so it surfaces as
+            // `Err` and is never read as "dead".
+            if err.raw_os_error() == Some(ERROR_INVALID_PARAMETER as i32) {
+                return Ok(None);
+            }
+            return Err(err);
         }
-        return Err(err);
-    }
-    let start_time = creation_time_units(handle);
-    // SAFETY: handle came from OpenProcess and is closed exactly once.
-    unsafe { CloseHandle(handle) };
+    };
+    let start_time = creation_time_units(handle.as_raw());
+    drop(handle);
     // A member absent from the snapshot exited in this later window — keep the
     // record (start time above still stands), with ppid/exe honestly `None`.
     let (ppid, exe) = match snapshot_process_metadata()?.get(&pid) {
@@ -2167,43 +2192,18 @@ fn cpu_hard_cap_rate(cores: f64, cpus: f64) -> u32 {
 /// `/proc/<pid>/stat` starttime).
 #[cfg(feature = "stats")]
 pub(crate) fn process_identity(pid: u32) -> Option<ProcIdentity> {
-    // SAFETY: limited-information access; returns null on failure (e.g. gone).
-    let handle = unsafe { OpenProcess(PROCESS_QUERY_LIMITED_INFORMATION, 0, pid) };
-    if handle.is_null() {
-        return None;
-    }
-    let mut creation = FILETIME {
-        dwLowDateTime: 0,
-        dwHighDateTime: 0,
-    };
-    let mut exit = creation;
-    let mut kernel = creation;
-    let mut user = creation;
-    // SAFETY: valid handle; all four out params are owned locals.
-    let ok = unsafe { GetProcessTimes(handle, &mut creation, &mut exit, &mut kernel, &mut user) };
-    // SAFETY: handle came from OpenProcess and is closed exactly once.
-    unsafe { CloseHandle(handle) };
-    (ok != 0).then(|| ProcIdentity::from_raw(filetime_units(creation)))
+    let handle = QueryProcessHandle::open(pid).ok()?;
+    process_times(handle.as_raw())
+        .map(|(creation, _, _)| ProcIdentity::from_raw(filetime_units(creation)))
 }
 
 #[cfg(feature = "stats")]
 pub(crate) fn process_metrics(pid: u32, expected: Option<ProcIdentity>) -> ProcMetrics {
     let mut metrics = ProcMetrics::default();
-    // SAFETY: limited-information access; returns null on failure (e.g. gone).
-    let handle = unsafe { OpenProcess(PROCESS_QUERY_LIMITED_INFORMATION, 0, pid) };
-    if handle.is_null() {
+    let Ok(handle) = QueryProcessHandle::open(pid) else {
         return metrics;
-    }
-
-    let mut creation = FILETIME {
-        dwLowDateTime: 0,
-        dwHighDateTime: 0,
     };
-    let mut exit = creation;
-    let mut kernel = creation;
-    let mut user = creation;
-    // SAFETY: valid handle; all four out params are owned locals.
-    let ok = unsafe { GetProcessTimes(handle, &mut creation, &mut exit, &mut kernel, &mut user) };
+    let times = process_times(handle.as_raw());
 
     // Identity gate. `OpenProcess(pid)` resolves the number to *whatever process
     // holds it now* — possibly one that recycled it after our child was reaped —
@@ -2213,15 +2213,15 @@ pub(crate) fn process_metrics(pid: u32, expected: Option<ProcIdentity>) -> ProcM
     // included. If the times read failed we can't verify identity, so when one was
     // demanded that counts as a mismatch: return defaults and touch nothing else.
     if let Some(expected) = expected {
-        let confirmed = ok != 0 && filetime_units(creation) == expected.raw();
+        let confirmed = times
+            .as_ref()
+            .is_some_and(|(creation, _, _)| filetime_units(*creation) == expected.raw());
         if !confirmed {
-            // SAFETY: handle came from OpenProcess and is closed exactly once.
-            unsafe { CloseHandle(handle) };
             return ProcMetrics::default();
         }
     }
 
-    if ok != 0 {
+    if let Some((_, kernel, user)) = times {
         metrics.cpu_time = Some(Duration::from_nanos(
             filetime_nanos(kernel).saturating_add(filetime_nanos(user)),
         ));
@@ -2232,13 +2232,11 @@ pub(crate) fn process_metrics(pid: u32, expected: Option<ProcIdentity>) -> ProcM
     // SAFETY: valid handle; `counters` sized via its `cb` field. Reading through the
     // same identity-confirmed handle keeps the memory figure bound to our process,
     // never a recycled stranger's.
-    let ok = unsafe { K32GetProcessMemoryInfo(handle, &mut counters, counters.cb) };
+    let ok = unsafe { K32GetProcessMemoryInfo(handle.as_raw(), &mut counters, counters.cb) };
     if ok != 0 {
         metrics.peak_memory_bytes = Some(counters.PeakWorkingSetSize as u64);
     }
 
-    // SAFETY: handle came from OpenProcess and is closed exactly once.
-    unsafe { CloseHandle(handle) };
     metrics
 }
 
