@@ -23,6 +23,8 @@ use std::time::Duration;
 use std::sync::Arc;
 
 #[cfg(unix)]
+use super::pgroup::{self, ProcessState};
+#[cfg(unix)]
 use super::pid_gate::PidGate;
 
 // `tokio::time::Instant` (not `std::time::Instant`): the deadline must share the
@@ -415,21 +417,23 @@ impl UnixChild {
     }
 }
 
-/// Resolve direct-child liveness from the exact state reader when one exists,
-/// otherwise from the historical signal-0 existence probe. Keeping the fallback
-/// lazy is load-bearing: a zombie is still an existing pid, so probing after an
-/// exact `Some(false)` would turn the zombie back into a false live verdict.
+/// Resolve direct-child liveness from the state reader, falling back to the
+/// historical signal-0 existence probe only when that read is inconclusive.
+/// Keeping the fallback lazy is load-bearing: a zombie is still an existing pid,
+/// so probing after a confirmed zombie/dead verdict would turn it back into a
+/// false live verdict.
 #[cfg(unix)]
-fn live_state_or_existence_probe(
-    live_non_zombie: Option<bool>,
-    exists: impl FnOnce() -> bool,
-) -> bool {
-    live_non_zombie.unwrap_or_else(exists)
+fn live_state_or_existence_probe(state: ProcessState, exists: impl FnOnce() -> bool) -> bool {
+    match state {
+        ProcessState::Live => true,
+        ProcessState::ZombieOrDead => false,
+        ProcessState::Unknown => exists(),
+    }
 }
 
 /// Whether `pid` still names a process according to the portable Unix signal-0
 /// probe. This cannot distinguish a zombie from a running process and is used by
-/// [`UnixChild`] only on targets without the shared backend's state reader.
+/// [`UnixChild`] when the shared backend's state reader is absent or inconclusive.
 #[cfg(unix)]
 fn pid_exists(pid: u32) -> bool {
     // SAFETY: signal 0 performs an existence/permission check without delivering
@@ -456,15 +460,11 @@ impl PidTarget for UnixChild {
         // A retired pid is gone by definition, whatever an OS probe says about
         // whoever recycled it — `with_live_pid` returns the `false` default when
         // the gate is retired, which is the check that stops a recycled-pid kill.
-        // While the closure runs the owner cannot reap, so a negative state read
-        // refers to this child (usually its unreaped zombie), never a recycled pid.
+        // While the closure runs the owner cannot reap, so a confirmed zombie/dead
+        // state refers to this child, never a recycled pid. An inconclusive state
+        // read falls back to the same signal-0 existence probe bare BSD uses.
         self.gate.with_live_pid(false, |pid| {
-            #[cfg(any(target_os = "linux", target_os = "android", target_vendor = "apple"))]
-            let live_non_zombie = Some(super::pgroup::is_live_non_zombie(pid as i32));
-            #[cfg(not(any(target_os = "linux", target_os = "android", target_vendor = "apple")))]
-            let live_non_zombie = None;
-
-            live_state_or_existence_probe(live_non_zombie, || pid_exists(pid))
+            live_state_or_existence_probe(pgroup::process_state(pid as i32), || pid_exists(pid))
         })
     }
 
@@ -887,20 +887,19 @@ mod tests {
         );
     }
 
-    // The exact state verdict must win over the portable existence probe: an
+    // A conclusive state verdict must win over the portable existence probe: an
     // unreaped zombie still answers signal 0, so consulting the fallback after a
-    // state-reader `false` would recreate the bug. Conversely, a positive state
-    // verdict is sufficient without the fallback too. Hermetic and exhaustive for
-    // the state-reader half of `UnixChild::is_alive` — no subprocess or timing.
+    // confirmed zombie/dead state would recreate the bug. Conversely, a confirmed
+    // live state is sufficient without the fallback too.
     #[cfg(unix)]
     #[test]
     fn exact_live_state_bypasses_the_existence_fallback() {
         let fallback_calls = AtomicUsize::new(0);
-        let zombie = live_state_or_existence_probe(Some(false), || {
+        let zombie = live_state_or_existence_probe(ProcessState::ZombieOrDead, || {
             fallback_calls.fetch_add(1, Ordering::Relaxed);
             true // a zombie still exists according to signal 0
         });
-        let live = live_state_or_existence_probe(Some(true), || {
+        let live = live_state_or_existence_probe(ProcessState::Live, || {
             fallback_calls.fetch_add(1, Ordering::Relaxed);
             false
         });
@@ -914,19 +913,18 @@ mod tests {
         );
     }
 
-    // Bare BSD has no state reader, so it deliberately keeps the old signal-0
-    // semantics. Drive both probe results through the same resolver on every Unix
-    // host; this keeps the fallback deterministic and CI-visible even when CI runs
-    // on Linux rather than a BSD.
+    // Bare BSD has no state reader, and a state-capable target can still get an
+    // inconclusive read. Drive both fallback results through the same resolver on
+    // every Unix host so neither case becomes a false "gone" verdict.
     #[cfg(unix)]
     #[test]
-    fn missing_live_state_uses_the_existence_fallback() {
+    fn unknown_live_state_uses_the_existence_fallback() {
         let fallback_calls = AtomicUsize::new(0);
-        let existing = live_state_or_existence_probe(None, || {
+        let existing = live_state_or_existence_probe(ProcessState::Unknown, || {
             fallback_calls.fetch_add(1, Ordering::Relaxed);
             true
         });
-        let gone = live_state_or_existence_probe(None, || {
+        let gone = live_state_or_existence_probe(ProcessState::Unknown, || {
             fallback_calls.fetch_add(1, Ordering::Relaxed);
             false
         });
@@ -936,13 +934,52 @@ mod tests {
         assert_eq!(
             fallback_calls.load(Ordering::Relaxed),
             2,
-            "a missing state reader delegates every verdict to the fallback"
+            "an unknown state delegates every verdict to the fallback"
+        );
+    }
+
+    // An inaccessible state reader is not proof the child exited. Model an
+    // existing pid behind that unknown state and drive the real grace loop: it
+    // must remain live through the deadline and receive the hard-kill backstop.
+    #[cfg(unix)]
+    #[tokio::test(start_paused = true)]
+    async fn unknown_live_state_for_existing_pid_reaches_hard_kill() {
+        struct UnknownStatePid {
+            signals: AtomicUsize,
+            hard_kills: AtomicUsize,
+        }
+
+        impl PidTarget for UnknownStatePid {
+            fn signal(&self, _signal: i32) {
+                self.signals.fetch_add(1, Ordering::Relaxed);
+            }
+
+            fn is_alive(&self) -> bool {
+                live_state_or_existence_probe(ProcessState::Unknown, || true)
+            }
+
+            fn hard_kill(&self) {
+                self.hard_kills.fetch_add(1, Ordering::Relaxed);
+            }
+        }
+
+        let target = UnknownStatePid {
+            signals: AtomicUsize::new(0),
+            hard_kills: AtomicUsize::new(0),
+        };
+        run_pid(&target, 15, Duration::from_millis(100)).await;
+
+        assert_eq!(target.signals.load(Ordering::Relaxed), 1);
+        assert_eq!(
+            target.hard_kills.load(Ordering::Relaxed),
+            1,
+            "an unknown state for an existing pid must retain the hard-kill backstop"
         );
     }
 
     // End-to-end regression for the production `UnixChild` target. Hold a direct
     // child un-reaped after it exits, prove both halves of the interesting state
-    // (`is_live_non_zombie == false`, signal 0 still succeeds), then run the real
+    // (confirmed zombie/dead, signal 0 still succeeds), then run the real
     // driver on a paused clock. The exact state reader must report a drain before
     // the first sleep, so virtual time remains at zero; restoring the old signal-0
     // implementation advances the full grace and takes the escalation branch.
@@ -959,11 +996,11 @@ mod tests {
 
         let mut observed_zombie = false;
         for _ in 0..500 {
-            let non_zombie = super::super::pgroup::is_live_non_zombie(pid as i32);
+            let state = super::super::pgroup::process_state(pid as i32);
             // SAFETY: signal 0 does not deliver a signal. Its success distinguishes
             // the held zombie from a child that was unexpectedly reaped and gone.
             let still_exists = unsafe { libc::kill(pid as i32, 0) } == 0;
-            if !non_zombie && still_exists {
+            if state == ProcessState::ZombieOrDead && still_exists {
                 observed_zombie = true;
                 break;
             }

@@ -287,12 +287,12 @@ fn recycled_during_adoption(pid: i32) -> io::Error {
 /// attempt at this fix, breaking a normal shutdown of a group with unreaped
 /// children). The errno alone cannot tell them apart, so we check the target's
 /// actual run state after the `EPERM`. Only a *positive* live/non-zombie answer
-/// surfaces the error; a zombie, a since-reaped/gone pid, or a target without a
-/// state reader all report `false`, so a normal teardown is never falsely failed.
-/// The direct-child graceful driver reuses the same reader on state-capable
-/// targets: there, `false` also lets an unreaped zombie end its grace without a
-/// meaningless hard-kill escalation. Its pid gate prevents reap/reuse while that
-/// state is inspected.
+/// surfaces the error; a zombie, a since-reaped/gone pid, an unreadable state, or
+/// a target without a state reader leave the delivery error swallowed, so a
+/// normal teardown is never falsely failed. The direct-child graceful driver
+/// reuses the richer tri-state result: confirmed zombie/dead ends its grace,
+/// while an unknown state falls back to a signal-0 existence probe. Its pid gate
+/// prevents reap/reuse while that state is inspected.
 ///
 /// Availability mirrors [`read_identity`]:
 /// - **Linux / Android** — `/proc/<pid>/stat` field 3 (state); live is any state
@@ -301,7 +301,7 @@ fn recycled_during_adoption(pid: i32) -> io::Error {
 ///   `pbi_status`; live is `SIDL`/`SRUN`/`SSLEEP`/`SSTOP`, never `SZOMB`.
 /// - **the BSDs (and any other unix)** — no wired-up state reader (the same
 ///   per-OS `sysctl(KERN_PROC)` divergence that blocks `read_identity` there), so
-///   the answer is always `false`: delivery `EPERM` keeps its pre-existing
+///   the state is always unknown: delivery `EPERM` keeps its pre-existing
 ///   swallowed behavior on those targets, exactly as before this change — no
 ///   regression and, crucially, no new false positive.
 ///
@@ -311,22 +311,35 @@ fn recycled_during_adoption(pid: i32) -> io::Error {
 /// therefore not detected by the group caller — the fail-safe direction (a missed
 /// report, never a false one); the common case the first attempt tripped over —
 /// the tracked leader *being* the zombie — is what this closes.
-#[cfg(any(target_os = "linux", target_os = "android"))]
-pub(crate) fn is_live_non_zombie(pid: i32) -> bool {
-    // `/proc/<pid>/stat` field 3 is the state char. A successful read that is
-    // neither a zombie (`Z`) nor dead (`X`/`x`) is a live process; a failed read
-    // (the pid is gone) yields `None` → `false`. Pids are positive here, so the
-    // `as u32` cast is value-preserving.
-    super::procfs::read_state(pid as u32).is_some_and(|s| !matches!(s, 'Z' | 'X' | 'x'))
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub(crate) enum ProcessState {
+    Live,
+    ZombieOrDead,
+    Unknown,
 }
 
-/// The Apple reader — see the doc above the Linux `is_live_non_zombie`.
+#[cfg(any(target_os = "linux", target_os = "android"))]
+pub(crate) fn process_state(pid: i32) -> ProcessState {
+    // `/proc/<pid>/stat` field 3 is the state char. A successful read that is
+    // neither a zombie (`Z`) nor dead (`X`/`x`) is a live process; a failed read
+    // can also mean the state is inaccessible, so it remains unknown until a
+    // caller applies its own fallback. Pids are positive here, so the `as u32`
+    // cast is value-preserving.
+    match super::procfs::read_state(pid as u32) {
+        Some('Z' | 'X' | 'x') => ProcessState::ZombieOrDead,
+        Some(_) => ProcessState::Live,
+        None => ProcessState::Unknown,
+    }
+}
+
+/// The Apple reader — see the doc above the Linux [`process_state`].
 #[cfg(target_vendor = "apple")]
-pub(crate) fn is_live_non_zombie(pid: i32) -> bool {
+pub(crate) fn process_state(pid: i32) -> ProcessState {
     // `proc_pidinfo(PROC_PIDTBSDINFO)` fills a `proc_bsdinfo` whose `pbi_status` is
     // the BSD run state. A full-size fill whose status is a live value
-    // (SIDL/SRUN/SSLEEP/SSTOP — never SZOMB) is a genuinely-alive process; a
-    // short/failed read (the pid is gone or unreadable) or SZOMB reports `false`.
+    // (SIDL/SRUN/SSLEEP/SSTOP — never SZOMB) is a genuinely-alive process. A
+    // short/failed read may mean either gone or unreadable, so only a full fill
+    // can produce a conclusive state.
     // SAFETY: `proc_bsdinfo` is plain-old-data (integers and byte arrays), for
     // which an all-zero bit pattern is a valid initialized value.
     let mut info: libc::proc_bsdinfo = unsafe { std::mem::zeroed() };
@@ -342,26 +355,33 @@ pub(crate) fn is_live_non_zombie(pid: i32) -> bool {
             want,
         )
     };
-    got == want
-        && matches!(
-            info.pbi_status,
-            libc::SIDL | libc::SRUN | libc::SSLEEP | libc::SSTOP
-        )
+    if got != want {
+        return ProcessState::Unknown;
+    }
+    match info.pbi_status {
+        libc::SIDL | libc::SRUN | libc::SSLEEP | libc::SSTOP => ProcessState::Live,
+        libc::SZOMB => ProcessState::ZombieOrDead,
+        _ => ProcessState::Unknown,
+    }
 }
 
 /// The BSDs (and any other unix): no wired-up state reader, so a delivery `EPERM`
 /// is never classified as a live containment gap — see the doc above the Linux
-/// `is_live_non_zombie`.
+/// [`process_state`].
 #[cfg(not(any(target_os = "linux", target_os = "android", target_vendor = "apple")))]
-fn is_live_non_zombie(_pid: i32) -> bool {
-    false
+pub(crate) fn process_state(_pid: i32) -> ProcessState {
+    ProcessState::Unknown
+}
+
+fn is_live_non_zombie(pid: i32) -> bool {
+    process_state(pid) == ProcessState::Live
 }
 
 /// Best-effort enriching metadata for one tracked leader `pid` — its ppid, short
 /// image name, and start-time token — for [`ProcessGroup::members_info`]. `None`
 /// means the process is gone (skip the record, never fabricate one); a `Some`
 /// carries whatever fields the platform can report (each independently `Option`).
-/// Availability mirrors [`read_identity`]/[`is_live_non_zombie`].
+/// Availability mirrors [`read_identity`]/[`process_state`].
 ///
 /// **Linux / Android** — one `/proc/<pid>/stat` read via the shared `sys::procfs`
 /// parser (ppid = field 4, `comm` = field 2, start time = field 22), so the
