@@ -1002,57 +1002,9 @@ pub(crate) async fn launch(group: &ProcessGroup, command: &Command) -> Result<Ru
     if command.wants_pty() {
         return launch_pty(group, command, tokio_cmd, opts, stdin_reservation).await;
     }
-    // Translate the OS's opaque NotFound into `ErrorReason::NotFound` after the spawn
-    // attempt, so the OS stays the source of truth. The cwd was validated above,
-    // so NotFound here is genuinely the program. A bare name reports searched dirs;
-    // a path-form program gets `searched: None`.
-    let mut child = match group.spawn_with_options(&mut tokio_cmd, &opts) {
-        Ok(child) => child,
-        Err(err) => match err.into_reason() {
-            crate::ErrorReason::Spawn { source, .. }
-                if source.kind() == std::io::ErrorKind::NotFound =>
-            {
-                if is_bare_name(command.program()) {
-                    // Reuse the *same* spawn-free resolution the preflight helper
-                    // uses (`command::resolve_program`) to enrich the diagnostic —
-                    // one decision, so the two can never disagree. `prefer_local`
-                    // is parent-side (plain filesystem probes, independent of the
-                    // child env), so it is always searched and always safe to name.
-                    // The shared path source selects either the process `PATH` or
-                    // the command's effective child `PATH`, matching preflight and
-                    // the launch rewrite exactly.
-                    return match resolve_program(
-                        command.program(),
-                        command.prefer_local_dirs(),
-                        command.resolution_path_source(),
-                    ) {
-                        // Located parent-side (a `prefer_local` match) or on `PATH`,
-                        // yet the OS still refused with NotFound — the program
-                        // exists but isn't *directly* executable (e.g. a .cmd/.bat
-                        // on Windows), which is a `Spawn` condition, not "missing".
-                        ProgramResolution::Found(_) => Err(crate::ErrorReason::Spawn {
-                            program: command.program_name(),
-                            source,
-                        }
-                        .into()),
-                        ProgramResolution::NotFound { searched } => {
-                            Err(crate::ErrorReason::NotFound {
-                                program: command.program_name(),
-                                searched,
-                            }
-                            .into())
-                        }
-                    };
-                }
-                return Err(crate::ErrorReason::NotFound {
-                    program: command.program_name(),
-                    searched: None,
-                }
-                .into());
-            }
-            other => return Err(other.into()),
-        },
-    };
+    let mut child = group
+        .spawn_with_options(&mut tokio_cmd, &opts)
+        .map_err(|err| map_spawn_error(command, err))?;
     // A child now exists: commit the reservation so a one-shot source is consumed
     // for good. Every failure path above returned before this point, dropping the
     // reservation uncommitted and rolling its payload back. The commit precedes
@@ -1138,11 +1090,9 @@ pub(crate) async fn launch(group: &ProcessGroup, command: &Command) -> Result<Ru
 /// OS's opaque `NotFound` into [`ErrorReason::NotFound`](crate::ErrorReason::NotFound)
 /// (enriched with the searched dirs for a bare name, or reclassified as
 /// [`ErrorReason::Spawn`](crate::ErrorReason::Spawn) when the program *is* locatable
-/// but not directly executable) — the same enrichment the pipe launch path does
-/// inline. Shared with the PTY launch path so the two never diverge on how a
-/// missing program is reported.
-#[cfg(feature = "pty")]
-fn map_spawn_error(command: &Command, err: crate::Error) -> crate::Error {
+/// but not directly executable). Shared by the pipe, PTY, and detached spawn
+/// paths so they cannot diverge on how a missing program is reported.
+pub(crate) fn map_spawn_error(command: &Command, err: crate::Error) -> crate::Error {
     match err.into_reason() {
         crate::ErrorReason::Spawn { source, .. }
             if source.kind() == std::io::ErrorKind::NotFound =>
