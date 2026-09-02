@@ -1754,6 +1754,17 @@ impl PipelineSession {
     /// [`ErrorReason::Io`](crate::ErrorReason::Io) when the last stage's stdout was not piped,
     /// or a prior readiness/streaming call already started its one line pump —
     /// returned instead of a silently-empty stream.
+    ///
+    /// # Panics
+    ///
+    /// Has the same runtime requirements as [`RunningProcess::stdout_lines`](crate::RunningProcess::stdout_lines):
+    /// successful streaming setup needs an active Tokio runtime for the line
+    /// pumps, while the documented error path for non-piped or already-consumed
+    /// stdout returns before spawning. A runtime with its time driver enabled is
+    /// required when the last stage has a timeout or output-inactivity timeout
+    /// configured. It is also required when any stage has `cancel_grace`
+    /// configured and a cancellation token fires; merely configuring the grace
+    /// window without cancellation does not arm that timer.
     pub fn stdout_lines(&mut self) -> Result<StdoutLines> {
         self.with_last(RunningProcess::stdout_lines)
     }
@@ -1771,6 +1782,17 @@ impl PipelineSession {
     ///
     /// [`ErrorReason::Io`](crate::ErrorReason::Io) when the last stage's stdout was not piped,
     /// or a prior readiness/streaming call already started its line pump.
+    ///
+    /// # Panics
+    ///
+    /// Has the same runtime requirements as [`RunningProcess::events`](crate::RunningProcess::events):
+    /// successful streaming setup needs an active Tokio runtime for the line
+    /// pumps, while the documented error path for non-piped or already-consumed
+    /// stdout returns before spawning. A runtime with its time driver enabled is
+    /// required when the last stage has a timeout or output-inactivity timeout
+    /// configured. It is also required when any stage has `cancel_grace`
+    /// configured and a cancellation token fires; merely configuring the grace
+    /// window without cancellation does not arm that timer.
     pub fn events(&mut self) -> Result<ProcessEvents> {
         self.with_last(RunningProcess::events)
     }
@@ -1823,6 +1845,14 @@ impl PipelineSession {
     /// [`ErrorReason::Teardown`](crate::ErrorReason::Teardown) when a stage group
     /// rejects the kill. The source error is retained and the session remains
     /// finishable; kill-on-drop still backstops every group.
+    ///
+    /// # Panics
+    ///
+    /// If a stage-group kill fails and the failed-kill capture path needs to start
+    /// one or more line pumps for still-piped output, this method panics unless
+    /// it is called from an active Tokio runtime. A successful kill, and an error
+    /// path with no pipe to capture, do not require a runtime; the synchronous
+    /// hard-kill operation itself does not use Tokio timers.
     pub fn start_kill(&mut self) -> Result<()> {
         match kill_all_stage_groups(&self.stage_groups) {
             Ok(()) => Ok(()),

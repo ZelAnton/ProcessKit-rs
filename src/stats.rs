@@ -359,6 +359,12 @@ impl OwnedStatsSampler {
     /// reach for it when the group lives under an `Arc` and the sampler must
     /// outlive the borrow (move into a spawned task, cross an FFI boundary);
     /// reach for `sample_stats` when a plain borrow suffices.
+    ///
+    /// # Panics
+    ///
+    /// The sampler is constructed eagerly, so this method panics unless it is
+    /// called from an active Tokio runtime with its time driver enabled (for
+    /// example, a runtime built with `Builder::enable_time` or `enable_all`).
     pub fn new(group: &Arc<ProcessGroup>, every: Duration) -> Self {
         OwnedStatsSampler {
             group: Arc::downgrade(group),

@@ -115,6 +115,18 @@ impl RunningProcess {
     /// [`ErrorReason::Io`](crate::ErrorReason::Io) when stdout was not piped, or a prior
     /// readiness or streaming call already started its line pump — returned
     /// instead of a stream that would silently be empty.
+    ///
+    /// # Panics
+    ///
+    /// Panics when it reaches successful streaming setup without an active Tokio
+    /// runtime, because setting up the line pumps uses [`tokio::spawn`]. If stdout
+    /// is not piped or was already consumed, it returns the documented error
+    /// before any pump is spawned. When the command has a timeout or an
+    /// output-inactivity timeout, the runtime must also have its time driver
+    /// enabled (for example with `Builder::enable_time` or `enable_all`) so the
+    /// watchdog can run. The same time driver is required when `cancel_grace` is
+    /// configured and a cancellation token fires; merely configuring the grace
+    /// window without cancellation does not arm that timer.
     pub fn stdout_lines(&mut self) -> Result<StdoutLines> {
         // Drain stdout AND arm the timeout watchdog. `wait_for_line` instead calls
         // `drain_stdout_lines` directly, so a readiness probe never kills the tree.
@@ -144,6 +156,17 @@ impl RunningProcess {
     /// prior readiness/streaming call already consumed it. Per-line JSON errors
     /// are stream items, not construction errors. Available with the `json`
     /// feature.
+    ///
+    /// # Panics
+    ///
+    /// Has the same runtime requirements as [`stdout_lines`](Self::stdout_lines):
+    /// successful streaming setup needs an active Tokio runtime for the line
+    /// pumps, while the documented error path for non-piped or already-consumed
+    /// stdout returns before spawning. A runtime with its time driver enabled is
+    /// required when a timeout or output-inactivity timeout is configured. It is
+    /// also required when `cancel_grace` is configured and a cancellation token
+    /// fires; merely configuring the grace window without cancellation does not
+    /// arm that timer.
     #[cfg(feature = "json")]
     pub fn stdout_json_lines<T>(&mut self) -> Result<JsonLines<T>>
     where
@@ -720,6 +743,18 @@ impl RunningProcess {
     /// [`ErrorReason::Io`](crate::ErrorReason::Io) when stdout was not piped, or a prior
     /// readiness/streaming call already started its line pump — returned instead
     /// of a stream that would silently be empty.
+    ///
+    /// # Panics
+    ///
+    /// Panics when it reaches successful streaming setup without an active Tokio
+    /// runtime, because the stdout and stderr line pumps use [`tokio::spawn`]. If
+    /// stdout is not piped or was already consumed, it returns the documented
+    /// error before any pump is spawned. When the command has a timeout or an
+    /// output-inactivity timeout, the runtime must also have its time driver
+    /// enabled (for example with `Builder::enable_time` or `enable_all`) so the
+    /// watchdog can run. The same time driver is required when `cancel_grace` is
+    /// configured and a cancellation token fires; merely configuring the grace
+    /// window without cancellation does not arm that timer.
     pub fn events(&mut self) -> Result<ProcessEvents> {
         self.ensure_stdout_streamable()?;
         debug_assert!(

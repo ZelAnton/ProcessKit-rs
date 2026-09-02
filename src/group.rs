@@ -1258,6 +1258,12 @@ impl ProcessGroup {
     /// [`Stream`](tokio_stream::Stream) of snapshots. The first sample is taken
     /// immediately; the series ends on the first failure. A zero `every` is
     /// clamped to 1 ms.
+    ///
+    /// # Panics
+    ///
+    /// The sampler is constructed eagerly, so this method panics unless it is
+    /// called from an active Tokio runtime with its time driver enabled (for
+    /// example, a runtime built with `Builder::enable_time` or `enable_all`).
     #[cfg(feature = "stats")]
     pub fn sample_stats(&self, every: Duration) -> crate::stats::StatsSampler<'_> {
         crate::stats::StatsSampler::new(self, every)
