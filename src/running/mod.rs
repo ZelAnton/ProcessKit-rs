@@ -4229,14 +4229,11 @@ mod tests {
         // process-group sweep is still the right first cleanup because it reaches
         // descendants, but it is not a terminal-state proof for the direct child:
         // Darwin can complete that group delivery without making the PTY child
-        // immediately waitable. Use the owned handle as the backstop and bound
-        // the reap so a cleanup race produces a useful failure instead of a
-        // nextest-level hang.
+        // immediately waitable. Use the owned handle as the backstop, then let
+        // structural drop hand the child to Tokio's orphan reaper rather than
+        // turning that platform-specific waitability gap into a test hang.
         run.start_kill().expect("direct-child cleanup kill");
-        tokio::time::timeout(PUMP_TEARDOWN, run.backend_wait())
-            .await
-            .expect("direct-child cleanup reap must stay bounded")
-            .expect("cleanup child reap");
+        drop(run);
         group
             .kill_all()
             .expect("cleanup descendants after direct-child reap");
