@@ -116,6 +116,85 @@ fn assert_located_spawn_error(err: processkit::Error) {
     );
 }
 
+#[cfg(all(unix, feature = "pty"))]
+#[derive(Clone, Copy, Debug)]
+enum NotFoundSpawnPath {
+    Pipe,
+    Pty,
+    Detached,
+}
+
+#[cfg(all(unix, feature = "pty"))]
+impl NotFoundSpawnPath {
+    async fn launch_failure(self, command: &Command) -> processkit::Error {
+        match self {
+            Self::Pipe => command
+                .output_string()
+                .await
+                .expect_err("the pipe launch must fail"),
+            Self::Pty => command
+                .clone()
+                .use_pty()
+                .output_string()
+                .await
+                .expect_err("the PTY launch must fail"),
+            Self::Detached => command
+                .spawn_detached()
+                .expect_err("the detached launch must fail"),
+        }
+    }
+}
+
+#[cfg(all(unix, feature = "pty"))]
+#[tokio::test]
+#[ignore = "exercises all three real spawn paths and PTY support"]
+async fn not_found_enrichment_has_parity_across_every_spawn_path() {
+    let paths = [
+        NotFoundSpawnPath::Pipe,
+        NotFoundSpawnPath::Pty,
+        NotFoundSpawnPath::Detached,
+    ];
+
+    let prefer_dir = tempfile::tempdir().expect("temp prefer-local dir");
+    let path_dir = tempfile::tempdir().expect("temp PATH dir");
+    let child_path = std::env::join_paths([path_dir.path()]).expect("single PATH entry");
+    let expected_search = std::env::join_paths([prefer_dir.path(), path_dir.path()])
+        .expect("two search entries")
+        .to_string_lossy()
+        .into_owned();
+    let missing_bare = Command::new("processkit-missing-parity-bare")
+        .prefer_local(prefer_dir.path())
+        .env("PATH", child_path);
+    for path in paths {
+        let err = path.launch_failure(&missing_bare).await;
+        match err.into_reason() {
+            processkit::ErrorReason::NotFound { searched, .. } => assert_eq!(
+                searched,
+                Some(expected_search.clone()),
+                "{path:?} must report the prefer-local and effective child PATH search"
+            ),
+            other => panic!("{path:?} must report NotFound, got {other:?}"),
+        }
+    }
+
+    let missing_path = Command::new(prefer_dir.path().join("processkit-missing-parity-path"));
+    for path in paths {
+        let err = path.launch_failure(&missing_path).await;
+        match err.into_reason() {
+            processkit::ErrorReason::NotFound { searched, .. } => assert_eq!(
+                searched, None,
+                "{path:?} must not report a PATH search for a path-form program"
+            ),
+            other => panic!("{path:?} must report NotFound, got {other:?}"),
+        }
+    }
+
+    let (_dir, located_bare) = broken_interpreter_command();
+    for path in paths {
+        assert_located_spawn_error(path.launch_failure(&located_bare).await);
+    }
+}
+
 #[cfg(unix)]
 #[tokio::test]
 #[ignore = "exercises pipe and detached real-spawn NotFound enrichment"]

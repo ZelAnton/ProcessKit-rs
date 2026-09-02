@@ -21,6 +21,12 @@ type SharedReader = Arc<Mutex<Option<Pin<Box<dyn AsyncRead + Send>>>>>;
 /// A boxed async line stream, shared the same way.
 type SharedLines = Arc<Mutex<Option<Pin<Box<dyn Stream<Item = String> + Send>>>>>;
 
+#[derive(Clone)]
+pub(crate) struct EagerLines {
+    bytes: Vec<u8>,
+    terminators: Vec<usize>,
+}
+
 /// Lock a shared one-shot cell, tolerating a poisoned mutex. The critical
 /// section never panics while holding the lock (it only `take`s/stores an
 /// `Option`), so poisoning cannot arise from this module — recovering the guard
@@ -57,6 +63,7 @@ pub struct Stdin(Source);
 enum Source {
     Empty,
     Bytes(Vec<u8>),
+    IterLines(EagerLines),
     File(PathBuf),
     Reader(SharedReader),
     Lines(SharedLines),
@@ -83,27 +90,31 @@ impl Stdin {
         Stdin(Source::File(path.as_ref().to_path_buf()))
     }
 
-    /// Write each item (as a UTF-8 line, `\n`-terminated) to the child's stdin.
-    /// Eagerly collected, so the resulting [`Stdin`] is fully reusable. (The
-    /// async-stream analogue is [`from_lines`](Self::from_lines).)
+    /// Write each item as a UTF-8 line to the child's stdin. Eagerly collected,
+    /// so the resulting [`Stdin`] is fully reusable. (The async-stream analogue
+    /// is [`from_lines`](Self::from_lines).)
     ///
-    /// **Newline contract:** exactly one `\n` is appended after *every* item,
-    /// including the last — so `["a", "b"]` sends `"a\nb\n"` (a trailing
-    /// newline). Each item is written verbatim and is **not** re-split, so an
-    /// item that already contains `\n` (or ends in one) is passed through as-is
-    /// and yields a blank line. To send bytes without this per-item framing, use
-    /// [`from_bytes`](Self::from_bytes) / [`from_string`](Self::from_string).
+    /// **Line contract:** exactly one target Enter sequence is appended after
+    /// *every* item, including the last. It is `\n` for a regular stdin pipe or
+    /// Unix PTY and `\r` for a Windows ConPTY, matching
+    /// [`ProcessStdin::write_line`]. Each item is written verbatim and is
+    /// **not** re-split, so embedded `\n` bytes remain `\n`; only the terminator
+    /// added by this constructor is target-aware. To send byte-exact input
+    /// without per-item framing, use [`from_bytes`](Self::from_bytes) or
+    /// [`from_string`](Self::from_string).
     pub fn from_iter_lines<I, S>(lines: I) -> Self
     where
         I: IntoIterator<Item = S>,
         S: AsRef<str>,
     {
-        let mut buf = Vec::new();
+        let mut bytes = Vec::new();
+        let mut terminators = Vec::new();
         for line in lines {
-            buf.extend_from_slice(line.as_ref().as_bytes());
-            buf.push(b'\n');
+            bytes.extend_from_slice(line.as_ref().as_bytes());
+            terminators.push(bytes.len());
+            bytes.push(b'\n');
         }
-        Stdin(Source::Bytes(buf))
+        Stdin(Source::IterLines(EagerLines { bytes, terminators }))
     }
 
     /// Stream an arbitrary async reader to the child's stdin. One-shot.
@@ -114,8 +125,13 @@ impl Stdin {
         Stdin(Source::Reader(Arc::new(Mutex::new(Some(Box::pin(reader))))))
     }
 
-    /// Write each item of an async string stream as a `\n`-terminated line.
-    /// One-shot.
+    /// Write each item of an async string stream as a line. One-shot.
+    ///
+    /// Each item is followed by the same target Enter sequence as
+    /// [`from_iter_lines`](Self::from_iter_lines): `\n` for a regular stdin pipe
+    /// or Unix PTY, and `\r` for a Windows ConPTY. Item bytes themselves remain
+    /// verbatim; use [`from_reader`](Self::from_reader) for byte-exact streaming
+    /// without per-item framing.
     pub fn from_lines<S>(lines: S) -> Self
     where
         S: Stream<Item = String> + Send + 'static,
@@ -151,19 +167,33 @@ impl Stdin {
     /// that discriminant would collide distinct payloads.
     #[cfg(feature = "record")]
     pub(crate) fn content_digest(&self) -> u64 {
-        let (tag, payload): (u8, &[u8]) = match &self.0 {
-            Source::Empty => (0, &[]),
-            Source::Bytes(b) => (1, b),
-            Source::File(p) => (2, p.as_os_str().as_encoded_bytes()),
-            Source::Reader(_) | Source::Lines(_) => (3, b"<stream>"),
-        };
         // FNV-1a via the shared `digest::Fnv1a` helper — the single home of the
         // constants + mix loop, shared with `MatchPolicy::digest_of` so the two
         // cassette-key digests reason alike and can't drift apart. A leading tag
         // byte keeps distinct source kinds from colliding.
         let mut h = crate::digest::Fnv1a::new();
-        h.mix(&[tag]);
-        h.mix(payload);
+        match &self.0 {
+            Source::Empty => h.mix(&[0]),
+            Source::Bytes(bytes) => {
+                h.mix(&[1]);
+                h.mix(bytes);
+            }
+            Source::IterLines(lines) => {
+                // Preserve the historical digest of the eagerly flattened
+                // `Bytes` representation used before line framing became
+                // target-aware.
+                h.mix(&[1]);
+                h.mix(&lines.bytes);
+            }
+            Source::File(path) => {
+                h.mix(&[2]);
+                h.mix(path.as_os_str().as_encoded_bytes());
+            }
+            Source::Reader(_) | Source::Lines(_) => {
+                h.mix(&[3]);
+                h.mix(b"<stream>");
+            }
+        }
         h.finish()
     }
 
@@ -202,6 +232,7 @@ impl Stdin {
         let reserved = match &self.0 {
             Source::Empty => Reserved::Reusable(TakenStdin::Empty),
             Source::Bytes(bytes) => Reserved::Reusable(TakenStdin::Bytes(bytes.clone())),
+            Source::IterLines(lines) => Reserved::Reusable(TakenStdin::IterLines(lines.clone())),
             Source::File(path) => Reserved::Reusable(TakenStdin::File(path.clone())),
             Source::Reader(reader) => match lock_cell(reader).take() {
                 Some(r) => Reserved::OneShotReader(r, Arc::clone(reader)),
@@ -297,9 +328,42 @@ impl Drop for StdinReservation {
 pub(crate) enum TakenStdin {
     Empty,
     Bytes(Vec<u8>),
+    IterLines(EagerLines),
     File(PathBuf),
     Reader(Pin<Box<dyn AsyncRead + Send>>),
     Lines(Pin<Box<dyn Stream<Item = String> + Send>>),
+}
+
+/// The input target determines only the framing appended by line sources. Raw
+/// byte/file/reader payloads never consult this trait and remain byte-exact.
+pub(crate) trait BulkStdinTarget: AsyncWrite + Unpin {
+    fn line_terminator(&self) -> &'static [u8] {
+        b"\n"
+    }
+}
+
+impl BulkStdinTarget for tokio::process::ChildStdin {}
+
+#[cfg(feature = "pty")]
+impl BulkStdinTarget for crate::sys::pty::PtyWriter {
+    fn line_terminator(&self) -> &'static [u8] {
+        pty_line_terminator()
+    }
+}
+
+#[cfg(test)]
+impl BulkStdinTarget for Vec<u8> {}
+
+#[cfg(feature = "pty")]
+fn pty_line_terminator() -> &'static [u8] {
+    #[cfg(windows)]
+    {
+        b"\r"
+    }
+    #[cfg(not(windows))]
+    {
+        b"\n"
+    }
 }
 
 impl TakenStdin {
@@ -312,11 +376,41 @@ impl TakenStdin {
     /// drop the sink to signal EOF.
     pub(crate) async fn write_to<W>(self, sink: &mut W) -> std::io::Result<()>
     where
-        W: tokio::io::AsyncWrite + Unpin,
+        W: BulkStdinTarget,
+    {
+        let line_terminator = if matches!(&self, TakenStdin::IterLines(_) | TakenStdin::Lines(_)) {
+            sink.line_terminator()
+        } else {
+            b"\n"
+        };
+        self.write_to_with_line_terminator(sink, line_terminator)
+            .await
+    }
+
+    async fn write_to_with_line_terminator<W>(
+        self,
+        sink: &mut W,
+        line_terminator: &'static [u8],
+    ) -> std::io::Result<()>
+    where
+        W: AsyncWrite + Unpin,
     {
         match self {
             TakenStdin::Empty => Ok(()),
             TakenStdin::Bytes(bytes) => sink.write_all(&bytes).await,
+            TakenStdin::IterLines(lines) => {
+                if line_terminator == b"\n" {
+                    return sink.write_all(&lines.bytes).await;
+                }
+
+                let mut start = 0;
+                for terminator in lines.terminators {
+                    sink.write_all(&lines.bytes[start..terminator]).await?;
+                    sink.write_all(line_terminator).await?;
+                    start = terminator + 1;
+                }
+                sink.write_all(&lines.bytes[start..]).await
+            }
             TakenStdin::File(path) => {
                 let mut file = tokio::fs::File::open(&path).await?;
                 tokio::io::copy(&mut file, sink).await.map(|_| ())
@@ -325,7 +419,7 @@ impl TakenStdin {
             TakenStdin::Lines(mut stream) => {
                 while let Some(line) = stream.next().await {
                     sink.write_all(line.as_bytes()).await?;
-                    sink.write_all(b"\n").await?;
+                    sink.write_all(line_terminator).await?;
                 }
                 Ok(())
             }
@@ -338,6 +432,9 @@ impl fmt::Debug for Stdin {
         let kind = match &self.0 {
             Source::Empty => "Empty",
             Source::Bytes(_) => "Bytes",
+            // `from_iter_lines` historically flattened into `Bytes`; keep the
+            // intentionally coarse public Debug view stable.
+            Source::IterLines(_) => "Bytes",
             Source::File(_) => "File",
             Source::Reader(_) => "Reader",
             Source::Lines(_) => "Lines",
@@ -432,11 +529,9 @@ impl AsyncWrite for StdinSink {
 impl StdinSink {
     /// The byte sequence that represents pressing Enter for this input target.
     fn line_terminator(&self) -> &'static [u8] {
-        #[cfg(all(windows, feature = "pty"))]
+        #[cfg(feature = "pty")]
         if matches!(self, Self::Pty(_)) {
-            // ConPTY consumes virtual-terminal input: Enter is CR. A lone LF is
-            // Ctrl-J and does not complete a cooked `ReadLine` prompt.
-            return b"\r";
+            return pty_line_terminator();
         }
         b"\n"
     }
@@ -672,6 +767,46 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn target_line_framing_does_not_rewrite_payload_bytes() {
+        let mut iter_sink = Vec::new();
+        Stdin::from_iter_lines(["a\n", "b"])
+            .take_for_run()
+            .expect("reusable line source")
+            .commit()
+            .write_to_with_line_terminator(&mut iter_sink, b"\r")
+            .await
+            .expect("write eager lines");
+        assert_eq!(iter_sink, b"a\n\rb\r");
+
+        let mut stream_sink = Vec::new();
+        Stdin::from_lines(tokio_stream::iter(vec!["a\n".to_owned(), "b".to_owned()]))
+            .take_for_run()
+            .expect("one-shot line source")
+            .commit()
+            .write_to_with_line_terminator(&mut stream_sink, b"\r")
+            .await
+            .expect("write streaming lines");
+        assert_eq!(stream_sink, b"a\n\rb\r");
+
+        let mut raw_sink = Vec::new();
+        Stdin::from_bytes(b"raw\nbytes\r".to_vec())
+            .take_for_run()
+            .expect("reusable byte source")
+            .commit()
+            .write_to_with_line_terminator(&mut raw_sink, b"\r")
+            .await
+            .expect("write raw bytes");
+        assert_eq!(raw_sink, b"raw\nbytes\r");
+    }
+
+    #[cfg(feature = "pty")]
+    #[test]
+    fn pty_line_terminator_matches_the_platform_enter_sequence() {
+        let expected: &[u8] = if cfg!(windows) { b"\r" } else { b"\n" };
+        assert_eq!(pty_line_terminator(), expected);
+    }
+
+    #[tokio::test]
     async fn missing_file_surfaces_not_found() {
         let stdin = Stdin::from_file("processkit-definitely-missing-424242.txt");
         let mut sink = Vec::new();
@@ -782,6 +917,11 @@ mod tests {
         assert_eq!(
             Stdin::from_string("processkit").content_digest(),
             0xdc0e_2747_f7ea_4273
+        );
+        assert_eq!(
+            Stdin::from_iter_lines(["process", "kit"]).content_digest(),
+            Stdin::from_bytes(b"process\nkit\n".to_vec()).content_digest(),
+            "target-aware line framing must preserve historical cassette keys"
         );
         // A file source hashes its *path* bytes (ASCII → identical on every OS).
         assert_eq!(
