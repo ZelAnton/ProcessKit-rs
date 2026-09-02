@@ -1203,6 +1203,42 @@ fn dir_allows_subdir_creation(dir: &Path) -> bool {
     access_ok(dir, libc::W_OK | libc::X_OK)
 }
 
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+enum HardKillPrimitive {
+    CgroupKill,
+    Pidfd,
+}
+
+/// The primitive that makes a cgroup job safe to hand back as kill-on-drop.
+///
+/// `cgroup.kill` is path-local, while pidfd support is process-wide. Keeping the
+/// decision in one seam lets the read-only host query and real creation apply the
+/// same fallback rule without making tests depend on the running kernel or its
+/// seccomp profile.
+fn hard_kill_primitive_with(
+    cgroup_dir: &Path,
+    cgroup_kill_exists: impl FnOnce(&Path) -> bool,
+    pidfd_probe: impl FnOnce(i32) -> io::Result<()>,
+) -> Option<HardKillPrimitive> {
+    if cgroup_kill_exists(&cgroup_dir.join("cgroup.kill")) {
+        return Some(HardKillPrimitive::CgroupKill);
+    }
+    pidfd_probe(std::process::id() as i32)
+        .ok()
+        .map(|()| HardKillPrimitive::Pidfd)
+}
+
+fn hard_kill_primitive(cgroup_dir: &Path) -> Option<HardKillPrimitive> {
+    hard_kill_primitive_with(cgroup_dir, Path::exists, |pid| pidfd_open(pid).map(drop))
+}
+
+fn hard_kill_unavailable() -> io::Error {
+    io::Error::new(
+        io::ErrorKind::Unsupported,
+        "cgroup v2 cannot guarantee hard teardown: neither cgroup.kill nor pidfd_open is available",
+    )
+}
+
 /// Whether `path` exists and grants `mode` (`W_OK`, `X_OK`, …) to the **effective**
 /// ids right now — the shared `faccessat(…, AT_EACCESS)` primitive behind
 /// [`dir_allows_subdir_creation`] and the leaf-joinability probe in
@@ -1228,19 +1264,24 @@ fn access_ok(path: &Path, mode: libc::c_int) -> bool {
 /// `host_containment()` query and `Job::new` agree.
 ///
 /// Reports [`Mechanism::CgroupV2`] when a cgroup v2 hierarchy is mounted
-/// ([`cgroup2_root`]) **and** this process's own cgroup dir ([`cgroup2_self_dir`])
-/// would accept a new leaf ([`dir_allows_subdir_creation`]) — the same two facts
-/// `Cgroup::create` needs — otherwise [`Mechanism::ProcessGroup`] (the POSIX
-/// process-group fallback). The cgroup branch is **best-effort**: it uses a cheap
-/// read-only permission probe rather than actually creating the leaf, so in the
-/// rare case a writable-looking cgroup then rejects the `mkdir` this may report
-/// `CgroupV2` where `Job::new` falls back to `ProcessGroup`.
+/// ([`cgroup2_root`]), this process's own cgroup dir ([`cgroup2_self_dir`]) would
+/// accept a new leaf ([`dir_allows_subdir_creation`]), and that leaf can be torn
+/// down by either `cgroup.kill` or pidfd-backed member signalling. These are the
+/// same gates `Cgroup::create` applies; otherwise this reports
+/// [`Mechanism::ProcessGroup`] (the POSIX process-group fallback). The cgroup
+/// branch is **best-effort**: it predicts the child cgroup's interface from its
+/// parent and probes permissions rather than creating the leaf, so a later
+/// `mkdir` refusal or a changed interface view can still make `Job::new` fall back.
 pub(crate) fn detect_mechanism() -> Mechanism {
     let Some(root) = cgroup2_root() else {
         return Mechanism::ProcessGroup;
     };
     match cgroup2_self_dir(&root) {
-        Ok(parent) if dir_allows_subdir_creation(&parent) => Mechanism::CgroupV2,
+        Ok(parent)
+            if dir_allows_subdir_creation(&parent) && hard_kill_primitive(&parent).is_some() =>
+        {
+            Mechanism::CgroupV2
+        }
         _ => Mechanism::ProcessGroup,
     }
 }
@@ -1712,6 +1753,12 @@ impl Cgroup {
         // can never disagree on *where* this process's cgroup is.
         let parent = cgroup2_self_dir(root)?;
 
+        // Do not select a backend whose Drop path has no usable hard-kill
+        // primitive. This is also the read-only detection gate; checking it before
+        // mkdir keeps the public host query aligned with the real choice. A
+        // cgroup.kill prediction is verified against the created directory below.
+        let predicted_hard_kill = hard_kill_primitive(&parent).ok_or_else(hard_kill_unavailable)?;
+
         // Without limits, no controllers are enabled — `cgroup.kill` needs none,
         // and that sidesteps the "no internal processes" rule. Even *with* limits,
         // the controllers are enabled in the PARENT's `cgroup.subtree_control` (see
@@ -1754,6 +1801,18 @@ impl Cgroup {
             )
         })?;
         let cg = Cgroup::at(path);
+
+        // pidfd support is process-wide and the successful probe above is the
+        // capability proof. `cgroup.kill`, however, belongs to the cgroup itself:
+        // verify the interface the kernel populated in the directory we will own.
+        // If the parent's view changed, pidfd gets one chance to preserve the
+        // backend before the empty directory is removed and Job::new falls back.
+        if predicted_hard_kill == HardKillPrimitive::CgroupKill
+            && hard_kill_primitive(&cg.path).is_none()
+        {
+            let _ = std::fs::remove_dir(&cg.path);
+            return Err(hard_kill_unavailable());
+        }
 
         // With limits, enable the matching controllers and write the caps. If that
         // fails (no delegation, or the parent holds processes so it can't carry
@@ -5232,10 +5291,13 @@ mod member_sample_tests {
 /// must agree with a really-created group's mechanism on this same host.
 #[cfg(test)]
 mod detect_mechanism_tests {
+    use std::cell::Cell;
+    use std::io;
     use std::path::Path;
 
     use super::{
-        Job, cgroup2_root, cgroup2_self_dir, detect_mechanism, dir_allows_subdir_creation,
+        HardKillPrimitive, Job, cgroup2_root, cgroup2_self_dir, detect_mechanism,
+        dir_allows_subdir_creation, hard_kill_primitive_with,
     };
     use crate::Mechanism;
 
@@ -5265,11 +5327,63 @@ mod detect_mechanism_tests {
     }
 
     #[test]
+    fn cgroup_kill_alone_is_a_hard_kill_primitive() {
+        let pidfd_calls = Cell::new(0);
+        let cgroup = Path::new("/stand-in/job");
+
+        let primitive = hard_kill_primitive_with(
+            cgroup,
+            |path| {
+                assert_eq!(path, cgroup.join("cgroup.kill"));
+                true
+            },
+            |_| {
+                pidfd_calls.set(pidfd_calls.get() + 1);
+                Err(io::Error::from(io::ErrorKind::Unsupported))
+            },
+        );
+
+        assert_eq!(primitive, Some(HardKillPrimitive::CgroupKill));
+        assert_eq!(pidfd_calls.get(), 0, "cgroup.kill avoids a needless pidfd");
+    }
+
+    #[test]
+    fn pidfd_alone_is_a_hard_kill_primitive() {
+        let cgroup = Path::new("/stand-in/job");
+
+        let primitive = hard_kill_primitive_with(
+            cgroup,
+            |path| {
+                assert_eq!(path, cgroup.join("cgroup.kill"));
+                false
+            },
+            |pid| {
+                assert_eq!(pid, std::process::id() as i32);
+                Ok(())
+            },
+        );
+
+        assert_eq!(primitive, Some(HardKillPrimitive::Pidfd));
+    }
+
+    #[test]
+    fn missing_cgroup_kill_and_pidfd_reject_the_cgroup_backend() {
+        let cgroup = Path::new("/stand-in/job");
+
+        let primitive = hard_kill_primitive_with(
+            cgroup,
+            |_| false,
+            |_| Err(io::Error::from(io::ErrorKind::PermissionDenied)),
+        );
+
+        assert_eq!(primitive, None);
+    }
+
+    #[test]
     fn the_writability_probe_creates_no_filesystem_entry() {
-        // `detect_mechanism`'s only cgroup-side filesystem touch is this permission
-        // probe; prove it writes nothing by probing a fresh, empty scratch dir and
-        // asserting the dir stays empty afterwards — the "no new cgroup directory"
-        // guarantee the host query is built on, isolated from any parallel test.
+        // The permission half of `detect_mechanism` writes nothing: probe a fresh,
+        // empty scratch dir and assert it stays empty afterwards. The hard-kill
+        // half uses only an existence check and pidfd_open on this process.
         let tmp =
             std::env::temp_dir().join(format!("processkit-detect-probe-{}", std::process::id()));
         let _ = std::fs::remove_dir_all(&tmp);
