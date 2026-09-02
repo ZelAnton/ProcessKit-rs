@@ -400,10 +400,6 @@ name = "metrics"
 path = "examples/metrics.rs"
 required-features = ["metrics"]
 
-[[test]]
-name = "identifiers_manifest"
-path = "tests/identifiers_manifest.rs"
-
 [target.'cfg(windows)'.dev-dependencies]
 # Liveness probe (OpenProcess) in the integration tests that prove a grandchild is
 # reaped with its job — integration tests can't see the non-dev windows-sys.
