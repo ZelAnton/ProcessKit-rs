@@ -256,12 +256,15 @@ async fn main() -> processkit::Result<()> {
 ```
 
 Unlike `ScriptedRunner`, there is nothing to script — a dry run has no real
-output to fake, only a command line to show — so every call unconditionally
-succeeds on both `output_string` and `start`: empty stdout/stderr, and an
-exit code drawn from the command's own `ok_codes` (`0` by default) so
-`is_success()` and the ergonomic `run`/`run_unit`/`checked`/`parse` verbs
-agree it succeeded even for a command whose `ok_codes` excludes `0`. The
-rendered lines are available two ways, usable together or alone:
+output to fake, only a command line to show — so every non-cancelled call
+unconditionally succeeds on both `output_string` and `start`: empty
+stdout/stderr, and an exit code drawn from the command's own `ok_codes` (`0`
+by default) so `is_success()` and the ergonomic
+`run`/`run_unit`/`checked`/`parse` verbs agree it succeeded even for a command
+whose `ok_codes` excludes `0`. A call whose cancellation token is already
+cancelled instead returns `ErrorReason::Cancelled` before stdin validation,
+command recording, or the `on_invocation` callback. The rendered lines are
+available two ways, usable together or alone:
 
 - a collected snapshot, in the style of `RecordingRunner::calls` —
   `commands()` (all of them, in order) / `only_command()` (panics unless
