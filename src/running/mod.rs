@@ -4204,15 +4204,22 @@ mod tests {
         // wait can keep the macOS process driver externally armed and suppress
         // that heuristic. Explicit advancement preserves the hermetic timing
         // premise on every platform without shortening either production budget.
-        let teardown =
-            run.graceful_teardown(grace, crate::sys::SIGTERM_RAW, TeardownCause::Cancellation);
-        let clock = async {
-            tokio::task::yield_now().await;
-            tokio::time::advance(grace).await;
-            tokio::task::yield_now().await;
-            tokio::time::advance(PUMP_TEARDOWN).await;
+        let failure = {
+            let teardown =
+                run.graceful_teardown(grace, crate::sys::SIGTERM_RAW, TeardownCause::Cancellation);
+            let clock = async {
+                tokio::task::yield_now().await;
+                tokio::time::advance(grace).await;
+                tokio::task::yield_now().await;
+                tokio::time::advance(PUMP_TEARDOWN).await;
+            };
+            tokio::pin!(teardown);
+            tokio::select! {
+                biased;
+                failure = &mut teardown => failure,
+                () = clock => teardown.await,
+            }
         };
-        let (failure, ()) = tokio::join!(biased; teardown, clock);
         let failure =
             failure.expect_err("the injected hard escalation must leave reap unconfirmed");
         assert_eq!(failure.cause, TeardownCause::Cancellation);
