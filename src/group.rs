@@ -285,17 +285,25 @@ impl ProcessGroup {
     /// `spawn_with_options` under a pseudo-terminal (the
     /// [`Command::use_pty`](crate::Command::use_pty) launch path): the child joins
     /// this group exactly as [`spawn_with_options`](Self::spawn_with_options)'s
-    /// does, but over a single PTY master instead of three pipes. `env` is the
-    /// child's resolved environment for the Windows raw-spawn path.
+    /// does, but over a single PTY master instead of three pipes. Windows also
+    /// receives the resolved environment needed by its raw ConPTY spawn.
     #[cfg(feature = "pty")]
     pub(crate) fn spawn_pty_with_options(
         &self,
         cmd: &mut Command,
         opts: &crate::sys::SpawnOptions,
-        env: Option<Vec<(std::ffi::OsString, std::ffi::OsString)>>,
+        #[cfg(windows)] env: Option<Vec<(std::ffi::OsString, std::ffi::OsString)>>,
     ) -> Result<crate::sys::pty::PtySpawn> {
+        #[cfg(windows)]
+        {
+            return self
+                .job
+                .spawn_pty(cmd, opts, env)
+                .map_err(|source| Error::spawn(program_name(cmd), source));
+        }
+        #[cfg(not(windows))]
         self.job
-            .spawn_pty(cmd, opts, env)
+            .spawn_pty(cmd, opts)
             .map_err(|source| Error::spawn(program_name(cmd), source))
     }
 

@@ -495,14 +495,13 @@ impl Job {
     }
 
     /// Spawn `cmd` under a pseudo-terminal, reusing this backend's normal
-    /// cgroup / process-group containment for the actual spawn (K-032). `env` is
-    /// unused on Unix — the pty child keeps the tokio `Command`'s env.
+    /// cgroup / process-group containment for the actual spawn (K-032). The Unix
+    /// pty child keeps the tokio `Command`'s environment.
     #[cfg(feature = "pty")]
     pub(crate) fn spawn_pty(
         &self,
         cmd: &mut Command,
         opts: &crate::sys::SpawnOptions,
-        _env: Option<Vec<(std::ffi::OsString, std::ffi::OsString)>>,
     ) -> io::Result<crate::sys::pty::PtySpawn> {
         // Carries the spare the spawn's kill-on-drop re-arm displaced over to the
         // rollback. Both closures run inside this one call, on this thread, and the
@@ -5654,7 +5653,7 @@ mod pty_rollback_spare_tests {
             let _fault = Faults::new()
                 .fail_every(Site::PtyMasterClone, Some("writer"), libc::EIO)
                 .arm();
-            let result = job.spawn_pty(&mut idle_command(), &pty_options(), None);
+            let result = job.spawn_pty(&mut idle_command(), &pty_options());
             assert!(
                 result.is_err(),
                 "the injected master-clone fault must surface as an error"
