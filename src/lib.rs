@@ -68,12 +68,14 @@
 //! [`ProcessResult::ensure_success`].
 //!
 //! **Stability.** Since **1.0**, `processkit` follows [Semantic Versioning]: the
-//! public API is stable, and any breaking change lands only in a new *major*
-//! version, so `2.x` upgrades are backward-compatible (the last breaking release
-//! was **2.1.0**). (The lone exception is the `mock` feature's `mockall`-generated
-//! `expect_*` surface — see below.)
+//! public API is stable, and breaking changes land only in a new *major* version.
+//! Upgrades within a major release line are backward-compatible; when moving to
+//! a new major, consult the [upgrading guide] for migration notes. (The lone
+//! exception is the `mock` feature's `mockall`-generated `expect_*` surface — see
+//! below.)
 //!
 //! [Semantic Versioning]: https://semver.org/spec/v2.0.0.html
+//! [upgrading guide]: https://github.com/ZelAnton/ProcessKit-rs/blob/main/docs/upgrading.md
 //!
 //! **Stable machine identifiers.** The reporting and configuration enums —
 //! [`Mechanism`], [`Outcome`], [`ParentDeathCleanup`], [`StopReason`],

@@ -27,7 +27,10 @@ use crate::Mechanism;
 #[cfg(feature = "process-control")]
 use crate::Signal;
 #[cfg(feature = "limits")]
-use crate::limits::{CappedAxes, LimitEvidence, LimitKind, LimitVerdict, ResourceLimits};
+use crate::limits::{
+    CappedAxes, LimitEvidence, LimitKind, LimitVerdict, ResourceLimits, limit_application_error,
+    limit_application_error_with_context_parts,
+};
 #[cfg(feature = "process-control")]
 use crate::member::MemberInfo;
 #[cfg(feature = "stats")]
@@ -1951,13 +1954,25 @@ impl Cgroup {
         // Some axes are written; the None-axis reset lives in `update_limits`.
         self.enable_controllers(parent, &needed_controllers(limits))?;
         if let Some(bytes) = limits.max_memory {
-            cgroup_write(&self.path.join("memory.max"), bytes.to_string())?;
+            limit_cgroup_write(
+                &self.path.join("memory.max"),
+                bytes.to_string(),
+                LimitKind::Memory,
+            )?;
         }
         if let Some(n) = limits.max_processes {
-            cgroup_write(&self.path.join("pids.max"), n.to_string())?;
+            limit_cgroup_write(
+                &self.path.join("pids.max"),
+                n.to_string(),
+                LimitKind::Processes,
+            )?;
         }
         if let Some(cores) = limits.cpu_quota {
-            cgroup_write(&self.path.join("cpu.max"), cpu_max_value(cores))?;
+            limit_cgroup_write(
+                &self.path.join("cpu.max"),
+                cpu_max_value(cores),
+                LimitKind::Cpu,
+            )?;
         }
         Ok(())
     }
@@ -1993,14 +2008,17 @@ impl Cgroup {
         write_limit_reset(
             &self.path.join("memory.max"),
             limits.max_memory.map(|b| b.to_string()),
+            LimitKind::Memory,
         )?;
         write_limit_reset(
             &self.path.join("pids.max"),
             limits.max_processes.map(|n| n.to_string()),
+            LimitKind::Processes,
         )?;
         write_limit_reset(
             &self.path.join("cpu.max"),
             limits.cpu_quota.map(cpu_max_value),
+            LimitKind::Cpu,
         )?;
         Ok(())
     }
@@ -2135,23 +2153,26 @@ impl Cgroup {
                 .join(" ");
             let file = parent.join("cgroup.subtree_control");
             cgroup_write(&file, &spec).map_err(|e| {
-                io::Error::new(
-                    e.kind(),
-                    format!(
-                        "enabling cgroup controllers ({spec}) in {} failed: {e}. cgroup v2's \
-                         'no internal processes' rule forbids enabling controllers in a cgroup \
-                         that holds member processes (except the real hierarchy root), and this \
-                         process is a member of that cgroup — so processkit's resource limits \
-                         apply only when this process runs at the real cgroup-v2 root, not under \
-                         a systemd session/scope/service nor an ordinary (private-cgroupns) \
-                         container, both of which place it in a non-root cgroup. (A cgroup \
-                         namespace root does not count — it only virtualizes the view.) processkit \
-                         does not migrate your process into a sub-cgroup to satisfy the rule; \
-                         arrange that externally (the create-leaf/migrate-self/enable dance) if \
-                         you need limits there.",
-                        file.display()
-                    ),
-                )
+                let prefix = format!(
+                    "enabling cgroup controllers ({spec}) in {} failed",
+                    file.display()
+                );
+                let suffix = ". cgroup v2's 'no internal processes' rule forbids enabling \
+                    controllers in a cgroup that holds member processes (except the real \
+                    hierarchy root), and this process is a member of that cgroup — so \
+                    processkit's resource limits apply only when this process runs at the real \
+                    cgroup-v2 root, not under a systemd session/scope/service nor an ordinary \
+                    (private-cgroupns) container, both of which place it in a non-root cgroup. \
+                    (A cgroup namespace root does not count — it only virtualizes the view.) \
+                    processkit does not migrate your process into a sub-cgroup to satisfy the \
+                    rule; arrange that externally (the create-leaf/migrate-self/enable dance) \
+                    if you need limits there.";
+                match controller_limit_kind(&to_enable) {
+                    Some(kind) => {
+                        limit_application_error_with_context_parts(kind, e, prefix, suffix)
+                    }
+                    None => io::Error::new(e.kind(), format!("{prefix}: {e}{suffix}")),
+                }
             })?;
         }
         Ok(())
@@ -3295,15 +3316,38 @@ fn needed_controllers(limits: &ResourceLimits) -> Vec<&'static str> {
     needed
 }
 
+/// A subtree-control write can enable several controllers in one kernel call.
+/// Attribute it only when that call names exactly one controller; a combined
+/// refusal remains intentionally ambiguous and the shared mapper applies its
+/// first-requested tie-break.
+#[cfg(feature = "limits")]
+fn controller_limit_kind(controllers: &[&str]) -> Option<LimitKind> {
+    match controllers {
+        ["memory"] => Some(LimitKind::Memory),
+        ["pids"] => Some(LimitKind::Processes),
+        ["cpu"] => Some(LimitKind::Cpu),
+        _ => None,
+    }
+}
+
+/// Write a cgroup interface for a known limit axis while retaining the exact
+/// OS error that rejected the write.
+#[cfg(feature = "limits")]
+fn limit_cgroup_write(path: &Path, contents: impl AsRef<[u8]>, kind: LimitKind) -> io::Result<()> {
+    cgroup_write(path, contents).map_err(|source| limit_application_error(kind, source))
+}
+
 /// Write one cgroup limit interface file for the `update_limits` full replacement:
 /// `Some(v)` sets the axis to `v`; `None` resets it to `max` (unbounded) — but only
 /// when the file exists. A controller that was never enabled has no interface file
 /// and the axis is already unbounded, so a `None` reset there is a no-op success
 /// rather than a spurious `NotFound` write error.
 #[cfg(feature = "limits")]
-fn write_limit_reset(path: &Path, value: Option<String>) -> io::Result<()> {
+fn write_limit_reset(path: &Path, value: Option<String>, kind: LimitKind) -> io::Result<()> {
     match value {
-        Some(v) => cgroup_write(path, v),
+        Some(v) => limit_cgroup_write(path, v, kind),
+        // A reset is ordinary I/O, not application of a requested cap. Keep the
+        // original error so `update_limits(default())` preserves its errno.
         None if path.exists() => cgroup_write(path, "max"),
         None => Ok(()),
     }
@@ -4487,7 +4531,7 @@ mod cgroup_write_seam_tests {
                 reason,
                 detail,
             } => {
-                assert_eq!(*kind, LimitKind::Memory, "the first requested axis");
+                assert_eq!(*kind, LimitKind::Processes, "the rejected axis");
                 assert_eq!(
                     *reason,
                     LimitReason::Unenforceable,
@@ -4513,6 +4557,137 @@ mod cgroup_write_seam_tests {
             "max\n",
             "the write after the failure was never attempted"
         );
+    }
+
+    /// A `cpu.max` refusal is attributable even when another axis was written
+    /// first. The cgroup write wrapper carries the CPU axis through the shared
+    /// public error mapping without replacing the injected errno.
+    #[cfg(feature = "limits")]
+    #[test]
+    fn a_cpu_limit_write_reports_cpu_when_memory_was_requested_first() {
+        use crate::limits::{CappedAxes, ResourceLimits};
+        use crate::{ErrorKind, ErrorReason, LimitKind, LimitReason};
+
+        let (_dir, cgroup) = temp_cgroup();
+        let limits = ResourceLimits {
+            max_memory: Some(64 << 20),
+            cpu_quota: Some(0.5),
+            ..ResourceLimits::default()
+        };
+        let faults = Faults::new()
+            .fail_every(SITE, Some("cpu.max"), libc::EIO)
+            .arm();
+
+        let mut capped = CappedAxes::default();
+        let mut reflected = ResourceLimits::default();
+        let err = crate::group::update_limits_with(&mut capped, &mut reflected, limits, |limits| {
+            cgroup.update_limits(limits)
+        })
+        .expect_err("the CPU write must be surfaced");
+
+        assert_eq!(faults.fired(SITE), 1);
+        assert_eq!(err.kind(), ErrorKind::ResourceLimit);
+        match err.reason() {
+            ErrorReason::ResourceLimit {
+                kind,
+                reason,
+                detail,
+            } => {
+                assert_eq!(*kind, LimitKind::Cpu);
+                assert_eq!(*reason, LimitReason::Unenforceable);
+                assert!(detail.contains(&format!("os error {}", libc::EIO)));
+            }
+            other => panic!("expected a ResourceLimit failure, got {other:?}"),
+        }
+        assert_eq!(
+            read(&cgroup.path.join("memory.max")),
+            (64u64 << 20).to_string()
+        );
+        assert_eq!(read(&cgroup.path.join("cpu.max")), "max\n");
+    }
+
+    /// When the parent already has memory delegation but still needs `cpu`, the
+    /// `cgroup.subtree_control` write names exactly one controller. Its refusal
+    /// must therefore be attributed to CPU rather than the first requested axis.
+    #[cfg(feature = "limits")]
+    #[test]
+    fn a_cpu_controller_enable_rejection_reports_cpu_when_memory_was_requested_first() {
+        use crate::limits::{CappedAxes, ResourceLimits};
+        use crate::{ErrorKind, ErrorReason, LimitKind, LimitReason};
+
+        let (_dir, cgroup) = temp_cgroup();
+        let parent = cgroup
+            .path
+            .parent()
+            .expect("the stand-in cgroup has a parent");
+        std::fs::write(parent.join("cgroup.subtree_control"), "memory\n")
+            .expect("seed only the memory controller");
+        let limits = ResourceLimits {
+            max_memory: Some(64 << 20),
+            cpu_quota: Some(0.5),
+            ..ResourceLimits::default()
+        };
+        let faults = Faults::new()
+            .fail_every(SITE, Some("cgroup.subtree_control"), libc::EIO)
+            .arm();
+
+        let mut capped = CappedAxes::default();
+        let mut reflected = ResourceLimits::default();
+        let err = crate::group::update_limits_with(&mut capped, &mut reflected, limits, |limits| {
+            cgroup.update_limits(limits)
+        })
+        .expect_err("the CPU controller enable must be surfaced");
+
+        assert_eq!(faults.fired(SITE), 1);
+        assert_eq!(err.kind(), ErrorKind::ResourceLimit);
+        match err.reason() {
+            ErrorReason::ResourceLimit {
+                kind,
+                reason,
+                detail,
+            } => {
+                assert_eq!(*kind, LimitKind::Cpu);
+                assert_eq!(*reason, LimitReason::Unenforceable);
+                assert!(detail.contains("cgroup.subtree_control"));
+                assert!(detail.contains(&format!("os error {}", libc::EIO)));
+            }
+            other => panic!("expected a ResourceLimit failure, got {other:?}"),
+        }
+        assert_eq!(read(&cgroup.path.join("memory.max")), "max\n");
+        assert_eq!(read(&cgroup.path.join("cpu.max")), "max\n");
+    }
+
+    /// A reset is a plain I/O operation rather than a requested limit application.
+    /// Its injected errno must therefore remain directly available through the
+    /// public `ErrorReason::Io` source instead of being hidden by axis metadata.
+    #[cfg(feature = "limits")]
+    #[test]
+    fn a_reset_limit_write_preserves_the_original_io_error() {
+        use crate::ErrorReason;
+        use crate::limits::{CappedAxes, ResourceLimits};
+
+        let (_dir, cgroup) = temp_cgroup();
+        let faults = Faults::new()
+            .fail_every(SITE, Some("cpu.max"), libc::EIO)
+            .arm();
+
+        let mut capped = CappedAxes::default();
+        let mut reflected = ResourceLimits::default();
+        let err = crate::group::update_limits_with(
+            &mut capped,
+            &mut reflected,
+            ResourceLimits::default(),
+            |limits| cgroup.update_limits(limits),
+        )
+        .expect_err("a refused reset write must surface as I/O");
+
+        assert_eq!(faults.fired(SITE), 1, "exactly one reset write was failed");
+        match err.reason() {
+            ErrorReason::Io(source) => {
+                assert_eq!(source.raw_os_error(), Some(libc::EIO));
+            }
+            other => panic!("expected an I/O failure, got {other:?}"),
+        }
     }
 
     /// `freeze` may degrade to the per-pid `SIGSTOP`/`SIGCONT` sweep for exactly one

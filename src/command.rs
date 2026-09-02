@@ -3253,6 +3253,8 @@ impl Command {
     /// [`cancel_on`](Self::cancel_on)/[`cancel_grace`](Self::cancel_grace),
     /// [`kill_on_parent_death`](Self::kill_on_parent_death) (its exact opposite),
     /// [`windows_graceful_ctrl_break`](Self::windows_graceful_ctrl_break),
+    /// [`io_priority`](Self::io_priority)/[`cpu_affinity`](Self::cpu_affinity)
+    /// (both owner-dependent),
     /// [`keep_stdin_open`](Self::keep_stdin_open)/[`inherit_stdin`](Self::inherit_stdin)/
     /// a configured [`stdin`](Self::stdin) source, any capture wiring
     /// ([`on_stdout_line`](Self::on_stdout_line)/[`on_stderr_line`](Self::on_stderr_line),
@@ -3261,7 +3263,11 @@ impl Command {
     /// Program/argument/env/working-directory and the
     /// privilege-drop knobs ([`uid`](Self::uid)/[`gid`](Self::gid)/
     /// [`groups`](Self::groups)/[`umask`](Self::umask)/[`priority`](Self::priority))
-    /// **are** honored — a detached daemon may still drop privileges.
+    /// **are** honored — a detached daemon may still drop privileges. On Unix,
+    /// [`arg0`](Self::arg0) and [`rlimit`](Self::rlimit) are honored too, while
+    /// `setsid` is forced for every detached spawn whether or not
+    /// [`setsid`](Self::setsid) was requested; requesting that Unix-only option on
+    /// another target is rejected.
     ///
     /// # Not `async`
     ///
@@ -3280,6 +3286,9 @@ impl Command {
     /// - [`ErrorReason::Spawn`] — the program was located
     ///   but the OS refused to start it (bad working directory, permission denied, a
     ///   Windows `.cmd`/`.bat` that needs `cmd.exe`, …).
+    /// - [`ErrorReason::Io`] — a configured [`stdout_file`](Self::stdout_file) or
+    ///   [`stderr_file`](Self::stderr_file) could not be opened, or a Unix
+    ///   [`rlimit`](Self::rlimit) request was invalid before spawn.
     ///
     /// ```no_run
     /// use processkit::Command;

@@ -303,6 +303,8 @@ mod imp {
     use windows_sys::Win32::System::IO::CancelSynchronousIo;
     use windows_sys::Win32::System::Threading::WaitForSingleObject;
 
+    use crate::sys::channel_reader::{ChannelReader, ReaderMessage};
+
     /// How much of the pipe the bridge thread takes per `ReadFile`.
     const CHUNK: usize = 8 * 1024;
     /// How many chunks may sit between the bridge thread and the async side.
@@ -334,13 +336,6 @@ mod imp {
     /// The bridge thread has left its loop; the pipe's read end is closed.
     const STATE_FINISHED: u8 = 2;
 
-    /// What the bridge thread forwards to the async side.
-    #[derive(Debug)]
-    enum Message {
-        Chunk(Vec<u8>),
-        Error(io::Error),
-    }
-
     /// The cancellation contract between a [`BridgeReader`] and its bridge
     /// thread: the async side sets [`Bridge::cancelled`] and interrupts the read
     /// the thread is parked in; the thread publishes enough of its own state
@@ -367,7 +362,7 @@ mod imp {
         ///
         /// Takes `source` by value so the read end is closed when this returns —
         /// the thread is its only owner.
-        fn pump(&self, mut source: impl Read, tx: mpsc::Sender<Message>) {
+        fn pump(&self, mut source: impl Read, tx: mpsc::Sender<ReaderMessage>) {
             let mut buf = [0u8; CHUNK];
             loop {
                 // Publish "about to read" *before* reading the cancel flag,
@@ -394,7 +389,7 @@ mod imp {
                     Ok(0) => break,
                     Ok(read) => {
                         if tx
-                            .blocking_send(Message::Chunk(buf[..read].to_vec()))
+                            .blocking_send(ReaderMessage::Chunk(buf[..read].to_vec()))
                             .is_err()
                         {
                             break;
@@ -406,7 +401,7 @@ mod imp {
                     // have received it is the one being dropped.
                     Err(_) if self.cancelled.load(Ordering::SeqCst) => break,
                     Err(error) => {
-                        let _ = tx.blocking_send(Message::Error(error));
+                        let _ = tx.blocking_send(ReaderMessage::Error(error));
                         break;
                     }
                 }
@@ -468,17 +463,11 @@ mod imp {
     /// The parent end of a merge pipe: a bridge thread blocks on it, and this
     /// hands what that thread reads to the async caller one chunk at a time.
     ///
-    /// The `Receiver` is wrapped in a `Mutex` purely so this is `Sync` (a tokio
-    /// mpsc `Receiver` is `Send` but not `Sync`), which keeps the boxed
-    /// [`OutputReader`](crate::running) — and thus
-    /// [`RunningProcess`](crate::RunningProcess) — `Sync`. The lock is
-    /// uncontended (only `poll_read` and `Drop` touch it, and a reader is polled
-    /// from one task) and never held across an `.await`.
+    /// The shared [`ChannelReader`] owns the receiver and preserves chunk
+    /// remainders across the caller's partial reads.
     #[derive(Debug)]
     struct BridgeReader {
-        rx: std::sync::Mutex<mpsc::Receiver<Message>>,
-        leftover: Vec<u8>,
-        pos: usize,
+        reader: ChannelReader,
         bridge: Arc<Bridge>,
         thread: JoinHandle<()>,
     }
@@ -515,9 +504,7 @@ mod imp {
                     }
                 })?;
             Ok(Self {
-                rx: std::sync::Mutex::new(rx),
-                leftover: Vec::new(),
-                pos: 0,
+                reader: ChannelReader::new(rx),
                 bridge,
                 thread,
             })
@@ -533,10 +520,7 @@ mod imp {
             // Close the channel first: a thread parked in `blocking_send`
             // (a full channel the async side stopped draining) has to be let go
             // before anything waits for it.
-            self.rx
-                .get_mut()
-                .unwrap_or_else(|poisoned| poisoned.into_inner())
-                .close();
+            self.reader.close();
             let thread = self.thread.as_raw_handle();
             if self.bridge.cancel(thread) {
                 // A bounded join: it returns as soon as the thread has closed
@@ -561,39 +545,7 @@ mod imp {
             buf: &mut ReadBuf<'_>,
         ) -> Poll<io::Result<()>> {
             let this = self.get_mut();
-            if this.pos < this.leftover.len() {
-                let start = this.pos;
-                let n = (this.leftover.len() - start).min(buf.remaining());
-                buf.put_slice(&this.leftover[start..start + n]);
-                this.pos += n;
-                return Poll::Ready(Ok(()));
-            }
-            let poll = this
-                .rx
-                .get_mut()
-                .expect("merge pipe reader mutex poisoned")
-                .poll_recv(cx);
-            match poll {
-                Poll::Ready(Some(Message::Chunk(chunk))) => {
-                    let n = chunk.len().min(buf.remaining());
-                    buf.put_slice(&chunk[..n]);
-                    if n < chunk.len() {
-                        this.leftover = chunk;
-                        this.pos = n;
-                    } else {
-                        this.leftover.clear();
-                        this.pos = 0;
-                    }
-                    Poll::Ready(Ok(()))
-                }
-                // A genuine read error goes to the caller unchanged — never
-                // reported as a short read or as EOF.
-                Poll::Ready(Some(Message::Error(error))) => Poll::Ready(Err(error)),
-                // The bridge thread ended: the pipe's EOF, or a teardown that
-                // has no reader left to tell anyway.
-                Poll::Ready(None) => Poll::Ready(Ok(())),
-                Poll::Pending => Poll::Pending,
-            }
+            Pin::new(&mut this.reader).poll_read(cx, buf)
         }
     }
 

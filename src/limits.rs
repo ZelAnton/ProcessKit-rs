@@ -1,5 +1,8 @@
 //! Resource caps applied to a [`ProcessGroup`](crate::ProcessGroup).
 
+#[cfg(feature = "limits")]
+use std::{fmt, io};
+
 #[cfg(feature = "report-serde")]
 use serde::ser::{Serialize, SerializeStruct as _, Serializer};
 
@@ -103,6 +106,9 @@ impl ResourceLimits {
 /// because this process isn't at the real hierarchy root), `kind` names the
 /// **first** requested limit in `max_memory`, `max_processes`, `cpu_quota` order
 /// — a fixed, documented tie-break rather than an arbitrary one.
+/// On Windows, memory and process caps share one extended-limit operation; if
+/// that operation is rejected for a combined request, `Memory` is reported when
+/// requested, otherwise `Processes`.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 #[non_exhaustive]
 pub enum LimitKind {
@@ -151,6 +157,130 @@ impl LimitKind {
             _ => None,
         }
     }
+}
+
+/// An internal error wrapper used while a backend applies resource limits.
+///
+/// The public [`ErrorReason::ResourceLimit`](crate::ErrorReason::ResourceLimit)
+/// keeps its existing shape, but the backend must tell the shared error mapping
+/// which axis actually failed. Keeping the original `io::Error` as the source is
+/// important: the wrapper adds classification without replacing the OS error's
+/// kind, errno, or source chain.
+#[cfg(feature = "limits")]
+#[derive(Debug)]
+pub(crate) struct LimitApplicationError {
+    kind: LimitKind,
+    source: io::Error,
+    context: Option<LimitApplicationContext>,
+}
+
+#[cfg(feature = "limits")]
+#[derive(Debug)]
+struct LimitApplicationContext {
+    prefix: String,
+    suffix: String,
+}
+
+#[cfg(feature = "limits")]
+impl LimitApplicationError {
+    fn new(kind: LimitKind, source: io::Error, context: Option<LimitApplicationContext>) -> Self {
+        Self {
+            kind,
+            source,
+            context,
+        }
+    }
+
+    fn kind(&self) -> LimitKind {
+        self.kind
+    }
+}
+
+#[cfg(feature = "limits")]
+impl fmt::Display for LimitApplicationError {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        if let Some(context) = &self.context {
+            write!(f, "{}: {}{}", context.prefix, self.source, context.suffix)
+        } else {
+            self.source.fmt(f)
+        }
+    }
+}
+
+#[cfg(feature = "limits")]
+impl std::error::Error for LimitApplicationError {
+    fn source(&self) -> Option<&(dyn std::error::Error + 'static)> {
+        Some(&self.source)
+    }
+}
+
+/// Attach the axis that a limit-capable backend could identify as the failing
+/// one while retaining the original OS error for display and source-chain
+/// inspection.
+#[cfg(feature = "limits")]
+pub(crate) fn limit_application_error(kind: LimitKind, source: io::Error) -> io::Error {
+    io::Error::new(
+        source.kind(),
+        LimitApplicationError::new(kind, source, None),
+    )
+}
+
+/// Attach an axis and a short backend context while retaining the original OS
+/// error as the wrapper's source.
+#[cfg(all(feature = "limits", windows))]
+pub(crate) fn limit_application_error_with_context(
+    kind: LimitKind,
+    source: io::Error,
+    context: impl Into<String>,
+) -> io::Error {
+    let error_kind = source.kind();
+    io::Error::new(
+        error_kind,
+        LimitApplicationError::new(
+            kind,
+            source,
+            Some(LimitApplicationContext {
+                prefix: context.into(),
+                suffix: String::new(),
+            }),
+        ),
+    )
+}
+
+/// Attach an axis and preserve a backend's existing error layout around the
+/// original OS error. This is useful for long diagnostics whose explanation
+/// historically followed the errno text.
+#[cfg(all(feature = "limits", target_os = "linux"))]
+pub(crate) fn limit_application_error_with_context_parts(
+    kind: LimitKind,
+    source: io::Error,
+    prefix: impl Into<String>,
+    suffix: impl Into<String>,
+) -> io::Error {
+    let error_kind = source.kind();
+    io::Error::new(
+        error_kind,
+        LimitApplicationError::new(
+            kind,
+            source,
+            Some(LimitApplicationContext {
+                prefix: prefix.into(),
+                suffix: suffix.into(),
+            }),
+        ),
+    )
+}
+
+/// Recover a backend-provided axis from an `io::Error`, if the backend could
+/// identify one. Unwrapped errors intentionally return `None`, preserving the
+/// shared first-requested-axis fallback for unsupported or otherwise ambiguous
+/// failures.
+#[cfg(feature = "limits")]
+pub(crate) fn limit_application_kind(source: &io::Error) -> Option<LimitKind> {
+    source
+        .get_ref()
+        .and_then(|source| source.downcast_ref::<LimitApplicationError>())
+        .map(LimitApplicationError::kind)
 }
 
 /// Why a requested resource limit could not be applied — the classification an

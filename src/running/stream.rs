@@ -519,7 +519,8 @@ impl RunningProcess {
     /// caller opted into by streaming — a bare `finish` discards untouched stdout
     /// and never trips it), [`ErrorReason::Stdin`](crate::ErrorReason::Stdin) (a
     /// non-broken-pipe stdin-source failure on an otherwise-successful run), or
-    /// [`ErrorReason::Io`](crate::ErrorReason::Io) (waiting on the child failed).
+    /// [`ErrorReason::Io`](crate::ErrorReason::Io) (waiting on the child or
+    /// reading either output pipe failed).
     pub async fn finish(self) -> Result<Finished> {
         self.finish_observing_exit(|_| ()).await
     }

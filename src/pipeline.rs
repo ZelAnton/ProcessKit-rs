@@ -851,10 +851,14 @@ impl Pipeline {
     /// A launch failure of any stage
     /// ([`ErrorReason::NotFound`](crate::ErrorReason::NotFound) /
     /// [`ErrorReason::Spawn`](crate::ErrorReason::Spawn) /
-    /// [`ErrorReason::Unsupported`](crate::ErrorReason::Unsupported)) or
-    /// [`ErrorReason::Stdin`](crate::ErrorReason::Stdin) at start-up — every already-started
-    /// stage is torn down before the error returns. A failing *stage* is not raised
-    /// here; it surfaces at [`finish`](PipelineSession::finish).
+    /// [`ErrorReason::Unsupported`](crate::ErrorReason::Unsupported) /
+    /// [`ErrorReason::Cancelled`](crate::ErrorReason::Cancelled)), or
+    /// [`ErrorReason::Io`](crate::ErrorReason::Io) (the stage's containment group
+    /// could not be created, stdin setup conflicted or a one-shot stdin source was
+    /// already consumed, or a pre-spawn I/O/configuration step such as opening a
+    /// configured stdout/stderr file or validating Unix `rlimit` failed) — every
+    /// already-started stage is torn down before the error returns. A failing
+    /// *stage* is not raised here; it surfaces at [`finish`](PipelineSession::finish).
     pub async fn start(&self) -> Result<PipelineSession> {
         let LaunchedChain {
             stage_groups,

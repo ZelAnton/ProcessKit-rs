@@ -8,7 +8,9 @@ use tokio::process::{Child, Command};
 use crate::error::ErrorReason;
 use crate::error::{Error, Result};
 #[cfg(feature = "limits")]
-use crate::limits::{CappedAxes, LimitEvidence, LimitKind, LimitReason, ResourceLimits};
+use crate::limits::{
+    CappedAxes, LimitEvidence, LimitKind, LimitReason, ResourceLimits, limit_application_kind,
+};
 use crate::mechanism::Mechanism;
 #[cfg(feature = "process-control")]
 use crate::member::MemberInfo;
@@ -197,7 +199,7 @@ impl ProcessGroup {
                         LimitReason::Unenforceable
                     };
                     ErrorReason::ResourceLimit {
-                        kind: first_requested_kind(&options.limits),
+                        kind: failed_limit_kind(&source, &options.limits),
                         reason,
                         detail: source.to_string(),
                     }
@@ -1564,7 +1566,7 @@ pub(crate) fn update_limits_with(
                 LimitReason::Unenforceable
             };
             ErrorReason::ResourceLimit {
-                kind: first_requested_kind(&limits),
+                kind: failed_limit_kind(&source, &limits),
                 reason,
                 detail: source.to_string(),
             }
@@ -1582,11 +1584,23 @@ pub(crate) fn update_limits_with(
     Ok(())
 }
 
-/// Which limit an enforcement failure (as opposed to a `validate_limits`
-/// rejection) should be attributed to, when the backend's error can't be
-/// pinned to a single one: the **first** requested limit in `max_memory`,
-/// `max_processes`, `cpu_quota` order — see [`LimitKind`]'s doc for why this
-/// fixed tie-break is honest rather than arbitrary. `limits.any()` is a
+/// Attribute an enforcement failure to the backend-reported axis when one is
+/// available. Unsupported mechanisms and failures that affect several axes in
+/// one indivisible operation intentionally use the documented first-requested
+/// tie-break instead.
+#[cfg(feature = "limits")]
+fn failed_limit_kind(source: &std::io::Error, limits: &ResourceLimits) -> LimitKind {
+    if source.kind() != std::io::ErrorKind::Unsupported
+        && let Some(kind) = limit_application_kind(source)
+    {
+        return kind;
+    }
+    first_requested_kind(limits)
+}
+
+/// Which limit an enforcement failure should be attributed to when the backend
+/// cannot pin it to a single axis: the **first** requested limit in
+/// `max_memory`, `max_processes`, `cpu_quota` order. `limits.any()` is a
 /// precondition (checked by the caller), so at least one arm always matches.
 #[cfg(feature = "limits")]
 fn first_requested_kind(limits: &ResourceLimits) -> LimitKind {

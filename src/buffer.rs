@@ -202,7 +202,8 @@ pub enum OverflowMode {
     /// *byte* cap (its `max_lines` is meaningless for a non-line stream), pair
     /// Error mode with [`with_max_bytes`](OutputBufferPolicy::with_max_bytes) when
     /// capturing raw bytes; a `timeout` additionally bounds wall-time. Discard-only
-    /// verbs ([`wait`](crate::RunningProcess::wait), and `profile` under the `stats`
+    /// verbs ([`wait`](crate::RunningProcess::wait),
+    /// [`drain`](crate::RunningProcess::drain), and `profile` under the `stats`
     /// feature) use a retain-nothing sink internally and are not affected.
     ///
     /// Use this when unbounded *line* output is itself a misbehavior — an

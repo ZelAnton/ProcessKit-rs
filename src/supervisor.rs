@@ -1824,10 +1824,26 @@ impl<R: ProcessRunner> Supervisor<R> {
     ///
     /// # Errors
     ///
-    /// Returns `Err` only when the **terminating** attempt failed to produce a
-    /// result at all (a spawn/IO failure when no further restart is allowed) —
-    /// there is no final [`ProcessResult`] to report in that case. A spawn
-    /// failure with restarts remaining counts as a crash and is retried.
+    /// Returns `Err` when the supervisor cannot produce a final
+    /// [`ProcessResult`]: this includes a terminating launch/capture failure,
+    /// cancellation or unconfirmed teardown, or an error from a fallible control
+    /// predicate. A launch or capture failure with restarts remaining counts as a
+    /// crash and is retried according to the policy.
+    ///
+    /// The possible [`crate::ErrorReason`] variants are
+    /// [`crate::ErrorReason::NotFound`], [`crate::ErrorReason::Spawn`],
+    /// [`crate::ErrorReason::Unsupported`], and [`crate::ErrorReason::Io`]
+    /// (launch, group, stdin, or output-pump failures),
+    /// [`crate::ErrorReason::Cancelled`] (a caller cancellation),
+    /// [`crate::ErrorReason::Teardown`] (terminal teardown was not confirmed),
+    /// [`crate::ErrorReason::OutputTooLarge`] (a fail-loud capture ceiling),
+    /// [`crate::ErrorReason::Stdin`] (a non-broken-pipe stdin-source failure on an
+    /// otherwise-successful incarnation), or [`crate::ErrorReason::Predicate`] (a
+    /// fallible stop, give-up, or health-check callback failed).
+    #[cfg_attr(
+        feature = "limits",
+        doc = "With the `limits` feature, an unenforceable group cap can also return [`ErrorReason::ResourceLimit`](crate::ErrorReason::ResourceLimit)."
+    )]
     ///
     /// # Cancellation
     ///
@@ -1852,10 +1868,11 @@ impl<R: ProcessRunner> Supervisor<R> {
     /// `run` reports its outcome only at the very end and exposes no handle
     /// while it runs. For a live view — watch the restart count / current pid,
     /// or ask supervision to stop gracefully mid-flight — use
-    /// [`start`](Self::start), which returns a [`SupervisionSession`]; `run` is a
-    /// thin wrapper over `start` + awaiting its outcome, so their behavior is
-    /// identical. (`run` therefore never reports [`StopReason::Stopped`], which
-    /// only a session stop produces.)
+    /// [`start`](Self::start), which returns a [`SupervisionSession`]. `run` drives
+    /// the shared `drive` engine inline and does not spawn a Tokio
+    /// task; this is why it also works with a borrowed shared-group runner, unlike
+    /// `start`, which requires a `'static` runner. (`run` therefore never reports
+    /// [`StopReason::Stopped`], which only a session stop produces.)
     pub async fn run(self) -> Result<SupervisionOutcome> {
         // A thin wrapper over the shared supervision engine (`drive`), the same
         // one `start`'s detached task runs — so `run` preserves the classic

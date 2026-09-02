@@ -93,7 +93,10 @@ use crate::Mechanism;
 #[cfg(feature = "process-control")]
 use crate::Signal;
 #[cfg(feature = "limits")]
-use crate::limits::{CappedAxes, LimitEvidence, LimitKind, LimitVerdict, ResourceLimits};
+use crate::limits::{
+    CappedAxes, LimitEvidence, LimitKind, LimitVerdict, ResourceLimits, limit_application_error,
+    limit_application_error_with_context,
+};
 #[cfg(feature = "process-control")]
 use crate::member::MemberInfo;
 #[cfg(feature = "stats")]
@@ -160,6 +163,22 @@ const EXTENDED_LIMIT_AXIS: &str = "extended-limit";
 /// info class carrying the CPU hard cap.
 #[cfg(feature = "limits")]
 const CPU_RATE_AXIS: &str = "cpu-rate";
+
+/// The extended-limit info class carries memory and process caps in one
+/// indivisible Job Object call. If that combined call is rejected, the
+/// documented deterministic attribution is memory when requested, otherwise
+/// processes; a CPU-only request has no axis in this call and falls back to the
+/// shared first-requested rule.
+#[cfg(feature = "limits")]
+fn extended_limit_kind(limits: &ResourceLimits) -> Option<LimitKind> {
+    if limits.max_memory.is_some() {
+        Some(LimitKind::Memory)
+    } else if limits.max_processes.is_some() {
+        Some(LimitKind::Processes)
+    } else {
+        None
+    }
+}
 
 #[derive(Debug, Clone, Copy)]
 struct ThreadSnapshotEntry {
@@ -502,12 +521,19 @@ impl Job {
             }
         }
         // On failure `job` drops here, closing the handle — no leak.
-        set_information_job_object(
+        let extended_result = set_information_job_object(
             job.handle,
             JobObjectExtendedLimitInformation,
             &info,
             EXTENDED_LIMIT_AXIS,
-        )?;
+        );
+        if let Err(source) = extended_result {
+            #[cfg(feature = "limits")]
+            if let Some(kind) = extended_limit_kind(limits) {
+                return Err(limit_application_error(kind, source));
+            }
+            return Err(source);
+        }
 
         // CPU quota is a separate info class. The hard cap is expressed in 1/100 of
         // a percent of *total* system CPU (1..=10000), so convert our per-core
@@ -521,12 +547,14 @@ impl Job {
                 JOB_OBJECT_CPU_RATE_CONTROL_ENABLE | JOB_OBJECT_CPU_RATE_CONTROL_HARD_CAP;
             cpu.Anonymous.CpuRate = rate;
             // `job` drops (closing the handle) on the error path.
-            set_information_job_object(
+            if let Err(source) = set_information_job_object(
                 job.handle,
                 JobObjectCpuRateControlInformation,
                 &cpu,
                 CPU_RATE_AXIS,
-            )?;
+            ) {
+                return Err(limit_application_error(LimitKind::Cpu, source));
+            }
         }
 
         Ok(job)
@@ -571,10 +599,14 @@ impl Job {
             &info,
             EXTENDED_LIMIT_AXIS,
         ) {
-            return Err(io::Error::new(
-                err.kind(),
-                format!("{EXTENDED_LIMIT_AXIS} reissue: {err}"),
-            ));
+            return Err(match extended_limit_kind(limits) {
+                Some(kind) => limit_application_error_with_context(
+                    kind,
+                    err,
+                    format!("{EXTENDED_LIMIT_AXIS} reissue"),
+                ),
+                None => io::Error::new(err.kind(), format!("{EXTENDED_LIMIT_AXIS} reissue: {err}")),
+            });
         }
 
         // CPU quota is a separate info class. Written unconditionally so a removed
@@ -606,10 +638,14 @@ impl Job {
                 && err.raw_os_error()
                     == Some(windows_sys::Win32::Foundation::ERROR_INVALID_PARAMETER as i32);
             if !benign_clear {
-                return Err(io::Error::new(
-                    err.kind(),
-                    format!("{CPU_RATE_AXIS} reissue: {err}"),
-                ));
+                return Err(match limits.cpu_quota {
+                    Some(_) => limit_application_error_with_context(
+                        LimitKind::Cpu,
+                        err,
+                        format!("{CPU_RATE_AXIS} reissue"),
+                    ),
+                    None => io::Error::new(err.kind(), format!("{CPU_RATE_AXIS} reissue: {err}")),
+                });
             }
         }
         Ok(())
@@ -2373,6 +2409,7 @@ mod job_limit_error_paths {
 
         let err = group
             .update_limits(ResourceLimits {
+                max_memory: Some(64 << 20),
                 cpu_quota: Some(0.5),
                 ..ResourceLimits::default()
             })
@@ -2393,7 +2430,7 @@ mod job_limit_error_paths {
                 reason,
                 detail,
             } => {
-                assert_eq!(*kind, LimitKind::Cpu, "the only requested axis");
+                assert_eq!(*kind, LimitKind::Cpu, "the rejected axis");
                 assert_eq!(
                     *reason,
                     LimitReason::Unenforceable,
@@ -2410,6 +2447,58 @@ mod job_limit_error_paths {
             }
             other => panic!("expected a ResourceLimit failure, got {other:?}"),
         }
+    }
+
+    /// Memory and process caps share one extended-limit call. A combined
+    /// rejection follows the documented deterministic rule: memory wins when
+    /// both axes were requested.
+    #[test]
+    fn an_extended_limit_rejection_prefers_memory_over_processes() {
+        let mut group = ProcessGroup::new().expect("an uncapped Job Object group");
+        let faults = Faults::new()
+            .fail_every(SITE, Some(EXTENDED_LIMIT_AXIS), ERROR_ACCESS_DENIED as i32)
+            .arm();
+
+        let err = group
+            .update_limits(ResourceLimits {
+                max_memory: Some(64 << 20),
+                max_processes: Some(8),
+                ..ResourceLimits::default()
+            })
+            .expect_err("the extended-limit write must be surfaced");
+
+        assert_eq!(faults.fired(SITE), 1);
+        assert_eq!(err.limit_kind(), Some(LimitKind::Memory));
+        assert_eq!(err.limit_reason(), Some(LimitReason::Unenforceable));
+        match err.reason() {
+            ErrorReason::ResourceLimit { detail, .. } => {
+                assert!(detail.contains(EXTENDED_LIMIT_AXIS));
+                assert!(detail.contains("Access is denied") || detail.contains("os error"));
+            }
+            other => panic!("expected a ResourceLimit failure, got {other:?}"),
+        }
+    }
+
+    /// When no memory cap is present, a rejected combined extended-limit call
+    /// names processes as the honest axis.
+    #[test]
+    fn an_extended_limit_rejection_uses_processes_without_memory() {
+        let mut group = ProcessGroup::new().expect("an uncapped Job Object group");
+        let faults = Faults::new()
+            .fail_every(SITE, Some(EXTENDED_LIMIT_AXIS), ERROR_ACCESS_DENIED as i32)
+            .arm();
+
+        let err = group
+            .update_limits(ResourceLimits {
+                max_processes: Some(8),
+                cpu_quota: Some(0.5),
+                ..ResourceLimits::default()
+            })
+            .expect_err("the extended-limit write must be surfaced");
+
+        assert_eq!(faults.fired(SITE), 1);
+        assert_eq!(err.limit_kind(), Some(LimitKind::Processes));
+        assert_eq!(err.limit_reason(), Some(LimitReason::Unenforceable));
     }
 
     /// Clearing a CPU cap that was never enabled is rejected with

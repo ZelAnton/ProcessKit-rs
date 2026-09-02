@@ -1970,7 +1970,8 @@ impl RunningProcess {
     /// [`ErrorReason::Teardown`] (terminal timeout/cancellation teardown could not
     /// be confirmed and therefore outranks the ordinary outcome),
     /// [`ErrorReason::Stdin`] (a non-broken-pipe stdin-source failure on an
-    /// otherwise-successful run), or [`ErrorReason::Io`] (waiting on the child failed).
+    /// otherwise-successful run), or [`ErrorReason::Io`] (waiting on the child or
+    /// reading either output pipe failed).
     pub async fn wait(mut self) -> Result<Outcome> {
         Ok(self
             .finish_lines(CaptureMode::Discard, /* expose_counts */ false, |_| {})

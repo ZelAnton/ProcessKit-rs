@@ -208,6 +208,13 @@ pub(crate) mod graceful;
 // syscall behind `force_kill` differs); driven by `crate::running`.
 pub(crate) mod pid_gate;
 
+// The Windows bridge reader shared by merge-pipe and ConPTY. Both synchronous
+// pipe bridges send the same chunk/error messages to an async `AsyncRead`; keep
+// this module Windows-only because neither the message type nor its channel
+// adapter is needed by the reactor-backed Unix readers.
+#[cfg(windows)]
+pub(crate) mod channel_reader;
+
 // The opt-in PTY launch backend (`Command::use_pty`): `openpty` (Unix) /
 // `CreatePseudoConsole` ConPTY (Windows) instead of three pipes, wired into the
 // SAME per-platform containment path as `Job::spawn` (K-032). Compiled only with

@@ -23,7 +23,7 @@ use std::task::{Context, Poll};
 use std::thread::JoinHandle;
 use std::time::Duration;
 
-use tokio::io::{AsyncRead, AsyncWrite, ReadBuf};
+use tokio::io::AsyncWrite;
 use tokio::process::Command;
 use tokio::sync::Notify;
 
@@ -44,6 +44,7 @@ use windows_sys::Win32::System::Threading::{
 };
 
 use crate::sys::SpawnOptions;
+use crate::sys::channel_reader::{ChannelReader, ReaderMessage};
 use crate::sys::pid_gate::PidGate;
 
 use super::{PtyExitStatus, PtyReader, PtySpawn, PtyWriter};
@@ -1074,18 +1075,9 @@ where
         }),
     )?;
     Ok(PendingReader {
-        reader: Some(ChannelReader {
-            rx: std::sync::Mutex::new(rx),
-            leftover: Vec::new(),
-            pos: 0,
-        }),
+        reader: Some(ChannelReader::new(rx)),
         thread: Some(thread),
     })
-}
-
-enum ReaderMessage {
-    Chunk(Vec<u8>),
-    Error(io::Error),
 }
 
 /// No accepted command owns more than this many caller bytes. Together with the
@@ -1288,60 +1280,6 @@ where
         keepalive: Some(keepalive),
         thread: Some(thread),
     })
-}
-
-/// The async read half of the pipe bridge: drains `Vec<u8>` chunks from the reader
-/// thread's channel, carrying any partial chunk across polls.
-///
-/// The `Receiver` is wrapped in a `Mutex` purely so [`ChannelReader`] is `Sync`
-/// (a `tokio` mpsc `Receiver` is `Send` but not `Sync`), which keeps the boxed
-/// [`OutputReader`](crate::running) — and thus [`RunningProcess`](crate::RunningProcess) —
-/// `Sync`. The lock is uncontended (only `poll_read` touches it, and a reader is
-/// polled from one task) and never held across an `.await`.
-struct ChannelReader {
-    rx: std::sync::Mutex<tokio::sync::mpsc::Receiver<ReaderMessage>>,
-    leftover: Vec<u8>,
-    pos: usize,
-}
-
-impl AsyncRead for ChannelReader {
-    fn poll_read(
-        self: Pin<&mut Self>,
-        cx: &mut Context<'_>,
-        buf: &mut ReadBuf<'_>,
-    ) -> Poll<io::Result<()>> {
-        let this = self.get_mut();
-        if this.pos < this.leftover.len() {
-            let start = this.pos;
-            let n = (this.leftover.len() - start).min(buf.remaining());
-            buf.put_slice(&this.leftover[start..start + n]);
-            this.pos += n;
-            return Poll::Ready(Ok(()));
-        }
-        let poll = this
-            .rx
-            .get_mut()
-            .expect("pty reader mutex poisoned")
-            .poll_recv(cx);
-        match poll {
-            Poll::Ready(Some(ReaderMessage::Chunk(chunk))) => {
-                let n = chunk.len().min(buf.remaining());
-                buf.put_slice(&chunk[..n]);
-                if n < chunk.len() {
-                    this.leftover = chunk;
-                    this.pos = n;
-                } else {
-                    this.leftover.clear();
-                    this.pos = 0;
-                }
-                Poll::Ready(Ok(()))
-            }
-            Poll::Ready(Some(ReaderMessage::Error(error))) => Poll::Ready(Err(error)),
-            // The reader thread ended (pipe EOF) — clean end of stream.
-            Poll::Ready(None) => Poll::Ready(Ok(())),
-            Poll::Pending => Poll::Pending,
-        }
-    }
 }
 
 type WriterReserveFuture = Pin<
@@ -2229,11 +2167,7 @@ mod tests {
             .await
             .expect("queue read failure");
         drop(tx);
-        let mut reader = ChannelReader {
-            rx: std::sync::Mutex::new(rx),
-            leftover: Vec::new(),
-            pos: 0,
-        };
+        let mut reader = ChannelReader::new(rx);
         let mut captured = Vec::new();
         let error = reader
             .read_to_end(&mut captured)
