@@ -4188,7 +4188,6 @@ mod tests {
         // Mirror the retire-before-pid-delivery handoff in `drive_to_exit_inner`
         // and `wait_exit` before entering shared-group graceful teardown.
         run.pid_gate.retire();
-        tokio::time::pause();
         let faults = crate::sys::fault_injection::Faults::new()
             .fail_every(
                 crate::sys::fault_injection::Site::DirectChildKill,
@@ -4196,31 +4195,16 @@ mod tests {
                 5,
             )
             .arm();
-        let grace = Duration::from_secs(1);
+        // Keep wall-clock time active while awaiting the real OS child. A paused
+        // current-thread runtime cannot portably drive an externally armed PTY
+        // process wait on macOS, even when a sibling future advances the clock.
+        // The short grace still exercises both teardown boundaries; the bounded
+        // reap timeout remains the dominant wait and proves the failure path.
+        let grace = Duration::from_millis(50);
         let started = tokio::time::Instant::now();
-
-        // Drive both timeout boundaries explicitly. Tokio's paused clock normally
-        // auto-advances when the executor is otherwise idle, but an OS-backed PTY
-        // wait can keep the macOS process driver externally armed and suppress
-        // that heuristic. Advancing in bounded steps also lets each timeout arm
-        // before the next step; one large advance can otherwise race past the
-        // second timeout before escalation has installed it.
-        let failure = {
-            let teardown =
-                run.graceful_teardown(grace, crate::sys::SIGTERM_RAW, TeardownCause::Cancellation);
-            let clock = async {
-                loop {
-                    tokio::task::yield_now().await;
-                    tokio::time::advance(Duration::from_millis(100)).await;
-                }
-            };
-            tokio::pin!(teardown);
-            tokio::select! {
-                biased;
-                failure = &mut teardown => failure,
-                () = clock => unreachable!("the clock driver never completes"),
-            }
-        };
+        let failure = run
+            .graceful_teardown(grace, crate::sys::SIGTERM_RAW, TeardownCause::Cancellation)
+            .await;
         let failure =
             failure.expect_err("the injected hard escalation must leave reap unconfirmed");
         assert_eq!(failure.cause, TeardownCause::Cancellation);
