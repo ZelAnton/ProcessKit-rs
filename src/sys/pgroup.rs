@@ -298,7 +298,10 @@ fn recycled_during_adoption(pid: i32) -> io::Error {
 /// - **Linux / Android** — `/proc/<pid>/stat` field 3 (state); live is any state
 ///   other than `Z` (zombie) or `X`/`x` (dead).
 /// - **macOS / the other Apple targets** — `proc_pidinfo(PROC_PIDTBSDINFO)`'s
-///   `pbi_status`; live is `SIDL`/`SRUN`/`SSLEEP`/`SSTOP`, never `SZOMB`.
+///   `pbi_status`; live is `SIDL`/`SRUN`/`SSLEEP`/`SSTOP`, never `SZOMB`. Apple
+///   can remove a zombie from the ordinary proc lookup before its parent reaps
+///   it, so a short fill is followed by a non-reaping `waitid(WNOWAIT)` probe
+///   when the pid names one of this process's children.
 /// - **the BSDs (and any other unix)** — no wired-up state reader (the same
 ///   per-OS `sysctl(KERN_PROC)` divergence that blocks `read_identity` there), so
 ///   the state is always unknown: delivery `EPERM` keeps its pre-existing
@@ -338,8 +341,10 @@ pub(crate) fn process_state(pid: i32) -> ProcessState {
     // `proc_pidinfo(PROC_PIDTBSDINFO)` fills a `proc_bsdinfo` whose `pbi_status` is
     // the BSD run state. A full-size fill whose status is a live value
     // (SIDL/SRUN/SSLEEP/SSTOP — never SZOMB) is a genuinely-alive process. A
-    // short/failed read may mean either gone or unreadable, so only a full fill
-    // can produce a conclusive state.
+    // short/failed read may mean either gone or unreadable. In particular, Apple
+    // removes an exited child from this ordinary proc lookup while its wait
+    // status is still owned by the parent, so `waitid(WNOWAIT)` supplies the
+    // missing non-reaping child-state verdict below.
     // SAFETY: `proc_bsdinfo` is plain-old-data (integers and byte arrays), for
     // which an all-zero bit pattern is a valid initialized value.
     let mut info: libc::proc_bsdinfo = unsafe { std::mem::zeroed() };
@@ -355,12 +360,39 @@ pub(crate) fn process_state(pid: i32) -> ProcessState {
             want,
         )
     };
-    if got != want {
+    if got == want {
+        return match info.pbi_status {
+            libc::SIDL | libc::SRUN | libc::SSLEEP | libc::SSTOP => ProcessState::Live,
+            libc::SZOMB => ProcessState::ZombieOrDead,
+            _ => ProcessState::Unknown,
+        };
+    }
+
+    // `WNOWAIT` observes an exited direct child without consuming its wait
+    // status, preserving the owned Child's sole-reaper contract. A zero si_pid
+    // means the matching child exists but has no waitable exit yet. `ECHILD` (an
+    // adopted/non-child pid, or one already reaped) and every other failure stay
+    // unknown so callers retain their conservative fallback.
+    // SAFETY: siginfo_t accepts all-zero initialization; that also gives the
+    // WNOHANG no-status case its required zero si_pid on implementations that
+    // leave the buffer untouched. WNOWAIT prevents a reap.
+    let mut wait_info: libc::siginfo_t = unsafe { std::mem::zeroed() };
+    let waited = unsafe {
+        libc::waitid(
+            libc::P_PID,
+            pid as libc::id_t,
+            std::ptr::addr_of_mut!(wait_info),
+            libc::WEXITED | libc::WNOHANG | libc::WNOWAIT,
+        )
+    };
+    if waited != 0 {
         return ProcessState::Unknown;
     }
-    match info.pbi_status {
-        libc::SIDL | libc::SRUN | libc::SSLEEP | libc::SSTOP => ProcessState::Live,
-        libc::SZOMB => ProcessState::ZombieOrDead,
+    // SAFETY: a successful waitid initialized the siginfo_t. With WNOHANG, zero
+    // is the specified "matching child exists but no status is available" result.
+    match unsafe { wait_info.si_pid() } {
+        0 => ProcessState::Live,
+        observed if observed == pid => ProcessState::ZombieOrDead,
         _ => ProcessState::Unknown,
     }
 }
