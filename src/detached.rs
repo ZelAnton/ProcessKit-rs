@@ -10,7 +10,8 @@ mod reaper {
     use std::sync::{Mutex, MutexGuard, OnceLock};
     use std::time::Duration;
 
-    const POLL_INTERVAL: Duration = Duration::from_millis(10);
+    const INITIAL_POLL_INTERVAL: Duration = Duration::from_millis(10);
+    const MAX_POLL_INTERVAL: Duration = Duration::from_secs(1);
 
     enum ReaperMessage {
         Probe,
@@ -133,7 +134,7 @@ mod reaper {
                 Err(source) if is_already_reaped(&source) => return first_error,
                 Err(source) => {
                     first_error.get_or_insert(source);
-                    std::thread::sleep(POLL_INTERVAL);
+                    std::thread::sleep(INITIAL_POLL_INTERVAL);
                 }
             }
         }
@@ -205,24 +206,51 @@ mod reaper {
         }
     }
 
-    fn receive(message: ReaperMessage, children: &mut Vec<Child>) {
-        if let ReaperMessage::Child(child) = message {
-            children.push(child);
+    fn receive(message: ReaperMessage, children: &mut Vec<Child>) -> bool {
+        match message {
+            ReaperMessage::Child(child) => {
+                children.push(child);
+                true
+            }
+            ReaperMessage::Probe => false,
         }
     }
 
+    fn next_poll_interval(current: Duration) -> Duration {
+        current.saturating_mul(2).min(MAX_POLL_INTERVAL)
+    }
+
     fn reap_loop(receiver: Receiver<ReaperMessage>) {
+        reap_loop_with(receiver, reap_finished);
+    }
+
+    fn reap_loop_with(receiver: Receiver<ReaperMessage>, mut reap: impl FnMut(&mut Vec<Child>)) {
         let mut children = Vec::new();
+        let mut poll_interval = INITIAL_POLL_INTERVAL;
         loop {
             if children.is_empty() {
+                poll_interval = INITIAL_POLL_INTERVAL;
                 match receiver.recv() {
-                    Ok(message) => receive(message, &mut children),
+                    Ok(message) => {
+                        receive(message, &mut children);
+                    }
                     Err(_) => return,
                 }
             } else {
-                match receiver.recv_timeout(POLL_INTERVAL) {
-                    Ok(message) => receive(message, &mut children),
-                    Err(mpsc::RecvTimeoutError::Timeout) => {}
+                match receiver.recv_timeout(poll_interval) {
+                    Ok(message) => {
+                        if receive(message, &mut children) {
+                            // A new child needs the short first interval so a
+                            // just-launched process cannot sit unobserved at
+                            // the current long backoff.
+                            poll_interval = INITIAL_POLL_INTERVAL;
+                        }
+                    }
+                    Err(mpsc::RecvTimeoutError::Timeout) => {
+                        reap(&mut children);
+                        poll_interval = next_poll_interval(poll_interval);
+                        continue;
+                    }
                     Err(mpsc::RecvTimeoutError::Disconnected) => {
                         // The sender is process-global and normally never drops;
                         // if that invariant changes, finish every owned child
@@ -235,18 +263,22 @@ mod reaper {
                 }
             }
 
-            reap_finished(&mut children);
+            reap(&mut children);
         }
     }
 
     #[cfg(test)]
     mod tests {
         use super::{
-            ReaperState, is_already_reaped, lock_reaper, reap_finished, wait_until_reaped,
+            INITIAL_POLL_INTERVAL, MAX_POLL_INTERVAL, ReaperMessage, ReaperState,
+            is_already_reaped, lock_reaper, next_poll_interval, reap_finished, reap_loop_with,
+            wait_until_reaped,
         };
         use std::io;
         use std::process::{Child, Command, Stdio};
-        use std::sync::Mutex;
+        use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
+        use std::sync::{Arc, Mutex, mpsc};
+        use std::thread;
         use std::time::{Duration, Instant};
 
         const HELPER_ENV: &str = "PROCESSKIT_DETACHED_ECHILD_HELPER";
@@ -462,6 +494,91 @@ mod reaper {
                     .recv()
                     .expect("replacement receives the sole owner"),
                 TestMessage::Child(41)
+            );
+        }
+
+        #[test]
+        fn poll_interval_grows_and_stays_bounded() {
+            let mut interval = INITIAL_POLL_INTERVAL;
+            let expected = [
+                Duration::from_millis(10),
+                Duration::from_millis(20),
+                Duration::from_millis(40),
+                Duration::from_millis(80),
+                Duration::from_millis(160),
+                Duration::from_millis(320),
+                Duration::from_millis(640),
+                Duration::from_secs(1),
+            ];
+
+            for expected in expected {
+                assert_eq!(interval, expected);
+                interval = next_poll_interval(interval);
+            }
+            assert_eq!(interval, MAX_POLL_INTERVAL);
+            assert_eq!(next_poll_interval(MAX_POLL_INTERVAL), MAX_POLL_INTERVAL);
+        }
+
+        #[test]
+        fn live_child_polling_uses_backoff() {
+            let (sender, receiver) = mpsc::channel();
+            let polls = Arc::new(AtomicUsize::new(0));
+            let stop = Arc::new(AtomicBool::new(false));
+            let killed = Arc::new(AtomicBool::new(false));
+            let worker_polls = Arc::clone(&polls);
+            let worker_stop = Arc::clone(&stop);
+            let worker_killed = Arc::clone(&killed);
+            let worker = thread::spawn(move || {
+                reap_loop_with(receiver, move |children| {
+                    worker_polls.fetch_add(1, Ordering::Relaxed);
+                    if worker_stop.load(Ordering::Relaxed)
+                        && let Some(child) = children.first_mut()
+                    {
+                        let _ = child.kill();
+                        worker_killed.store(true, Ordering::Relaxed);
+                    }
+                    reap_finished(children);
+                });
+            });
+
+            let child = Command::new("sleep")
+                .arg("5")
+                .stdin(Stdio::null())
+                .stdout(Stdio::null())
+                .stderr(Stdio::null())
+                .spawn()
+                .expect("spawn a live child");
+            sender
+                .send(ReaperMessage::Child(child))
+                .expect("send the live child to the test reaper");
+
+            // The fixed 10ms loop would make roughly one hundred reap attempts;
+            // the bounded schedule reaches only its seventh attempt here.
+            thread::sleep(Duration::from_secs(1));
+            let observed = polls.load(Ordering::Relaxed);
+            assert!(
+                !killed.load(Ordering::Relaxed),
+                "the child must still be live during sampling"
+            );
+
+            stop.store(true, Ordering::Relaxed);
+            sender
+                .send(ReaperMessage::Probe)
+                .expect("wake the test reaper");
+            drop(sender);
+            worker.join().expect("test reaper thread must exit");
+            assert!(
+                killed.load(Ordering::Relaxed),
+                "the test must kill the child after sampling"
+            );
+
+            assert!(
+                observed >= 5,
+                "a live child should be sampled repeatedly, only observed {observed} polls"
+            );
+            assert!(
+                observed < 20,
+                "polling should back off for a live child, observed {observed} polls"
             );
         }
 
