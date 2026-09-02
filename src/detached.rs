@@ -6,35 +6,114 @@
 mod reaper {
     use std::io;
     use std::process::Child;
-    use std::sync::OnceLock;
     use std::sync::mpsc::{self, Receiver, Sender};
+    use std::sync::{Mutex, MutexGuard, OnceLock};
     use std::time::Duration;
 
     const POLL_INTERVAL: Duration = Duration::from_millis(10);
 
+    enum ReaperMessage {
+        Probe,
+        Child(Child),
+    }
+
+    struct ReaperState<T> {
+        sender: Option<Sender<T>>,
+    }
+
+    struct ReaperSendError<T> {
+        message: T,
+        source: io::Error,
+    }
+
+    impl<T> ReaperState<T> {
+        const fn new() -> Self {
+            Self { sender: None }
+        }
+
+        fn start_with(
+            &mut self,
+            start: &mut impl FnMut(Receiver<T>) -> io::Result<()>,
+        ) -> io::Result<()> {
+            if self.sender.is_some() {
+                return Ok(());
+            }
+
+            let (sender, receiver) = mpsc::channel();
+            start(receiver)?;
+            self.sender = Some(sender);
+            Ok(())
+        }
+
+        /// Send through the current manager, replacing one receiver that closed
+        /// after an earlier successful start. The returned error keeps ownership
+        /// of the unsent message when even the replacement cannot accept it.
+        fn send_with(
+            &mut self,
+            mut message: T,
+            mut start: impl FnMut(Receiver<T>) -> io::Result<()>,
+        ) -> Result<(), ReaperSendError<T>> {
+            for attempt in 0..=1 {
+                if let Err(source) = self.start_with(&mut start) {
+                    return Err(ReaperSendError { message, source });
+                }
+
+                let sender = self.sender.as_ref().expect("reaper sender installed");
+                match sender.send(message) {
+                    Ok(()) => return Ok(()),
+                    Err(mpsc::SendError(returned)) => {
+                        message = returned;
+                        self.sender = None;
+                        if attempt == 1 {
+                            return Err(ReaperSendError {
+                                message,
+                                source: io::Error::new(
+                                    io::ErrorKind::BrokenPipe,
+                                    "detached reaper channel disconnected after restart",
+                                ),
+                            });
+                        }
+                    }
+                }
+            }
+
+            unreachable!("reaper send performs one initial and one replacement attempt")
+        }
+    }
+
     // One manager owns every detached `Child`. Keeping the `Child` in this
     // process is what makes it the only path allowed to consume the child's
     // wait status; the caller only ever receives the stable spawn-time pid.
-    static SENDER: OnceLock<Result<Sender<Child>, String>> = OnceLock::new();
+    static REAPER: OnceLock<Mutex<ReaperState<ReaperMessage>>> = OnceLock::new();
 
-    fn sender() -> io::Result<&'static Sender<Child>> {
-        match SENDER.get_or_init(|| {
-            let (sender, receiver) = mpsc::channel();
-            std::thread::Builder::new()
-                .name("processkit-detached-reaper".into())
-                .spawn(move || reap_loop(receiver))
-                .map(|_| sender)
-                .map_err(|source| format!("could not start detached reaper: {source}"))
-        }) {
-            Ok(sender) => Ok(sender),
-            Err(message) => Err(io::Error::other(message.clone())),
-        }
+    fn reaper_state() -> &'static Mutex<ReaperState<ReaperMessage>> {
+        REAPER.get_or_init(|| Mutex::new(ReaperState::new()))
+    }
+
+    fn lock_reaper<T>(reaper: &Mutex<ReaperState<T>>) -> MutexGuard<'_, ReaperState<T>> {
+        // `handoff` may already own the sole `Child`; poison cannot abort reaping it.
+        reaper
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner())
+    }
+
+    fn start_reaper(receiver: Receiver<ReaperMessage>) -> io::Result<()> {
+        std::thread::Builder::new()
+            .name("processkit-detached-reaper".into())
+            .spawn(move || reap_loop(receiver))
+            .map(|_| ())
+            .map_err(|source| {
+                io::Error::other(format!("could not start detached reaper: {source}"))
+            })
     }
 
     /// Start the manager before spawning the child, so a thread-resource failure
     /// cannot leave an already-launched child without a reaping owner.
     pub(super) fn prepare() -> io::Result<()> {
-        sender().map(|_| ())
+        let mut state = lock_reaper(reaper_state());
+        state
+            .send_with(ReaperMessage::Probe, start_reaper)
+            .map_err(|error| error.source)
     }
 
     fn is_already_reaped(source: &io::Error) -> bool {
@@ -105,37 +184,44 @@ mod reaper {
         }
     }
 
-    /// Transfer the only `Child` handle to the manager. The synchronous fallback
-    /// is defensive: `prepare` makes this path unreachable unless the manager
-    /// unexpectedly stops after initialization, but it still prevents a zombie
-    /// if that invariant is ever broken.
+    /// Transfer the only `Child` handle to the manager. A receiver that stopped
+    /// after `prepare` is replaced before the synchronous fallback is considered.
     pub(super) fn handoff(child: Child) -> io::Result<()> {
-        let sender = match sender() {
-            Ok(sender) => sender,
-            Err(source) => {
-                return Err(finish_failed_handoff(child, source));
-            }
+        let result = {
+            let mut state = lock_reaper(reaper_state());
+            state.send_with(ReaperMessage::Child(child), start_reaper)
         };
-        match sender.send(child) {
+
+        match result {
             Ok(()) => Ok(()),
-            Err(mpsc::SendError(child)) => Err(finish_failed_handoff(
-                child,
-                io::Error::other("detached reaper stopped unexpectedly"),
-            )),
+            Err(ReaperSendError {
+                message: ReaperMessage::Child(child),
+                source,
+            }) => Err(finish_failed_handoff(child, source)),
+            Err(ReaperSendError {
+                message: ReaperMessage::Probe,
+                ..
+            }) => unreachable!("handoff always sends a child"),
         }
     }
 
-    fn reap_loop(receiver: Receiver<Child>) {
+    fn receive(message: ReaperMessage, children: &mut Vec<Child>) {
+        if let ReaperMessage::Child(child) = message {
+            children.push(child);
+        }
+    }
+
+    fn reap_loop(receiver: Receiver<ReaperMessage>) {
         let mut children = Vec::new();
         loop {
             if children.is_empty() {
                 match receiver.recv() {
-                    Ok(child) => children.push(child),
+                    Ok(message) => receive(message, &mut children),
                     Err(_) => return,
                 }
             } else {
                 match receiver.recv_timeout(POLL_INTERVAL) {
-                    Ok(child) => children.push(child),
+                    Ok(message) => receive(message, &mut children),
                     Err(mpsc::RecvTimeoutError::Timeout) => {}
                     Err(mpsc::RecvTimeoutError::Disconnected) => {
                         // The sender is process-global and normally never drops;
@@ -155,14 +241,23 @@ mod reaper {
 
     #[cfg(test)]
     mod tests {
-        use super::{is_already_reaped, reap_finished, wait_until_reaped};
+        use super::{
+            ReaperState, is_already_reaped, lock_reaper, reap_finished, wait_until_reaped,
+        };
         use std::io;
         use std::process::{Child, Command, Stdio};
+        use std::sync::Mutex;
         use std::time::{Duration, Instant};
 
         const HELPER_ENV: &str = "PROCESSKIT_DETACHED_ECHILD_HELPER";
         const PROACTIVE_HELPER: &str = "detached::reaper::tests::proactive_echild_helper_process";
         const FALLBACK_HELPER: &str = "detached::reaper::tests::fallback_echild_helper_process";
+
+        #[derive(Debug, PartialEq, Eq)]
+        enum TestMessage {
+            Probe,
+            Child(u64),
+        }
 
         struct SigchldDisposition {
             original: libc::sigaction,
@@ -288,6 +383,117 @@ mod reaper {
                 libc::EINTR
             )));
             assert!(!is_already_reaped(&io::Error::other("retry")));
+        }
+
+        #[test]
+        fn transient_reaper_start_failure_is_retried() {
+            let mut state = ReaperState::new();
+            let mut starts = 0;
+            let first = state.send_with(TestMessage::Probe, |_| {
+                starts += 1;
+                Err(io::Error::new(
+                    io::ErrorKind::WouldBlock,
+                    "injected thread-resource exhaustion",
+                ))
+            });
+            let first = first.expect_err("the injected first start must fail");
+            assert_eq!(first.source.kind(), io::ErrorKind::WouldBlock);
+            assert_eq!(first.message, TestMessage::Probe);
+            assert!(
+                state.sender.is_none(),
+                "a failed start must not install a permanently failed sender"
+            );
+
+            let mut receiver = None;
+            assert!(
+                state
+                    .send_with(TestMessage::Probe, |started| {
+                        starts += 1;
+                        receiver = Some(started);
+                        Ok(())
+                    })
+                    .is_ok(),
+                "the next call must retry and use the replacement manager"
+            );
+            assert_eq!(starts, 2, "one failed and one successful start are enough");
+            let receiver = receiver.expect("capture the successful receiver");
+            assert_eq!(
+                receiver.recv().expect("receive the retry probe"),
+                TestMessage::Probe
+            );
+
+            assert!(
+                state
+                    .send_with(TestMessage::Probe, |_| {
+                        panic!("an open manager must be reused")
+                    })
+                    .is_ok()
+            );
+            assert_eq!(
+                receiver.recv().expect("receive the reuse probe"),
+                TestMessage::Probe
+            );
+        }
+
+        #[test]
+        fn closed_receiver_is_replaced_without_losing_ownership() {
+            let (closed_sender, closed_receiver) = std::sync::mpsc::channel();
+            drop(closed_receiver);
+            let mut state = ReaperState {
+                sender: Some(closed_sender),
+            };
+            let mut replacement = None;
+            let mut starts = 0;
+
+            assert!(
+                state
+                    .send_with(TestMessage::Child(41), |receiver| {
+                        starts += 1;
+                        replacement = Some(receiver);
+                        Ok(())
+                    })
+                    .is_ok(),
+                "the returned sole owner must be sent to a replacement manager"
+            );
+            assert_eq!(starts, 1, "only the disconnected receiver is replaced");
+            assert_eq!(
+                replacement
+                    .expect("replacement receiver")
+                    .recv()
+                    .expect("replacement receives the sole owner"),
+                TestMessage::Child(41)
+            );
+        }
+
+        #[test]
+        fn poisoned_reaper_state_still_accepts_a_handoff() {
+            let state = Mutex::new(ReaperState::<TestMessage>::new());
+            let poison = std::panic::catch_unwind(|| {
+                let _held = state.lock().expect("lock fresh reaper state");
+                panic!("poison the reaper state");
+            });
+            assert!(poison.is_err(), "the setup panic must be caught");
+            assert!(state.is_poisoned(), "the mutex must exercise recovery");
+
+            let mut receiver = None;
+            let mut state = lock_reaper(&state);
+            assert!(
+                state
+                    .send_with(TestMessage::Child(73), |started| {
+                        receiver = Some(started);
+                        Ok(())
+                    })
+                    .is_ok(),
+                "poison must not discard the sole child owner"
+            );
+            drop(state);
+            assert_eq!(
+                receiver
+                    .expect("receiver after poison recovery")
+                    .recv()
+                    .expect("receive the handoff after poison recovery"),
+                TestMessage::Child(73)
+            );
         }
 
         #[test]
