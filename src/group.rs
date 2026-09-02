@@ -296,8 +296,7 @@ impl ProcessGroup {
     ) -> Result<crate::sys::pty::PtySpawn> {
         #[cfg(windows)]
         {
-            return self
-                .job
+            self.job
                 .spawn_pty(cmd, opts, env)
                 .map_err(|source| Error::spawn(program_name(cmd), source));
         }

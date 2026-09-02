@@ -396,7 +396,7 @@ impl Job {
         debug_assert!(opts.use_pty, "spawn_pty requires SpawnOptions::use_pty");
         #[cfg(windows)]
         {
-            return self.0.spawn_pty(cmd, opts, env);
+            self.0.spawn_pty(cmd, opts, env)
         }
         #[cfg(not(windows))]
         self.0.spawn_pty(cmd, opts)
