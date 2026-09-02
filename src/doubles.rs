@@ -45,7 +45,7 @@
 //! A scripted handle also supports [`RunningProcess::shutdown`](crate::RunningProcess::shutdown)
 //! without pretending it owns an OS process group. A normal reply preserves its
 //! natural outcome; [`Reply::pending`] waits through the requested grace and then
-//! resolves as [`Outcome::Signalled(None)`], modeling the hard-kill fallback. No OS
+//! resolves as [`Outcome::Signalled`], modeling the hard-kill fallback. No OS
 //! signal is delivered to the double, so the soft phase is only a deterministic
 //! grace-window wait. Real shared-group handles retain their `Unsupported`
 //! diagnostic because they still must not tear down a caller's other children.
