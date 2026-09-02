@@ -4225,7 +4225,21 @@ mod tests {
 
         drop(faults);
         group.kill_all().expect("cleanup shared group");
-        run.backend_wait().await.expect("cleanup child reap");
+        // The assertion above deliberately leaves the owned child alive. A
+        // process-group sweep is still the right first cleanup because it reaches
+        // descendants, but it is not a terminal-state proof for the direct child:
+        // Darwin can complete that group delivery without making the PTY child
+        // immediately waitable. Use the owned handle as the backstop and bound
+        // the reap so a cleanup race produces a useful failure instead of a
+        // nextest-level hang.
+        run.start_kill().expect("direct-child cleanup kill");
+        tokio::time::timeout(PUMP_TEARDOWN, run.backend_wait())
+            .await
+            .expect("direct-child cleanup reap must stay bounded")
+            .expect("cleanup child reap");
+        group
+            .kill_all()
+            .expect("cleanup descendants after direct-child reap");
         let _ = std::fs::remove_file(marker);
     }
 
