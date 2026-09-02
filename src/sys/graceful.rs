@@ -277,9 +277,12 @@ pub(crate) trait PidTarget {
     /// already exited, `EPERM`) is swallowed — the driver proceeds to poll.
     fn signal(&self, signal: i32);
 
-    /// Whether the child is still alive — i.e. not yet exited *and reaped*.
-    /// Returning `false` both ends the grace early and suppresses the final
-    /// hard kill, so a reaped-and-recycled pid is never signalled.
+    /// Whether the child is still running. State-capable Unix targets exclude
+    /// an exited-but-unreaped zombie; targets without a state reader conservatively
+    /// retain the signal-0 existence probe and cannot make that distinction.
+    /// Returning `false` both ends the grace early and suppresses the final hard
+    /// kill. The owner cannot free the pid while this gated check runs, and a reap
+    /// retires the gate before any later signal can use a recycled pid.
     fn is_alive(&self) -> bool;
 
     /// Force a surviving child down (`SIGKILL`). Best-effort; a no-op if it is
@@ -307,9 +310,11 @@ pub(crate) trait PidTarget {
 /// to tokio's orphan reaper, which would free the pid without retiring the gate.
 ///
 /// When the child instead exits *on* the signal, [`is_alive`](PidTarget::is_alive)
-/// flips to `false` and the driver returns **without** the hard kill: the reap
-/// has already reclaimed the pid, so a `SIGKILL` there could hit an unrelated
-/// process that recycled it.
+/// flips to `false` and the driver returns **without** the hard kill. On targets
+/// with a state reader this includes an unreaped zombie: the owner still holds
+/// the pid, so it cannot be recycled, and the later reap retires the gate. On
+/// targets without a state reader the signal-0 fallback retains the historical
+/// behavior and can only stand down after the owner retires the gate.
 ///
 /// `grace` is clamped to [`crate::MAX_DEADLINE`] so a `Duration::MAX`-ish value
 /// can't overflow `Instant + Duration` and panic mid-teardown.
@@ -343,7 +348,8 @@ pub(crate) async fn run_pid(target: &impl PidTarget, signal: i32, grace: Duratio
             break; // grace elapsed with the child still around → hard kill below
         }
         if !target.is_alive() {
-            // exited (and reaped) within the grace → skip the SIGKILL
+            // Exited within the grace (possibly an unreaped zombie on a target
+            // with a state reader) → skip the SIGKILL.
             #[cfg(feature = "metrics")]
             crate::metrics::record_teardown("drained");
             #[cfg(feature = "tracing")]
@@ -409,6 +415,30 @@ impl UnixChild {
     }
 }
 
+/// Resolve direct-child liveness from the exact state reader when one exists,
+/// otherwise from the historical signal-0 existence probe. Keeping the fallback
+/// lazy is load-bearing: a zombie is still an existing pid, so probing after an
+/// exact `Some(false)` would turn the zombie back into a false live verdict.
+#[cfg(unix)]
+fn live_state_or_existence_probe(
+    live_non_zombie: Option<bool>,
+    exists: impl FnOnce() -> bool,
+) -> bool {
+    live_non_zombie.unwrap_or_else(exists)
+}
+
+/// Whether `pid` still names a process according to the portable Unix signal-0
+/// probe. This cannot distinguish a zombie from a running process and is used by
+/// [`UnixChild`] only on targets without the shared backend's state reader.
+#[cfg(unix)]
+fn pid_exists(pid: u32) -> bool {
+    // SAFETY: signal 0 performs an existence/permission check without delivering
+    // a signal. `ESRCH` means gone; `EPERM` means the process exists but cannot be
+    // signalled by this user.
+    let rc = unsafe { libc::kill(pid as i32, 0) };
+    rc == 0 || std::io::Error::last_os_error().raw_os_error() == Some(libc::EPERM)
+}
+
 #[cfg(unix)]
 impl PidTarget for UnixChild {
     fn signal(&self, signal: i32) {
@@ -423,17 +453,18 @@ impl PidTarget for UnixChild {
     }
 
     fn is_alive(&self) -> bool {
-        // A retired pid is gone by definition, whatever `kill(pid, 0)` says about
+        // A retired pid is gone by definition, whatever an OS probe says about
         // whoever recycled it — `with_live_pid` returns the `false` default when
-        // the gate is retired, which is the check that stops a recycled-pid
-        // `SIGKILL`.
+        // the gate is retired, which is the check that stops a recycled-pid kill.
+        // While the closure runs the owner cannot reap, so a negative state read
+        // refers to this child (usually its unreaped zombie), never a recycled pid.
         self.gate.with_live_pid(false, |pid| {
-            // SAFETY: signal 0 is a pure existence probe. `ESRCH` → gone; `EPERM`
-            // → alive but unsignallable (a uid-changed child) — treat as exists so
-            // a still-live tree is not abandoned; any other rc is treated as
-            // alive.
-            let rc = unsafe { libc::kill(pid as i32, 0) };
-            rc == 0 || std::io::Error::last_os_error().raw_os_error() == Some(libc::EPERM)
+            #[cfg(any(target_os = "linux", target_os = "android", target_vendor = "apple"))]
+            let live_non_zombie = Some(super::pgroup::is_live_non_zombie(pid as i32));
+            #[cfg(not(any(target_os = "linux", target_os = "android", target_vendor = "apple")))]
+            let live_non_zombie = None;
+
+            live_state_or_existence_probe(live_non_zombie, || pid_exists(pid))
         })
     }
 
@@ -853,6 +884,116 @@ mod tests {
             target.hard_kills.load(Ordering::Relaxed),
             0,
             "an already-gone child is not force-killed"
+        );
+    }
+
+    // The exact state verdict must win over the portable existence probe: an
+    // unreaped zombie still answers signal 0, so consulting the fallback after a
+    // state-reader `false` would recreate the bug. Conversely, a positive state
+    // verdict is sufficient without the fallback too. Hermetic and exhaustive for
+    // the state-reader half of `UnixChild::is_alive` — no subprocess or timing.
+    #[cfg(unix)]
+    #[test]
+    fn exact_live_state_bypasses_the_existence_fallback() {
+        let fallback_calls = AtomicUsize::new(0);
+        let zombie = live_state_or_existence_probe(Some(false), || {
+            fallback_calls.fetch_add(1, Ordering::Relaxed);
+            true // a zombie still exists according to signal 0
+        });
+        let live = live_state_or_existence_probe(Some(true), || {
+            fallback_calls.fetch_add(1, Ordering::Relaxed);
+            false
+        });
+
+        assert!(!zombie, "an exact zombie verdict is not live");
+        assert!(live, "an exact running verdict is live");
+        assert_eq!(
+            fallback_calls.load(Ordering::Relaxed),
+            0,
+            "a platform state verdict must never be overwritten by signal 0"
+        );
+    }
+
+    // Bare BSD has no state reader, so it deliberately keeps the old signal-0
+    // semantics. Drive both probe results through the same resolver on every Unix
+    // host; this keeps the fallback deterministic and CI-visible even when CI runs
+    // on Linux rather than a BSD.
+    #[cfg(unix)]
+    #[test]
+    fn missing_live_state_uses_the_existence_fallback() {
+        let fallback_calls = AtomicUsize::new(0);
+        let existing = live_state_or_existence_probe(None, || {
+            fallback_calls.fetch_add(1, Ordering::Relaxed);
+            true
+        });
+        let gone = live_state_or_existence_probe(None, || {
+            fallback_calls.fetch_add(1, Ordering::Relaxed);
+            false
+        });
+
+        assert!(existing, "signal 0 success remains live on bare BSD");
+        assert!(!gone, "signal 0 ESRCH remains gone on bare BSD");
+        assert_eq!(
+            fallback_calls.load(Ordering::Relaxed),
+            2,
+            "a missing state reader delegates every verdict to the fallback"
+        );
+    }
+
+    // End-to-end regression for the production `UnixChild` target. Hold a direct
+    // child un-reaped after it exits, prove both halves of the interesting state
+    // (`is_live_non_zombie == false`, signal 0 still succeeds), then run the real
+    // driver on a paused clock. The exact state reader must report a drain before
+    // the first sleep, so virtual time remains at zero; restoring the old signal-0
+    // implementation advances the full grace and takes the escalation branch.
+    #[cfg(any(target_os = "linux", target_os = "android", target_vendor = "apple"))]
+    #[test]
+    #[ignore = "spawns a real subprocess and holds it as an unreaped zombie"]
+    fn an_unreaped_zombie_ends_the_grace_without_escalation() {
+        let mut child = std::process::Command::new("sh")
+            .arg("-c")
+            .arg("exit 0")
+            .spawn()
+            .expect("spawn short-lived child");
+        let pid = child.id();
+
+        let mut observed_zombie = false;
+        for _ in 0..500 {
+            let non_zombie = super::super::pgroup::is_live_non_zombie(pid as i32);
+            // SAFETY: signal 0 does not deliver a signal. Its success distinguishes
+            // the held zombie from a child that was unexpectedly reaped and gone.
+            let still_exists = unsafe { libc::kill(pid as i32, 0) } == 0;
+            if !non_zombie && still_exists {
+                observed_zombie = true;
+                break;
+            }
+            std::thread::sleep(Duration::from_millis(10));
+        }
+
+        let elapsed = observed_zombie.then(|| {
+            let target = UnixChild::new(std::sync::Arc::new(PidGate::new(Some(pid))));
+            tokio::runtime::Builder::new_current_thread()
+                .enable_time()
+                .start_paused(true)
+                .build()
+                .expect("build paused runtime")
+                .block_on(async {
+                    let started = Instant::now();
+                    run_pid(&target, libc::SIGTERM, Duration::from_secs(10)).await;
+                    started.elapsed()
+                })
+        });
+
+        // Reap before asserting so even a failed regression check leaves no zombie.
+        child.wait().expect("reap held zombie");
+        assert!(
+            observed_zombie,
+            "the child never became an observable zombie"
+        );
+        assert_eq!(
+            elapsed,
+            Some(Duration::ZERO),
+            "a zombie must classify as drained before the driver sleeps or escalates"
         );
     }
 

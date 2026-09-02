@@ -289,6 +289,10 @@ fn recycled_during_adoption(pid: i32) -> io::Error {
 /// actual run state after the `EPERM`. Only a *positive* live/non-zombie answer
 /// surfaces the error; a zombie, a since-reaped/gone pid, or a target without a
 /// state reader all report `false`, so a normal teardown is never falsely failed.
+/// The direct-child graceful driver reuses the same reader on state-capable
+/// targets: there, `false` also lets an unreaped zombie end its grace without a
+/// meaningless hard-kill escalation. Its pid gate prevents reap/reuse while that
+/// state is inspected.
 ///
 /// Availability mirrors [`read_identity`]:
 /// - **Linux / Android** — `/proc/<pid>/stat` field 3 (state); live is any state
@@ -301,13 +305,14 @@ fn recycled_during_adoption(pid: i32) -> io::Error {
 ///   swallowed behavior on those targets, exactly as before this change — no
 ///   regression and, crucially, no new false positive.
 ///
-/// It classifies the tracked id itself (a group *leader* pid, or a solo pid). A
+/// Process-group callers classify the tracked id itself (a group *leader* pid, or
+/// a solo pid); the direct-child graceful caller passes its gate-protected pid. A
 /// live uid-changed *descendant* hidden behind an already-reaped/zombie leader is
-/// therefore not detected — the fail-safe direction (a missed report, never a
-/// false one); the common case the first attempt tripped over — the tracked leader
-/// *being* the zombie — is what this closes.
+/// therefore not detected by the group caller — the fail-safe direction (a missed
+/// report, never a false one); the common case the first attempt tripped over —
+/// the tracked leader *being* the zombie — is what this closes.
 #[cfg(any(target_os = "linux", target_os = "android"))]
-fn is_live_non_zombie(pid: i32) -> bool {
+pub(crate) fn is_live_non_zombie(pid: i32) -> bool {
     // `/proc/<pid>/stat` field 3 is the state char. A successful read that is
     // neither a zombie (`Z`) nor dead (`X`/`x`) is a live process; a failed read
     // (the pid is gone) yields `None` → `false`. Pids are positive here, so the
@@ -317,7 +322,7 @@ fn is_live_non_zombie(pid: i32) -> bool {
 
 /// The Apple reader — see the doc above the Linux `is_live_non_zombie`.
 #[cfg(target_vendor = "apple")]
-fn is_live_non_zombie(pid: i32) -> bool {
+pub(crate) fn is_live_non_zombie(pid: i32) -> bool {
     // `proc_pidinfo(PROC_PIDTBSDINFO)` fills a `proc_bsdinfo` whose `pbi_status` is
     // the BSD run state. A full-size fill whose status is a live value
     // (SIDL/SRUN/SSLEEP/SSTOP — never SZOMB) is a genuinely-alive process; a
