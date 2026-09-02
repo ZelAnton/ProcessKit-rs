@@ -2584,7 +2584,7 @@ mod tests {
 
         // The cancelled calls did not reserve the one-shot source; a later
         // non-cancelled call can still validate it successfully.
-        runner
+        let _ = runner
             .output_string(&Command::new("tool").stdin(source))
             .await
             .expect("pre-cancelled calls must leave stdin untouched");
