@@ -186,6 +186,91 @@ impl ScriptedExit {
     }
 }
 
+/// The lifecycle half of a scripted child, cloned without touching its duplex
+/// readers. Keeping the wait state separate lets an explicit graceful shutdown
+/// race its grace window with `RunningProcess::wait`, just like the live path,
+/// without holding a borrow of the backend while the finisher drives pumps.
+#[derive(Clone)]
+pub(super) struct ScriptedShutdown {
+    kill: ScriptedKill,
+    exit: ScriptedExit,
+    code: Option<i32>,
+    timed_out: bool,
+    inactivity_timed_out: bool,
+    signal: Option<i32>,
+    exit_at: Option<tokio::time::Instant>,
+}
+
+impl ScriptedShutdown {
+    /// The scripted counterpart of a non-blocking child exit probe.
+    fn outcome_now(&self) -> Option<Outcome> {
+        let already_exited = matches!(self.exit_at, Some(at) if at <= tokio::time::Instant::now())
+            || self.exit.flag.load(Ordering::Acquire);
+        if self.kill.killed.load(Ordering::Acquire) && !already_exited {
+            Some(Outcome::Signalled(None))
+        } else if already_exited {
+            // A natural status remains authoritative if a later kill arrives,
+            // matching a real child's cached exit status.
+            Some(self.classify_natural())
+        } else {
+            None
+        }
+    }
+
+    /// The canned natural-exit outcome.
+    fn classify_natural(&self) -> Outcome {
+        match (self.code, self.timed_out, self.inactivity_timed_out) {
+            (_, _, true) => Outcome::InactivityTimedOut,
+            (_, true, false) => Outcome::TimedOut,
+            (Some(code), false, false) => Outcome::Exited(code),
+            (None, false, false) => Outcome::Signalled(self.signal),
+        }
+    }
+
+    /// Wait for the scripted child to end, with the same kill-vs-natural ordering
+    /// as the live backend's wait boundary.
+    async fn wait_outcome(&self) -> Outcome {
+        if let Some(outcome) = self.outcome_now() {
+            return outcome;
+        }
+        match self.exit_at {
+            // Race so a streaming deadline or cancellation can still end this wait.
+            Some(at) => {
+                tokio::select! {
+                    biased;
+                    () = self.kill.signal.notified() => Outcome::Signalled(None),
+                    () = self.exit.signal.notified() => self.classify_natural(),
+                    () = tokio::time::sleep_until(at) => self.classify_natural(),
+                }
+            }
+            // A pending reply parks on kill; a dialog also resolves through its
+            // natural-exit signal.
+            None => {
+                tokio::select! {
+                    biased;
+                    () = self.kill.signal.notified() => Outcome::Signalled(None),
+                    () = self.exit.signal.notified() => self.classify_natural(),
+                }
+            }
+        }
+    }
+
+    /// Model the live graceful ladder: allow a natural scripted exit during the
+    /// grace window, then hang up feeders and report the hard-kill outcome.
+    pub(super) async fn graceful_shutdown(self, grace: Duration) -> Outcome {
+        if let Some(outcome) = self.outcome_now() {
+            return outcome;
+        }
+        match tokio::time::timeout(grace.min(crate::MAX_DEADLINE), self.wait_outcome()).await {
+            Ok(outcome) => outcome,
+            Err(_) => {
+                self.kill.fire();
+                self.wait_outcome().await
+            }
+        }
+    }
+}
+
 /// A scripted "child": canned output readers (fed by detached writer tasks so
 /// per-line delays work under a paused clock) plus a canned exit.
 pub(crate) struct ScriptedProc {
@@ -438,41 +523,20 @@ impl ScriptedProc {
     /// is killed is `Signalled`. A [`dialog`](Self::new_dialog) exits cleanly via
     /// its own [`exit`](Self::exit) signal, which resolves to the canned code just
     /// like a time-based `exit_at` would.
-    pub(super) async fn wait_outcome(&mut self) -> Outcome {
-        if let Some(outcome) = self.outcome_now() {
-            outcome
-        } else {
-            match self.exit_at {
-                // Race so a streaming `deadline_task` can still end this wait.
-                Some(at) => {
-                    tokio::select! {
-                        biased;
-                        () = self.kill.signal.notified() => Outcome::Signalled(None),
-                        () = self.exit.signal.notified() => self.classify_natural(),
-                        () = tokio::time::sleep_until(at) => self.classify_natural(),
-                    }
-                }
-                // A `pending` reply parks on kill only; a `dialog` also resolves
-                // once its feeder fires the natural-exit signal.
-                None => {
-                    tokio::select! {
-                        biased;
-                        () = self.kill.signal.notified() => Outcome::Signalled(None),
-                        () = self.exit.signal.notified() => self.classify_natural(),
-                    }
-                }
-            }
-        }
+    pub(super) async fn wait_outcome(&self) -> Outcome {
+        self.shutdown_state().wait_outcome().await
     }
 
-    /// The canned natural-exit outcome: the recorded code, unless the script was
-    /// scripted to time out (whole-run or inactivity) or to be signalled.
-    fn classify_natural(&self) -> Outcome {
-        match (self.code, self.timed_out, self.inactivity_timed_out) {
-            (_, _, true) => Outcome::InactivityTimedOut,
-            (_, true, false) => Outcome::TimedOut,
-            (Some(code), false, false) => Outcome::Exited(code),
-            (None, false, false) => Outcome::Signalled(self.signal),
+    /// Build a clonable lifecycle snapshot for a concurrent graceful shutdown.
+    pub(super) fn shutdown_state(&self) -> ScriptedShutdown {
+        ScriptedShutdown {
+            kill: self.kill.clone(),
+            exit: self.exit.clone(),
+            code: self.code,
+            timed_out: self.timed_out,
+            inactivity_timed_out: self.inactivity_timed_out,
+            signal: self.signal,
+            exit_at: self.exit_at,
         }
     }
 
@@ -483,17 +547,7 @@ impl ScriptedProc {
     /// [`wait_outcome`](Self::wait_outcome) resolves an already-ended script by,
     /// so the probe and the wait can never disagree.
     pub(super) fn outcome_now(&self) -> Option<Outcome> {
-        let already_exited = matches!(self.exit_at, Some(at) if at <= tokio::time::Instant::now())
-            || self.exit.flag.load(Ordering::Acquire);
-        if self.kill.killed.load(Ordering::Acquire) && !already_exited {
-            Some(Outcome::Signalled(None))
-        } else if already_exited {
-            // Cached natural outcome (time- or dialog-driven) even if a kill
-            // landed afterwards.
-            Some(self.classify_natural())
-        } else {
-            None
-        }
+        self.shutdown_state().outcome_now()
     }
 
     /// The scripted counterpart of `RunningProcess::has_exited_now` — a

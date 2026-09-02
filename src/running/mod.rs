@@ -2037,8 +2037,14 @@ impl RunningProcess {
     /// `SIGKILL` any survivor. On Windows the kill is atomic and `grace` is not
     /// awaited.
     ///
-    /// Only an **own-group** handle can be shut down here — a **shared-group**
-    /// handle returns [`ErrorReason::Unsupported`] because
+    /// An **own-group** live handle can be shut down here. A scripted
+    /// [`ScriptedRunner`](crate::testing::ScriptedRunner) handle is also supported
+    /// hermetically: an ordinary reply keeps its natural outcome, while a
+    /// [`Reply::pending`](crate::testing::Reply::pending) reply waits through the
+    /// requested grace and then models the hard-kill result as
+    /// [`Outcome::Signalled`]. The scripted double has no OS signal to
+    /// observe, so its soft phase is represented by that bounded wait only.
+    /// A **shared-group** handle still returns [`ErrorReason::Unsupported`] because
     /// shutting it down would tear down the caller's other children too.
     ///
     /// If the configured timeout deadline already elapsed when `shutdown` is
@@ -2049,7 +2055,8 @@ impl RunningProcess {
     /// - [`ErrorReason::Unsupported`] — this is a **shared-group** handle, which does
     ///   not own its group (tearing it down would kill the caller's other
     ///   children); use [`ProcessGroup::shutdown`](crate::ProcessGroup::shutdown)
-    ///   or [`start_kill`](Self::start_kill) instead.
+    ///   or [`start_kill`](Self::start_kill) instead. Scripted handles are not
+    ///   shared-group handles and therefore do not take this error path.
     /// - [`ErrorReason::Cancelled`] — the run was cancelled via
     ///   [`Command::cancel_on`](crate::Command::cancel_on).
     /// - [`ErrorReason::Teardown`] — terminal cancellation teardown could not be
@@ -2064,13 +2071,25 @@ impl RunningProcess {
     /// A timeout or signal-kill is *captured* in the returned [`Outcome`], not
     /// raised.
     pub async fn shutdown(mut self, grace: std::time::Duration) -> Result<Outcome> {
-        let Some(group) = self.backend.own_group().cloned() else {
-            return Err(ErrorReason::Unsupported {
-                operation: "shutdown (a shared-group handle does not own its group — \
-                            use ProcessGroup::shutdown, or start_kill for just this child)"
-                    .into(),
+        // Scripted doubles have no OS group, but they do have a clonable lifecycle
+        // seam. Capture it before starting `self.wait()`: the latter consumes the
+        // handle and owns the scripted output pumps, while the shutdown future owns
+        // only the synthetic soft-signal/grace/hard-kill state.
+        let scripted = match &self.backend {
+            Backend::Scripted(scripted) => Some(scripted.shutdown_state()),
+            _ => None,
+        };
+        let group = match (&scripted, self.backend.own_group()) {
+            (Some(_), _) => None,
+            (None, Some(group)) => Some(group.clone()),
+            (None, None) => {
+                return Err(ErrorReason::Unsupported {
+                    operation: "shutdown (a shared-group handle does not own its group — \
+                                use ProcessGroup::shutdown, or start_kill for just this child)"
+                        .into(),
+                }
+                .into());
             }
-            .into());
         };
         // Disable the concurrent `wait()`'s deadline and inactivity arms to avoid
         // overlapping teardowns. A timeout that already elapsed still classifies
@@ -2092,6 +2111,18 @@ impl RunningProcess {
         if let Some(task) = self.inactivity_task.take() {
             task.abort();
         }
+        if let Some(scripted) = scripted {
+            // The scripted lifecycle has no OS-level soft signal. Its bounded
+            // wait models the same natural-exit-before-escalation contract, and
+            // its shared kill state wakes the consuming wait after the grace.
+            let teardown = scripted.graceful_shutdown(grace);
+            let wait = self.wait();
+            tokio::pin!(teardown, wait);
+            return tokio::select! {
+                _natural_or_killed = &mut teardown => wait.await,
+                outcome = &mut wait => outcome,
+            };
+        }
         // Reap concurrently: an unreaped zombie still answers `kill(pgid, 0)`
         // probes, so without a concurrent reap a SIGTERM-handling child would
         // look alive for the whole grace and eat a pointless SIGKILL. Do not
@@ -2099,6 +2130,16 @@ impl RunningProcess {
         // alive, making the wait hide the teardown error forever. Returning that
         // primary error drops the still-owned wait future, so `RunningProcess::Drop`
         // keeps the group kill-on-drop and orphan-reap backstops intact.
+        let Some(group) = group else {
+            // The scripted branch returned above; keep this defensive fallback
+            // honest if another non-group backend is added later.
+            return Err(ErrorReason::Unsupported {
+                operation: "shutdown (a shared-group handle does not own its group — \
+                            use ProcessGroup::shutdown, or start_kill for just this child)"
+                    .into(),
+            }
+            .into());
+        };
         let teardown = group_graceful_kill(&group, grace, crate::sys::SIGTERM_RAW);
         let wait = self.wait();
         tokio::pin!(teardown, wait);
@@ -5433,6 +5474,50 @@ mod tests {
             .expect("output_bytes");
         assert_eq!(result.stdout(), b"raw\x00bytes\nno trailing newline");
         assert!(!result.truncated(), "no policy drop: {result:?}");
+    }
+
+    /// A pending scripted handle follows the explicit shutdown ladder: the
+    /// synthetic soft phase waits for the requested grace, then the kill fallback
+    /// wakes the consuming wait with the same signal outcome as a hard-killed live
+    /// child. Tokio's paused clock makes the grace assertion hermetic.
+    #[tokio::test(start_paused = true)]
+    async fn scripted_shutdown_pending_waits_for_grace_then_reports_signal() {
+        let grace = Duration::from_secs(3);
+        let run = ScriptedRunner::new()
+            .fallback(Reply::pending())
+            .start(&Command::new("pending"))
+            .await
+            .expect("scripted start");
+        let started = tokio::time::Instant::now();
+        let outcome = tokio::time::timeout(Duration::from_secs(10), run.shutdown(grace))
+            .await
+            .expect("scripted shutdown remains bounded")
+            .expect("scripted shutdown succeeds");
+
+        assert_eq!(outcome, Outcome::Signalled(None));
+        assert!(
+            started.elapsed() >= grace,
+            "pending shutdown must wait through its grace before the hard-kill fallback"
+        );
+    }
+
+    /// An ordinary scripted reply is already naturally complete by the time an
+    /// explicit shutdown starts. It must retain its canned successful outcome,
+    /// rather than being mistaken for a shared-group unsupported operation or a
+    /// synthetic signal kill.
+    #[tokio::test]
+    async fn scripted_shutdown_preserves_ordinary_reply_outcome() {
+        let run = ScriptedRunner::new()
+            .fallback(Reply::ok("done\n"))
+            .start(&Command::new("ordinary"))
+            .await
+            .expect("scripted start");
+        let outcome = run
+            .shutdown(Duration::from_secs(1))
+            .await
+            .expect("ordinary scripted shutdown");
+
+        assert_eq!(outcome, Outcome::Exited(0));
     }
 
     /// A `TS_TIMED_OUT` arbiter state overrides `backend_wait`'s clean exit 0.

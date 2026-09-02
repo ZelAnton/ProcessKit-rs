@@ -41,6 +41,14 @@
 //! [`Command::timeout`](crate::Command::timeout): with a deadline set it resolves
 //! timed-out (`Outcome::TimedOut`) rather than parking, on the bulk verbs and
 //! `start` alike, just as a live child killed for overrunning its deadline would.
+//!
+//! A scripted handle also supports [`RunningProcess::shutdown`](crate::RunningProcess::shutdown)
+//! without pretending it owns an OS process group. A normal reply preserves its
+//! natural outcome; [`Reply::pending`] waits through the requested grace and then
+//! resolves as [`Outcome::Signalled(None)`], modeling the hard-kill fallback. No OS
+//! signal is delivered to the double, so the soft phase is only a deterministic
+//! grace-window wait. Real shared-group handles retain their `Unsupported`
+//! diagnostic because they still must not tear down a caller's other children.
 
 use std::ffi::{OsStr, OsString};
 use std::path::PathBuf;
@@ -774,6 +782,16 @@ struct RuleEntry {
 ///
 /// Rules are tried in registration order; the first match wins. With no match,
 /// the [`fallback`](Self::fallback) reply is used, or an error is returned.
+///
+/// Handles returned by [`start`](Self::start) support
+/// [`RunningProcess::shutdown`](crate::RunningProcess::shutdown) hermetically:
+/// an ordinary reply keeps its natural exit outcome, while a
+/// [`Reply::pending`](Reply::pending) reply waits for the requested grace and then
+/// models hard-kill escalation as [`Outcome::Signalled`]. The double has no
+/// OS signal or process group, so this models the timing and classification
+/// contract without claiming to exercise platform signal delivery. A real
+/// shared-group handle continues to return `ErrorReason::Unsupported` from
+/// `shutdown`.
 ///
 /// # Example
 ///
