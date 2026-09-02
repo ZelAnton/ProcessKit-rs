@@ -39,11 +39,15 @@ use crate::sys::{ProcIdentity, ProcMetrics};
 /// Process-wide counter so concurrent jobs get distinct cgroup names.
 static NEXT_ID: AtomicU64 = AtomicU64::new(0);
 
-/// The interval at which the process-wide cgroup reclaimer retries a directory
-/// that the kernel still reports as busy. A single manager keeps a spared job
-/// from retaining one thread of its own, while still retrying until the last
-/// survivor has left its cgroup.
+/// The initial interval at which the process-wide cgroup reclaimer retries a
+/// directory that the kernel still reports as busy. A single manager keeps a
+/// spared job from retaining one thread of its own, while still retrying until
+/// the last survivor has left its cgroup.
 const CGROUP_RECLAIM_POLL: Duration = Duration::from_millis(10);
+/// A survivor can remain in a cgroup for an arbitrarily long time. Cap the
+/// retry delay in seconds so eventual cleanup stays bounded without keeping a
+/// reclaimer thread busy at millisecond cadence for the whole survivor lifetime.
+const CGROUP_RECLAIM_MAX_POLL: Duration = Duration::from_secs(1);
 
 /// A cgroup tree handed to the reclaimer after `Job::drop` could not remove it
 /// synchronously. The paths are deliberately owned by this request: once the
@@ -86,18 +90,33 @@ fn lock_cgroup_reclaimer(
         .unwrap_or_else(|poisoned| poisoned.into_inner())
 }
 
-#[cfg(not(feature = "tracing"))]
-fn write_cgroup_reclaim_failure<W: io::Write>(
-    writer: &mut W,
-    scope: &'static str,
-    kind: io::ErrorKind,
-    attempt: u64,
-) {
-    let _ = writeln!(
-        writer,
-        "processkit: cgroup cleanup is pending (scope={scope}, error={kind:?}, attempt={attempt}); \
-         the directory remains registered for retry"
-    );
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+struct CgroupReclaimBackoff {
+    delay: Duration,
+}
+
+impl CgroupReclaimBackoff {
+    fn new() -> Self {
+        Self {
+            delay: CGROUP_RECLAIM_POLL,
+        }
+    }
+
+    fn delay(self) -> Duration {
+        self.delay
+    }
+
+    fn reset(&mut self) {
+        self.delay = CGROUP_RECLAIM_POLL;
+    }
+
+    fn increase(&mut self) {
+        self.delay = self
+            .delay
+            .checked_mul(2)
+            .unwrap_or(CGROUP_RECLAIM_MAX_POLL)
+            .min(CGROUP_RECLAIM_MAX_POLL);
+    }
 }
 
 fn report_cgroup_reclaim_failure(scope: &'static str, kind: io::ErrorKind, attempt: u64) {
@@ -122,10 +141,10 @@ fn report_cgroup_reclaim_failure(scope: &'static str, kind: io::ErrorKind, attem
     }
     #[cfg(not(feature = "tracing"))]
     {
-        // An embedding process may close stderr; diagnostics must not abort the
-        // sole reclaimer thread and strand its still-contained request.
-        let mut stderr = io::stderr();
-        write_cgroup_reclaim_failure(&mut stderr, scope, kind, attempt);
+        // A library must not claim ownership of the host process's stderr. Keep
+        // the arguments in the no-op branch so this function remains the single
+        // report hook and diagnostics stay opt-in through `tracing`.
+        let _ = (scope, kind);
     }
 }
 
@@ -226,11 +245,21 @@ fn start_cgroup_reclaimer(state: &mut CgroupReclaimerState) -> io::Result<()> {
     Ok(())
 }
 
+fn accept_cgroup_reclaim(
+    pending: &mut Vec<CgroupReclaim>,
+    backoff: &mut CgroupReclaimBackoff,
+    request: CgroupReclaim,
+) {
+    pending.push(request);
+    backoff.reset();
+}
+
 fn cgroup_reclaim_loop(receiver: Receiver<CgroupReclaim>) {
     let mut pending = Vec::new();
+    let mut backoff = CgroupReclaimBackoff::new();
     loop {
         while let Ok(request) = receiver.try_recv() {
-            pending.push(request);
+            accept_cgroup_reclaim(&mut pending, &mut backoff, request);
         }
 
         let mut index = 0;
@@ -244,18 +273,19 @@ fn cgroup_reclaim_loop(receiver: Receiver<CgroupReclaim>) {
 
         if pending.is_empty() {
             match receiver.recv() {
-                Ok(request) => pending.push(request),
+                Ok(request) => accept_cgroup_reclaim(&mut pending, &mut backoff, request),
                 Err(_) => return,
             }
         } else {
-            match receiver.recv_timeout(CGROUP_RECLAIM_POLL) {
-                Ok(request) => pending.push(request),
-                Err(mpsc::RecvTimeoutError::Timeout) => {}
+            match receiver.recv_timeout(backoff.delay()) {
+                Ok(request) => accept_cgroup_reclaim(&mut pending, &mut backoff, request),
+                Err(mpsc::RecvTimeoutError::Timeout) => backoff.increase(),
                 // The sender is process-global and should not disconnect, but
                 // retaining pending requests is safer than abandoning paths if
                 // that invariant ever changes.
                 Err(mpsc::RecvTimeoutError::Disconnected) => {
-                    std::thread::sleep(CGROUP_RECLAIM_POLL);
+                    std::thread::sleep(backoff.delay());
+                    backoff.increase();
                 }
             }
         }
@@ -5741,34 +5771,12 @@ mod leaf_cgroup_tests {
     use std::time::Duration;
 
     use super::{
-        Backend, CGROUP_RECLAIMER_TEST_LOCK, Cgroup, CgroupReclaim, CgroupReclaimerState, Job,
-        LEAF_RECLAIM_FLOOR, LeafSlot, cgroup_reclaimer_state, enqueue_cgroup_reclaim,
-        enqueue_cgroup_reclaim_with_state, lock_cgroup_reclaimer,
+        Backend, CGROUP_RECLAIMER_TEST_LOCK, Cgroup, CgroupReclaim, CgroupReclaimBackoff,
+        CgroupReclaimerState, Job, LEAF_RECLAIM_FLOOR, LeafSlot, accept_cgroup_reclaim,
+        cgroup_reclaimer_state, enqueue_cgroup_reclaim, enqueue_cgroup_reclaim_with_state,
+        lock_cgroup_reclaimer,
     };
     use crate::sys::SkipDropKill;
-
-    #[cfg(not(feature = "tracing"))]
-    struct ClosedDiagnosticSink {
-        writes: usize,
-    }
-
-    #[cfg(not(feature = "tracing"))]
-    impl io::Write for ClosedDiagnosticSink {
-        fn write(&mut self, _buffer: &[u8]) -> io::Result<usize> {
-            self.writes += 1;
-            Err(io::Error::new(
-                io::ErrorKind::BrokenPipe,
-                "diagnostic sink is closed",
-            ))
-        }
-
-        fn flush(&mut self) -> io::Result<()> {
-            Err(io::Error::new(
-                io::ErrorKind::BrokenPipe,
-                "diagnostic sink is closed",
-            ))
-        }
-    }
 
     /// A stand-in job cgroup on a real temporary directory, carrying the two
     /// interface files this backend writes on it (`cgroup.procs` for an adopted
@@ -6237,6 +6245,34 @@ mod leaf_cgroup_tests {
         panic!("the process-wide reclaimer did not remove {parent:?} after the survivor drained");
     }
 
+    #[test]
+    fn reclaimer_backoff_is_bounded_and_reset_for_new_work() {
+        let mut pending = Vec::new();
+        let mut backoff = CgroupReclaimBackoff::new();
+        let expected = [10, 20, 40, 80, 160, 320, 640, 1_000];
+        for expected_millis in expected {
+            assert_eq!(backoff.delay(), Duration::from_millis(expected_millis));
+            backoff.increase();
+        }
+        assert_eq!(
+            backoff.delay(),
+            Duration::from_secs(1),
+            "a long-lived survivor must not make the retry interval unbounded"
+        );
+
+        accept_cgroup_reclaim(
+            &mut pending,
+            &mut backoff,
+            CgroupReclaim {
+                parent: PathBuf::from("new-parent"),
+                leaves: Vec::new(),
+                attempts: 0,
+            },
+        );
+        assert_eq!(backoff.delay(), Duration::from_millis(10));
+        assert_eq!(pending.len(), 1, "the new request must still be queued");
+    }
+
     /// A broken handoff must return the request to durable state instead of
     /// dropping it after one synchronous reclaim attempt. The next manager can
     /// accept the same request, which then keeps retrying until the survivor's
@@ -6423,41 +6459,34 @@ mod leaf_cgroup_tests {
         assert_eq!(restored.sender.is_some(), saved_had_sender);
     }
 
-    /// Diagnostics must remain best-effort: a closed stderr-equivalent sink
-    /// cannot abort the manager while the failed reclaim request remains
-    /// pending for a later retry.
+    /// Without `tracing`, failed reclaim diagnostics are intentionally a no-op:
+    /// library code must not write to the host process's stderr implicitly.
     #[cfg(not(feature = "tracing"))]
     #[test]
-    fn closed_diagnostic_sink_does_not_drop_pending_reclaim() {
-        let tmp = tempfile::tempdir().expect("create a reclaim test directory");
-        let parent = tmp.path().join("processkit-job");
-        let leaf = parent.join("spawn-survivor");
-        let survivor = leaf.join("survivor");
-        std::fs::create_dir(&parent).expect("create parent");
-        std::fs::create_dir(&leaf).expect("create leaf");
-        std::fs::create_dir(&survivor).expect("stand in for the live survivor");
+    fn cgroup_reclaim_failure_reporting_is_silent_without_tracing() {
+        const HELPER_ENV: &str = "PROCESSKIT_CGROUP_RECLAIM_STDERR_HELPER";
+        if std::env::var_os(HELPER_ENV).is_some() {
+            super::report_cgroup_reclaim_failure("test", io::ErrorKind::Other, 1);
+            return;
+        }
 
-        let mut request = CgroupReclaim {
-            parent: parent.clone(),
-            leaves: vec![leaf.clone()],
-            attempts: 0,
-        };
-        let mut sink = ClosedDiagnosticSink { writes: 0 };
+        let output = std::process::Command::new(
+            std::env::current_exe().expect("locate the current test executable"),
+        )
+        .args([
+            "--exact",
+            "sys::imp::leaf_cgroup_tests::cgroup_reclaim_failure_reporting_is_silent_without_tracing",
+            "--nocapture",
+        ])
+        .env(HELPER_ENV, "1")
+        .output()
+        .expect("run the isolated stderr helper");
+        assert!(output.status.success(), "stderr helper failed: {output:?}");
         assert!(
-            !request.reclaim_once_with(|scope, kind, attempt| {
-                super::write_cgroup_reclaim_failure(&mut sink, scope, kind, attempt)
-            }),
-            "a live survivor keeps the request pending"
+            output.stderr.is_empty(),
+            "reclaim diagnostics must not write to host stderr: {:?}",
+            String::from_utf8_lossy(&output.stderr)
         );
-        assert_eq!(sink.writes, 1, "the failed diagnostic write was attempted");
-        assert!(leaf.exists(), "the failed reclaim remains registered");
-
-        std::fs::remove_dir(&survivor).expect("the survivor leaves its cgroup");
-        assert!(
-            request.reclaim_once(),
-            "the pending request remains retryable after diagnostic failure"
-        );
-        assert!(!parent.exists(), "the later retry removes the hierarchy");
     }
 }
 
