@@ -429,40 +429,7 @@ impl<T> ProcessResult<T> {
     {
         match self.outcome {
             Outcome::Exited(code) if self.ok_codes.contains(&code) => Ok(self),
-            Outcome::TimedOut => Err(ErrorReason::Timeout {
-                program: self.program.clone(),
-                timeout: self.timeout.unwrap_or_default(),
-                inactivity: false,
-                stdout: self.stdout.as_text(),
-                stderr: self.stderr.clone(),
-                stdout_bytes: self.stdout.into_raw(),
-            }
-            .into()),
-            Outcome::InactivityTimedOut => Err(ErrorReason::Timeout {
-                program: self.program.clone(),
-                timeout: self.timeout.unwrap_or_default(),
-                inactivity: true,
-                stdout: self.stdout.as_text(),
-                stderr: self.stderr.clone(),
-                stdout_bytes: self.stdout.into_raw(),
-            }
-            .into()),
-            Outcome::Signalled(signal) => Err(ErrorReason::Signalled {
-                program: self.program.clone(),
-                signal,
-                stdout: self.stdout.as_text(),
-                stderr: self.stderr.clone(),
-                stdout_bytes: self.stdout.into_raw(),
-            }
-            .into()),
-            Outcome::Exited(code) => Err(ErrorReason::Exit {
-                program: self.program.clone(),
-                code,
-                stdout: self.stdout.as_text(),
-                stderr: self.stderr.clone(),
-                stdout_bytes: self.stdout.into_raw(),
-            }
-            .into()),
+            _ => Err(self.failure_error()),
         }
     }
 
@@ -479,33 +446,41 @@ impl<T> ProcessResult<T> {
     {
         match self.outcome {
             Outcome::Exited(code) => Ok(code),
-            Outcome::TimedOut => Err(ErrorReason::Timeout {
-                program: self.program.clone(),
-                timeout: self.timeout.unwrap_or_default(),
-                inactivity: false,
-                stdout: self.stdout.as_text(),
-                stderr: self.stderr.clone(),
-                stdout_bytes: self.stdout.into_raw(),
-            }
-            .into()),
-            Outcome::InactivityTimedOut => Err(ErrorReason::Timeout {
-                program: self.program.clone(),
-                timeout: self.timeout.unwrap_or_default(),
-                inactivity: true,
-                stdout: self.stdout.as_text(),
-                stderr: self.stderr.clone(),
-                stdout_bytes: self.stdout.into_raw(),
-            }
-            .into()),
-            Outcome::Signalled(signal) => Err(ErrorReason::Signalled {
-                program: self.program.clone(),
-                signal,
-                stdout: self.stdout.as_text(),
-                stderr: self.stderr.clone(),
-                stdout_bytes: self.stdout.into_raw(),
-            }
-            .into()),
+            _ => Err(self.failure_error()),
         }
+    }
+
+    fn failure_error(self) -> Error
+    where
+        T: StdoutText,
+    {
+        let stdout = self.stdout.as_text();
+        let stdout_bytes = self.stdout.into_raw();
+        match self.outcome {
+            Outcome::Exited(code) => ErrorReason::Exit {
+                program: self.program,
+                code,
+                stdout,
+                stderr: self.stderr,
+                stdout_bytes,
+            },
+            Outcome::TimedOut | Outcome::InactivityTimedOut => ErrorReason::Timeout {
+                program: self.program,
+                timeout: self.timeout.unwrap_or_default(),
+                inactivity: matches!(self.outcome, Outcome::InactivityTimedOut),
+                stdout,
+                stderr: self.stderr,
+                stdout_bytes,
+            },
+            Outcome::Signalled(signal) => ErrorReason::Signalled {
+                program: self.program,
+                signal,
+                stdout,
+                stderr: self.stderr,
+                stdout_bytes,
+            },
+        }
+        .into()
     }
 
     /// The wall-clock duration of the run — spawn to exit (or kill). It is
@@ -1170,6 +1145,100 @@ mod tests {
                 assert_eq!(signal, None);
             }
             other => panic!("expected Signalled for a signal-kill, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn checking_verbs_build_identical_non_exit_errors() {
+        let mut raw_stdout = b"partial-".to_vec();
+        raw_stdout.extend_from_slice(&[0xff, 0x00, 0xfe]);
+
+        for outcome in [
+            Outcome::TimedOut,
+            Outcome::InactivityTimedOut,
+            Outcome::Signalled(Some(9)),
+        ] {
+            let result = ProcessResult::new(
+                "tool".into(),
+                raw_stdout.clone(),
+                "diagnostic".into(),
+                outcome,
+                Some(Duration::from_millis(750)),
+            );
+            let from_success = result
+                .clone()
+                .ensure_success()
+                .expect_err("a non-exit outcome is never successful")
+                .into_reason();
+            let from_code = result
+                .require_code()
+                .expect_err("a non-exit outcome has no code")
+                .into_reason();
+
+            match (from_success, from_code) {
+                (
+                    ErrorReason::Timeout {
+                        program: left_program,
+                        timeout: left_timeout,
+                        inactivity: left_inactivity,
+                        stdout: left_stdout,
+                        stderr: left_stderr,
+                        stdout_bytes: left_stdout_bytes,
+                    },
+                    ErrorReason::Timeout {
+                        program: right_program,
+                        timeout: right_timeout,
+                        inactivity: right_inactivity,
+                        stdout: right_stdout,
+                        stderr: right_stderr,
+                        stdout_bytes: right_stdout_bytes,
+                    },
+                ) => {
+                    assert_eq!(left_program, "tool");
+                    assert_eq!(left_timeout, Duration::from_millis(750));
+                    assert_eq!(
+                        left_inactivity,
+                        matches!(outcome, Outcome::InactivityTimedOut)
+                    );
+                    assert_eq!(left_stdout, String::from_utf8_lossy(&raw_stdout));
+                    assert_eq!(left_stderr, "diagnostic");
+                    assert_eq!(left_stdout_bytes.as_deref(), Some(raw_stdout.as_slice()));
+                    assert_eq!(left_program, right_program);
+                    assert_eq!(left_timeout, right_timeout);
+                    assert_eq!(left_inactivity, right_inactivity);
+                    assert_eq!(left_stdout, right_stdout);
+                    assert_eq!(left_stderr, right_stderr);
+                    assert_eq!(left_stdout_bytes, right_stdout_bytes);
+                }
+                (
+                    ErrorReason::Signalled {
+                        program: left_program,
+                        signal: left_signal,
+                        stdout: left_stdout,
+                        stderr: left_stderr,
+                        stdout_bytes: left_stdout_bytes,
+                    },
+                    ErrorReason::Signalled {
+                        program: right_program,
+                        signal: right_signal,
+                        stdout: right_stdout,
+                        stderr: right_stderr,
+                        stdout_bytes: right_stdout_bytes,
+                    },
+                ) => {
+                    assert_eq!(left_program, "tool");
+                    assert_eq!(left_signal, Some(9));
+                    assert_eq!(left_stdout, String::from_utf8_lossy(&raw_stdout));
+                    assert_eq!(left_stderr, "diagnostic");
+                    assert_eq!(left_stdout_bytes.as_deref(), Some(raw_stdout.as_slice()));
+                    assert_eq!(left_program, right_program);
+                    assert_eq!(left_signal, right_signal);
+                    assert_eq!(left_stdout, right_stdout);
+                    assert_eq!(left_stderr, right_stderr);
+                    assert_eq!(left_stdout_bytes, right_stdout_bytes);
+                }
+                (left, right) => panic!("error variants differ: {left:?} versus {right:?}"),
+            }
         }
     }
 

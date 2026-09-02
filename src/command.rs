@@ -3338,15 +3338,13 @@ impl Command {
         };
         let child = match spawned {
             Ok(child) => child,
-            Err(source) if source.kind() == std::io::ErrorKind::NotFound => {
-                return Err(self.detached_not_found(source));
-            }
             Err(source) => {
-                return Err(ErrorReason::Spawn {
+                let err = ErrorReason::Spawn {
                     program: self.program_name(),
                     source,
                 }
-                .into());
+                .into();
+                return Err(crate::runner::map_spawn_error(self, err));
             }
         };
         let pid = child.id();
@@ -3504,39 +3502,6 @@ impl Command {
             base.stderr_mode = StdioMode::Null;
         }
         base.build_tokio()
-    }
-
-    /// Map an OS `NotFound` spawn failure to the enriched reason a live launch
-    /// would produce — [`NotFound`](crate::ErrorReason::NotFound) (with the
-    /// `searched` directories for a bare name) when the program truly isn't
-    /// resolvable, or [`Spawn`](crate::ErrorReason::Spawn) when it resolves but the
-    /// OS still refused it directly (a `.cmd`/`.bat` on Windows). Mirrors
-    /// `runner::launch`'s post-spawn translation, sharing the same spawn-free
-    /// [`resolve_program`] so the two can't disagree.
-    fn detached_not_found(&self, source: std::io::Error) -> Error {
-        if is_bare_name(&self.program) {
-            return match resolve_program(
-                &self.program,
-                &self.prefer_local,
-                self.resolution_path_source(),
-            ) {
-                ProgramResolution::Found(_) => ErrorReason::Spawn {
-                    program: self.program_name(),
-                    source,
-                }
-                .into(),
-                ProgramResolution::NotFound { searched } => ErrorReason::NotFound {
-                    program: self.program_name(),
-                    searched,
-                }
-                .into(),
-            };
-        }
-        ErrorReason::NotFound {
-            program: self.program_name(),
-            searched: None,
-        }
-        .into()
     }
 
     // --- Live handle (private one-shot group) ------------------------------
@@ -6057,10 +6022,14 @@ mod tests {
         let dir = tempfile::tempdir().expect("temp PATH dir");
         let child_path = std::env::join_paths([dir.path()]).expect("single PATH entry");
         let command = Command::new("processkit-missing-detached-path").env("PATH", &child_path);
-        let err = command.detached_not_found(std::io::Error::new(
-            std::io::ErrorKind::NotFound,
-            "synthetic spawn miss",
-        ));
+        let err = crate::runner::map_spawn_error(
+            &command,
+            crate::ErrorReason::Spawn {
+                program: command.program_name(),
+                source: std::io::Error::new(std::io::ErrorKind::NotFound, "synthetic spawn miss"),
+            }
+            .into(),
+        );
 
         match err.into_reason() {
             crate::ErrorReason::NotFound { searched, .. } => assert_eq!(

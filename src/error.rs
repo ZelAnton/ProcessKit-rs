@@ -396,6 +396,13 @@ pub enum ErrorReason {
     /// reporting one of those ordinary dispositions would falsely imply that a
     /// potentially-live process had been dealt with. Output already captured before
     /// the failed teardown remains attached as a best-effort diagnostic prefix.
+    ///
+    /// The generic IO classifiers deliberately ignore `source`: this variant's
+    /// fail-closed [`ErrorKind::Teardown`] classification must win even when the
+    /// failed OS primitive reports `PermissionDenied` or a normally transient IO
+    /// kind. Callers must assume the process may still be live and must not retry
+    /// the work based on the underlying error alone. Inspect `source` only for
+    /// teardown-specific diagnostics or recovery.
     #[error("`{program}` teardown after {cause:?} failed during {operation}: {source}")]
     #[non_exhaustive]
     Teardown {
@@ -577,7 +584,8 @@ pub enum ErrorKind {
     /// [`Error::is_permission_denied`]; split out of [`Spawn`](ErrorKind::Spawn)
     /// / [`Other`](ErrorKind::Other) because an ACL/executable-bit problem is a
     /// distinct operator action (fix permissions) from a generic launch or IO
-    /// failure.
+    /// failure. [`ErrorReason::Stdin`] and [`ErrorReason::Teardown`] retain their
+    /// phase-specific kinds regardless of their underlying IO error.
     PermissionDenied,
     /// A requested resource limit could not be enforced — from
     /// [`ErrorReason::ResourceLimit`] (`limits` feature). Gated exactly like the
@@ -601,7 +609,9 @@ pub enum ErrorKind {
     Cancelled,
     /// Terminal process teardown could not be confirmed — from
     /// [`ErrorReason::Teardown`]. The original OS error and initiating condition
-    /// remain on the reason. The twin of [`Error::is_teardown`].
+    /// remain on the reason. The twin of [`Error::is_teardown`]. This fail-closed
+    /// kind takes precedence over classifying the underlying IO error as permission
+    /// denied or transient.
     Teardown,
     /// A fallible control predicate returned an error — from
     /// [`ErrorReason::Predicate`]. Its own routing bucket, distinct from
@@ -627,8 +637,8 @@ pub enum ErrorKind {
     /// that is not one of the categories above:
     /// [`CassetteMiss`](ErrorReason::CassetteMiss),
     /// [`Parse`](ErrorReason::Parse), [`NotReady`](ErrorReason::NotReady),
-    /// [`OutputTooLarge`](ErrorReason::OutputTooLarge),
-    /// [`Stdin`](ErrorReason::Stdin), and a non-`PermissionDenied`
+    /// [`OutputTooLarge`](ErrorReason::OutputTooLarge), [`Stdin`](ErrorReason::Stdin)
+    /// regardless of its underlying IO error, and a non-`PermissionDenied`
     /// [`Io`](ErrorReason::Io). Mirrors [`std::io::ErrorKind::Other`]: a genuine
     /// but uncategorized backend/IO failure. Read [`Error::reason`] to tell them
     /// apart when it matters.
@@ -768,6 +778,8 @@ impl ErrorReason {
     ///   scope);
     /// - [`Timeout`](ErrorReason::Timeout) → [`ErrorKind::Timeout`],
     ///   [`Cancelled`](ErrorReason::Cancelled) → [`ErrorKind::Cancelled`],
+    ///   [`Teardown`](ErrorReason::Teardown) → [`ErrorKind::Teardown`] regardless
+    ///   of its underlying IO error,
     ///   [`Predicate`](ErrorReason::Predicate) → [`ErrorKind::Predicate`],
     ///   [`Exit`](ErrorReason::Exit) → [`ErrorKind::Exit`],
     ///   [`Signalled`](ErrorReason::Signalled) → [`ErrorKind::Signalled`],
@@ -778,7 +790,8 @@ impl ErrorReason {
     /// - [`CassetteMiss`](ErrorReason::CassetteMiss),
     ///   [`Parse`](ErrorReason::Parse), [`NotReady`](ErrorReason::NotReady),
     ///   [`OutputTooLarge`](ErrorReason::OutputTooLarge),
-    ///   [`Stdin`](ErrorReason::Stdin) → [`ErrorKind::Other`].
+    ///   [`Stdin`](ErrorReason::Stdin) → [`ErrorKind::Other`] regardless of its
+    ///   underlying IO error.
     ///
     /// This is a *routing* answer, **not** a replacement for matching the
     /// variant: for the exit code, captured streams, timeout duration, or which
@@ -1003,7 +1016,10 @@ impl ErrorReason {
     /// binary isn't executable, or the OS refused the launch. True for
     /// [`Spawn`](ErrorReason::Spawn) / [`Io`](ErrorReason::Io) carrying
     /// [`PermissionDenied`](std::io::ErrorKind::PermissionDenied); `false`
-    /// otherwise.
+    /// otherwise. In particular, [`Stdin`](ErrorReason::Stdin) stays tied to an
+    /// otherwise-successful run, and [`Teardown`](ErrorReason::Teardown) stays a
+    /// fail-closed teardown failure, so neither is reclassified from its underlying
+    /// IO error.
     pub fn is_permission_denied(&self) -> bool {
         self.io_source()
             .is_some_and(|e| e.kind() == std::io::ErrorKind::PermissionDenied)
@@ -1017,8 +1033,11 @@ impl ErrorReason {
     ///
     /// **Scope: IO/spawn-level, never exit codes.** Whether a tool's non-zero
     /// [`Exit`](ErrorReason::Exit) is retryable is domain-specific (a `git` 128 is not
-    /// generically transient) — that stays the caller's call. [`Timeout`](ErrorReason::Timeout)
-    /// is also excluded by design; compose it if wanted:
+    /// generically transient) — that stays the caller's call. [`Stdin`](ErrorReason::Stdin)
+    /// is excluded because the run otherwise succeeded, while
+    /// [`Teardown`](ErrorReason::Teardown) is excluded because the process may still
+    /// be live. [`Timeout`](ErrorReason::Timeout) is also excluded by design;
+    /// compose it if wanted:
     /// `e.is_transient() || e.is_timeout()`.
     ///
     /// Pairs with [`Command::retry`](crate::Command::retry):
@@ -1287,16 +1306,21 @@ impl ErrorReason {
         matches!(self, ErrorReason::Signalled { .. })
     }
 
-    /// The underlying [`std::io::Error`] for the variants that carry one
-    /// ([`Spawn`](ErrorReason::Spawn), [`Io`](ErrorReason::Io)) — the basis for the io-level
-    /// classifiers above.
+    /// The underlying [`std::io::Error`] selected for the generic IO classifiers
+    /// above. Deliberately limited to [`Spawn`](ErrorReason::Spawn) and
+    /// [`Io`](ErrorReason::Io): [`Stdin`](ErrorReason::Stdin) and
+    /// [`Teardown`](ErrorReason::Teardown) carry IO errors but retain their
+    /// phase-specific classification.
     fn io_source(&self) -> Option<&std::io::Error> {
-        // Exhaustive on purpose: a future variant carrying an `io::Error` must
-        // add itself here so the io-level classifiers (`is_transient`,
-        // `is_permission_denied`) see it, rather than slipping through a wildcard.
+        // Exhaustive on purpose: every source-carrying variant must explicitly
+        // decide whether generic retry/permission classification is safe rather
+        // than inheriting it merely because it contains an `io::Error`.
         match self {
             ErrorReason::Spawn { source, .. } => Some(source),
             ErrorReason::Io(source) => Some(source),
+            // Retain phase semantics: Stdin follows an otherwise-successful run,
+            // while Teardown means the process may still be live.
+            ErrorReason::Stdin { .. } | ErrorReason::Teardown { .. } => None,
             ErrorReason::NotFound { .. }
             | ErrorReason::CassetteMiss { .. }
             | ErrorReason::Exit { .. }
@@ -1306,9 +1330,7 @@ impl ErrorReason {
             | ErrorReason::Parse { .. }
             | ErrorReason::Unsupported { .. }
             | ErrorReason::Cancelled { .. }
-            | ErrorReason::Teardown { .. }
             | ErrorReason::Signalled { .. }
-            | ErrorReason::Stdin { .. }
             | ErrorReason::Predicate { .. } => None,
             #[cfg(feature = "limits")]
             ErrorReason::ResourceLimit { .. } => None,
@@ -2928,6 +2950,32 @@ mod tests {
                 ErrorReason::Io(std::io::Error::from(kind)).is_transient(),
                 "{kind:?} (Io) should be transient"
             );
+        }
+    }
+
+    #[test]
+    fn stdin_and_teardown_io_errors_keep_their_phase_classification() {
+        use std::io::ErrorKind::{Interrupted, PermissionDenied};
+
+        for kind in [PermissionDenied, Interrupted] {
+            let stdin = Error::stdin("x", std::io::Error::from(kind));
+            assert_eq!(stdin.kind(), ErrorKind::Other);
+            assert!(!stdin.is_permission_denied());
+            assert!(!stdin.is_transient());
+
+            let teardown = Error::teardown(
+                "x",
+                TeardownCause::Cancellation,
+                "process-group hard kill",
+                std::io::Error::from(kind),
+                String::new(),
+                String::new(),
+                None,
+            );
+            assert_eq!(teardown.kind(), ErrorKind::Teardown);
+            assert!(teardown.is_teardown());
+            assert!(!teardown.is_permission_denied());
+            assert!(!teardown.is_transient());
         }
     }
 

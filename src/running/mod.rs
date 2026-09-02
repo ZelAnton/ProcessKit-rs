@@ -801,6 +801,123 @@ impl RealProc {
     }
 }
 
+/// The process-lifecycle operations shared by pipe-backed and PTY-backed
+/// children. I/O stays in the backend-specific structs; this adapter exists so
+/// `backend_wait`, `exit_outcome_now`, `start_kill`, and both teardown drivers
+/// share one ordering path without erasing backend-specific diagnostics.
+enum ReapableChild<'a> {
+    Real(&'a mut Child),
+    #[cfg(feature = "pty")]
+    Pty(&'a mut crate::sys::pty::PtyChild),
+}
+
+impl ReapableChild<'_> {
+    fn target(&self) -> &'static str {
+        match self {
+            Self::Real(_) => "real",
+            #[cfg(feature = "pty")]
+            Self::Pty(_) => "pty",
+        }
+    }
+
+    fn terminal_reap_operation(&self) -> &'static str {
+        match self {
+            Self::Real(_) => "child terminal reap",
+            #[cfg(feature = "pty")]
+            Self::Pty(_) => "PTY child terminal reap",
+        }
+    }
+
+    #[cfg(not(unix))]
+    fn hard_kill_operation(&self) -> &'static str {
+        match self {
+            Self::Real(_) => "direct child hard kill",
+            #[cfg(feature = "pty")]
+            Self::Pty(_) => "PTY child hard kill",
+        }
+    }
+
+    #[cfg(unix)]
+    fn hard_kill_escalation_operation(&self) -> &'static str {
+        match self {
+            Self::Real(_) => "direct child hard-kill escalation",
+            #[cfg(feature = "pty")]
+            Self::Pty(_) => "PTY child hard-kill escalation",
+        }
+    }
+
+    fn shared_group_gate_invariant(&self) -> &'static str {
+        match self {
+            Self::Real(_) => {
+                "graceful_teardown's shared-group branch requires the caller to have retired \
+                 the PidGate first — it retires only after its own reap has freed the pid, so \
+                 an un-retired gate would leave a detached watchdog free to raw-kill a recycled pid"
+            }
+            #[cfg(feature = "pty")]
+            Self::Pty(_) => {
+                "graceful_teardown's shared-group PTY branch requires the caller to have retired \
+                 the PidGate first"
+            }
+        }
+    }
+
+    #[cfg(unix)]
+    fn id(&self) -> Option<u32> {
+        match self {
+            Self::Real(child) => child.id(),
+            #[cfg(feature = "pty")]
+            Self::Pty(child) => child.id(),
+        }
+    }
+
+    fn start_kill(&mut self) -> std::io::Result<()> {
+        match self {
+            Self::Real(child) => child.start_kill(),
+            #[cfg(feature = "pty")]
+            Self::Pty(child) => child.start_kill(),
+        }
+    }
+
+    async fn wait(&mut self) -> std::io::Result<Outcome> {
+        match self {
+            Self::Real(child) => child
+                .wait()
+                .await
+                .map(|status| outcome_of_exit_status(&status)),
+            #[cfg(feature = "pty")]
+            Self::Pty(child) => child
+                .wait()
+                .await
+                .map(|status| outcome_of_pty_exit_status(&status)),
+        }
+    }
+
+    async fn reap(&mut self, gate: &PidGate) -> std::io::Result<Outcome> {
+        match self {
+            Self::Real(child) => gated_reap(gate, child)
+                .await
+                .map(|status| outcome_of_exit_status(&status)),
+            #[cfg(feature = "pty")]
+            Self::Pty(child) => child
+                .reap(gate)
+                .await
+                .map(|status| outcome_of_pty_exit_status(&status)),
+        }
+    }
+
+    fn try_wait(&mut self) -> std::io::Result<Option<Outcome>> {
+        match self {
+            Self::Real(child) => child
+                .try_wait()
+                .map(|status| status.map(|status| outcome_of_exit_status(&status))),
+            #[cfg(feature = "pty")]
+            Self::Pty(child) => child
+                .try_wait()
+                .map(|status| status.map(|status| outcome_of_pty_exit_status(&status))),
+        }
+    }
+}
+
 impl Backend {
     fn own_group(&self) -> Option<&Arc<ProcessGroup>> {
         match self {
@@ -2662,43 +2779,29 @@ impl RunningProcess {
         }
 
         let gate = self.pid_gate.clone();
-        let outcome = match &mut self.backend {
-            Backend::Real(real) => {
-                // Reap the child *inside* the gate lock so the pid-freeing reap and
-                // the retire are one indivisible step — closing the window a plain
-                // `child.wait().await` then `retire()` leaves open, where a racing
-                // detached watchdog (cancel/deadline) could raw-kill the freed (and
-                // possibly OS-recycled) pid. tokio frees the pid via `try_wait`
-                // *inside* `Child::wait()`'s poll (see tokio's `Reaper::poll`), so
-                // running that poll under the gate lock via `reap_under_lock` makes
-                // the pid-free and the retire atomic: a watchdog's gated kill takes
-                // the same lock and so either lands entirely before this reap (pid
-                // still valid) or is skipped (retired first). A dropped wait (a
-                // `wait_any`/`wait_all` loser whose future is cancelled) simply stops
-                // polling — no reap, gate untouched — so losers stay usable.
-                let status = gated_reap(&gate, real.child_mut())
-                    .await
-                    .map_err(Error::io)?;
-                outcome_of_exit_status(&status)
-            }
-            // The PTY child reaps through the same gate discipline as `Real` (the
-            // Unix pty child IS a tokio `Child`; the Windows ConPTY child holds its
-            // process handle open across the wait, so its pid is never freed
-            // mid-wait). `PtyExitStatus` carries the code and (Unix) the signal.
+        let mut child = match &mut self.backend {
+            Backend::Real(real) => ReapableChild::Real(real.child_mut()),
             #[cfg(feature = "pty")]
-            Backend::Pty(pty) => {
-                let status = pty.child_mut().reap(&gate).await.map_err(Error::io)?;
-                outcome_of_pty_exit_status(&status)
-            }
+            Backend::Pty(pty) => ReapableChild::Pty(pty.child_mut()),
             // A scripted double owns no OS process, so its gate is pid-less: no reap
             // frees an OS pid and every gated kill is a no-op. The `.await` cannot
             // hold the lock, but there is no pid to recycle, so the retire below
             // suffices.
-            Backend::Scripted(s) => s.wait_outcome().await,
+            Backend::Scripted(s) => {
+                let outcome = s.wait_outcome().await;
+                self.pid_gate.retire();
+                let _ = deadline::claim_exited(&self.timeout_state);
+                return Ok(outcome);
+            }
         };
-        // Real: the `gated_reap` above already retired atomically with the reap;
-        // this is an idempotent backstop. Scripted: the retire that stands the
-        // (pid-less) watchdogs down.
+        // Reap the child *inside* the gate lock so the pid-freeing reap and the
+        // retire are one indivisible step. On Unix both variants ultimately poll
+        // tokio's `Child::wait` through `PidGate::reap_under_lock`; Windows ConPTY
+        // instead keeps its process handle alive until structural drop, so its pid
+        // cannot be recycled during the wait.
+        let outcome = child.reap(&gate).await.map_err(Error::io)?;
+        // The gated reap already retired atomically with a Unix pid-freeing reap;
+        // this is the Windows ConPTY and rare wait-error backstop.
         self.pid_gate.retire();
         // Claim natural reap. If a deadline already won (`TS_TIMED_OUT`), this
         // CAS fails and the run stays `TimedOut`.
@@ -2875,81 +2978,55 @@ impl RunningProcess {
         cause: TeardownCause,
     ) -> std::result::Result<(), TeardownFailure> {
         let gate = self.pid_gate.clone();
-        match &mut self.backend {
+        let (mut child, own_group) = match &mut self.backend {
             Backend::Real(real) => {
-                let child_error = child_start_kill("real", || real.child_mut().start_kill()).err();
-                // The child is being torn down through the owned `Child`; retire
-                // the gate (before the reap below frees the pid) so the
-                // cancel/deadline watchdogs stand down rather than racing that reap
-                // with a raw `kill(pid)` that could land on a recycled pid.
-                gate.retire();
-                let group_error = if let Some(group) = &real.own_group {
-                    // On Linux + legacy/restricted cgroup this can synchronously
-                    // block this worker thread up to ~100ms — accepted, not
-                    // routed through `spawn_blocking`; see the sweep loop in
-                    // `Cgroup::kill` (src/sys/linux.rs) for the full rationale.
-                    // ~100ms is the ceiling for every backend: FreeBSD's reaper
-                    // keeps its post-kill corpse drain in `Drop` alone (see
-                    // `DRAIN_BUDGET`, src/sys/freebsd.rs), so this call does not
-                    // block there at all.
-                    group_hard_kill(group).err()
-                } else {
-                    None
-                };
-                // Bound the reap: a D-state child can ignore SIGKILL until I/O
-                // unblocks, and an unbounded wait hangs shared-group handles.
-                let reap = confirm_reap(PUMP_TEARDOWN, real.child_mut().wait()).await;
-                if let Some(source) = group_error {
-                    return Err(TeardownFailure {
-                        cause,
-                        operation: "process-group hard kill",
-                        source,
-                    });
-                }
-                if let Err(source) = reap {
-                    return Err(TeardownFailure {
-                        cause,
-                        operation: if child_error.is_some() {
-                            "direct child hard kill"
-                        } else {
-                            "child terminal reap"
-                        },
-                        source: child_error.unwrap_or(source),
-                    });
-                }
+                let own_group = real.own_group.clone();
+                (ReapableChild::Real(real.child_mut()), own_group)
             }
-            // The PTY child tears down exactly like `Real`: kill through the owned
-            // handle, retire the gate before the group kill, then bound the reap.
             #[cfg(feature = "pty")]
             Backend::Pty(pty) => {
-                let child_error = child_start_kill("pty", || pty.child_mut().start_kill()).err();
-                gate.retire();
-                let group_error = if let Some(group) = &pty.own_group {
-                    group_hard_kill(group).err()
-                } else {
-                    None
-                };
-                let reap = confirm_reap(PUMP_TEARDOWN, pty.child_mut().wait()).await;
-                if let Some(source) = group_error {
-                    return Err(TeardownFailure {
-                        cause,
-                        operation: "process-group hard kill",
-                        source,
-                    });
-                }
-                if let Err(source) = reap {
-                    return Err(TeardownFailure {
-                        cause,
-                        operation: if child_error.is_some() {
-                            "direct child hard kill"
-                        } else {
-                            "child terminal reap"
-                        },
-                        source: child_error.unwrap_or(source),
-                    });
-                }
+                let own_group = pty.own_group.clone();
+                (ReapableChild::Pty(pty.child_mut()), own_group)
             }
-            Backend::Scripted(s) => s.kill(),
+            Backend::Scripted(s) => {
+                s.kill();
+                return Ok(());
+            }
+        };
+        let target = child.target();
+        let child_error = child_start_kill(target, || child.start_kill()).err();
+        // The child is being torn down through its owned handle. Retire before
+        // the group kill and reap so no detached raw-pid watchdog can race the
+        // pid-freeing wait.
+        gate.retire();
+        let group_error = if let Some(group) = &own_group {
+            // On Linux + legacy/restricted cgroup this can synchronously block
+            // this worker thread up to ~100ms. Every backend keeps that same
+            // ceiling; see `Cgroup::kill` and FreeBSD's `DRAIN_BUDGET` rationale.
+            group_hard_kill(group).err()
+        } else {
+            None
+        };
+        // Bound the reap: a D-state child can ignore the final hard kill until
+        // I/O unblocks, and an unbounded wait hangs shared-group handles.
+        let reap = confirm_reap(PUMP_TEARDOWN, child.wait()).await;
+        if let Some(source) = group_error {
+            return Err(TeardownFailure {
+                cause,
+                operation: "process-group hard kill",
+                source,
+            });
+        }
+        if let Err(source) = reap {
+            return Err(TeardownFailure {
+                cause,
+                operation: if child_error.is_some() {
+                    "direct child hard kill"
+                } else {
+                    "child terminal reap"
+                },
+                source: child_error.unwrap_or(source),
+            });
         }
         Ok(())
     }
@@ -3009,220 +3086,104 @@ impl RunningProcess {
         cause: TeardownCause,
     ) -> std::result::Result<(), TeardownFailure> {
         let gate = self.pid_gate.clone();
-        match &mut self.backend {
-            Backend::Real(real) => match real.own_group.clone() {
-                // Own group: tear the whole tree down pgid/cgroup-scoped (which
-                // never touches the raw pid, so it is recycled-pid safe), reaping
-                // concurrently so a signal-handling child that exits ends the grace
-                // early instead of eating a pointless `SIGKILL`.
-                Some(group) => {
-                    let teardown = async move { group_graceful_kill(&group, grace, signal).await };
-                    // Bound the reap: a D-state child can ignore the final SIGKILL.
-                    let reap = async {
-                        let r = confirm_reap(
-                            grace.saturating_add(PUMP_TEARDOWN),
-                            real.child_mut().wait(),
-                        )
-                        .await;
-                        // The group teardown never raw-kills, so retiring here only
-                        // keeps the gate consistent for any lingering external
-                        // watchdog once the pid is freed.
-                        gate.retire();
-                        r
-                    };
-                    let (teardown, reap) = tokio::join!(teardown, reap);
-                    if let Err(source) = teardown {
-                        return Err(TeardownFailure {
-                            cause,
-                            operation: "process-group graceful escalation",
-                            source,
-                        });
-                    }
-                    if let Err(source) = reap {
-                        return Err(TeardownFailure {
-                            cause,
-                            operation: "child terminal reap",
-                            source,
-                        });
-                    }
-                }
-                // Shared group: we own no group, so we reach only the direct child.
-                // Escalate the hard kill through the OWNED `Child` (`start_kill`)
-                // instead of a raw `kill(pid)`, so the SIGKILL is reaped by the same
-                // `Child` and can never outlive the reap to hit a recycled pid — the
-                // recycled-pid hazard the pid-only path guards with the gate is
-                // simply absent here. Only the graceful signal is sent by pid, and
-                // only while the child is provably un-reaped: this teardown is the
-                // sole reaper — the arm that called us won its `select!`, so
-                // `backend_wait` never ran — and EVERY caller retired the gate before
-                // reaching us (`drive_to_exit_inner` up front for the deadline,
-                // inactivity and cancel arms; `wait_exit`'s cancel arm likewise), so
-                // no detached watchdog can still be racing the reap below with a raw
-                // pid kill. That ordering is load-bearing here, because the trailing
-                // `gate.retire()` in this branch runs only AFTER the reap has already
-                // freed the pid — so it is `debug_assert`ed below rather than left to
-                // this comment. `Child::id()` is additionally `None` once the child
-                // has been reaped, so the pid-scoped signal below degrades to a no-op
-                // rather than a stray signal even if it were reached late.
-                None => {
-                    // The invariant the paragraph above rests on, made enforceable
-                    // instead of merely documented: every caller must have retired
-                    // the gate BEFORE reaching this branch, because the trailing
-                    // `gate.retire()` here runs only after the reap has already freed
-                    // the pid. A future third caller that forgets trips this in debug
-                    // and under `cargo test` rather than shipping a silent SIGKILL on
-                    // a recycled pid (the K-044 / T-093 class). Debug-only on purpose:
-                    // this is an internal call-ordering contract, not user input, and
-                    // a hard `assert!` would abort a *teardown* in release — turning a
-                    // caller's ordering slip into a child left un-reaped, which is the
-                    // worse failure. Every build that could introduce such a caller
-                    // (`cargo test`, CI, the debug profile) carries the check.
-                    debug_assert!(
-                        gate.is_retired(),
-                        "graceful_teardown's shared-group branch requires the caller \
-                         to have retired the PidGate first — it retires only after \
-                         its own reap has freed the pid, so an un-retired gate would \
-                         leave a detached watchdog free to raw-kill a recycled pid"
-                    );
-                    #[cfg(unix)]
-                    {
-                        stream::signal_direct_child(real.child_mut().id(), signal);
-                        // Wait up to `grace` for the child to exit on the signal; a
-                        // child that catches it and stays up rides out the grace.
-                        // Only a *clean* reap skips escalation — on a grace elapse
-                        // (or a rare wait error) escalate through the owned `Child`,
-                        // whose `start_kill` is a harmless no-op if it turns out the
-                        // child was already reaped.
-                        let reaped_cleanly =
-                            confirm_reap(grace, real.child_mut().wait()).await.is_ok();
-                        if !reaped_cleanly {
-                            let child_error =
-                                child_start_kill("real", || real.child_mut().start_kill()).err();
-                            let reap = confirm_reap(PUMP_TEARDOWN, real.child_mut().wait()).await;
-                            if let Err(source) = reap {
-                                return Err(TeardownFailure {
-                                    cause,
-                                    operation: if child_error.is_some() {
-                                        "direct child hard-kill escalation"
-                                    } else {
-                                        "child terminal reap"
-                                    },
-                                    source: child_error.unwrap_or(source),
-                                });
-                            }
-                        }
-                    }
-                    #[cfg(not(unix))]
-                    {
-                        // Windows has no graceful tier: hard-kill immediately
-                        // through the owned Child and reap.
-                        let _ = signal;
-                        let child_error =
-                            child_start_kill("real", || real.child_mut().start_kill()).err();
-                        let reap = confirm_reap(PUMP_TEARDOWN, real.child_mut().wait()).await;
-                        if let Err(source) = reap {
-                            return Err(TeardownFailure {
-                                cause,
-                                operation: if child_error.is_some() {
-                                    "direct child hard kill"
-                                } else {
-                                    "child terminal reap"
-                                },
-                                source: child_error.unwrap_or(source),
-                            });
-                        }
-                    }
-                    // Reaped (pid freed); retire so any lingering external watchdog
-                    // stands down. `drive_to_exit_inner` already retired before
-                    // calling us; this keeps the post-reap invariant explicit.
-                    gate.retire();
-                }
-            },
-            // The PTY child follows the same graceful tiers as `Real`: an own-group
-            // handle drives the whole-tree signal→grace→kill through the group; a
-            // shared-group handle reaches only its direct child (a real signal on
-            // Unix, a hard kill on Windows, which has no signal tier).
+        let (mut child, own_group) = match &mut self.backend {
+            Backend::Real(real) => {
+                let own_group = real.own_group.clone();
+                (ReapableChild::Real(real.child_mut()), own_group)
+            }
             #[cfg(feature = "pty")]
-            Backend::Pty(pty) => match pty.own_group.clone() {
-                Some(group) => {
-                    let teardown = async move { group_graceful_kill(&group, grace, signal).await };
-                    let reap = async {
-                        let r = confirm_reap(
-                            grace.saturating_add(PUMP_TEARDOWN),
-                            pty.child_mut().wait(),
-                        )
-                        .await;
-                        gate.retire();
-                        r
-                    };
-                    let (teardown, reap) = tokio::join!(teardown, reap);
-                    if let Err(source) = teardown {
-                        return Err(TeardownFailure {
-                            cause,
-                            operation: "process-group graceful escalation",
-                            source,
-                        });
-                    }
-                    if let Err(source) = reap {
-                        return Err(TeardownFailure {
-                            cause,
-                            operation: "PTY child terminal reap",
-                            source,
-                        });
-                    }
+            Backend::Pty(pty) => {
+                let own_group = pty.own_group.clone();
+                (ReapableChild::Pty(pty.child_mut()), own_group)
+            }
+            Backend::Scripted(s) => {
+                s.kill();
+                return Ok(());
+            }
+        };
+        let target = child.target();
+        let terminal_reap_operation = child.terminal_reap_operation();
+        #[cfg(not(unix))]
+        let hard_kill_operation = child.hard_kill_operation();
+        #[cfg(unix)]
+        let hard_kill_escalation_operation = child.hard_kill_escalation_operation();
+        let shared_group_gate_invariant = child.shared_group_gate_invariant();
+
+        match own_group {
+            // Own group: the group-scoped driver signals and escalates the whole
+            // tree while the child is reaped concurrently, so a graceful exit
+            // ends the window early. The bounded reap still covers D-state tasks.
+            Some(group) => {
+                let teardown = async move { group_graceful_kill(&group, grace, signal).await };
+                let reap = async {
+                    let result =
+                        confirm_reap(grace.saturating_add(PUMP_TEARDOWN), child.wait()).await;
+                    // Group teardown never raw-kills by the direct pid. Retiring
+                    // here stands down any external watchdog after the reap.
+                    gate.retire();
+                    result
+                };
+                let (teardown, reap) = tokio::join!(teardown, reap);
+                if let Err(source) = teardown {
+                    return Err(TeardownFailure {
+                        cause,
+                        operation: "process-group graceful escalation",
+                        source,
+                    });
                 }
-                None => {
-                    // Same caller contract as the `Real` shared-group branch above,
-                    // for the same reason (the retire below trails the reap).
-                    debug_assert!(
-                        gate.is_retired(),
-                        "graceful_teardown's shared-group PTY branch requires the \
-                         caller to have retired the PidGate first"
-                    );
-                    #[cfg(unix)]
-                    {
-                        stream::signal_direct_child(pty.child_mut().id(), signal);
-                        let reaped_cleanly =
-                            confirm_reap(grace, pty.child_mut().wait()).await.is_ok();
-                        if !reaped_cleanly {
-                            let child_error =
-                                child_start_kill("pty", || pty.child_mut().start_kill()).err();
-                            let reap = confirm_reap(PUMP_TEARDOWN, pty.child_mut().wait()).await;
-                            if let Err(source) = reap {
-                                return Err(TeardownFailure {
-                                    cause,
-                                    operation: if child_error.is_some() {
-                                        "PTY child hard-kill escalation"
-                                    } else {
-                                        "PTY child terminal reap"
-                                    },
-                                    source: child_error.unwrap_or(source),
-                                });
-                            }
-                        }
-                    }
-                    #[cfg(not(unix))]
-                    {
-                        let _ = signal;
-                        let child_error =
-                            child_start_kill("pty", || pty.child_mut().start_kill()).err();
-                        let reap = confirm_reap(PUMP_TEARDOWN, pty.child_mut().wait()).await;
+                if let Err(source) = reap {
+                    return Err(TeardownFailure {
+                        cause,
+                        operation: terminal_reap_operation,
+                        source,
+                    });
+                }
+            }
+            // Shared group: only the direct child belongs to this handle. Every
+            // caller must retire before this branch because its trailing retire
+            // follows the pid-freeing reap. The owned child handle performs any
+            // hard escalation, so that kill cannot outlive its reaper.
+            None => {
+                debug_assert!(gate.is_retired(), "{shared_group_gate_invariant}");
+                #[cfg(unix)]
+                {
+                    stream::signal_direct_child(child.id(), signal);
+                    let reaped_cleanly = confirm_reap(grace, child.wait()).await.is_ok();
+                    if !reaped_cleanly {
+                        let child_error = child_start_kill(target, || child.start_kill()).err();
+                        let reap = confirm_reap(PUMP_TEARDOWN, child.wait()).await;
                         if let Err(source) = reap {
                             return Err(TeardownFailure {
                                 cause,
                                 operation: if child_error.is_some() {
-                                    "PTY child hard kill"
+                                    hard_kill_escalation_operation
                                 } else {
-                                    "PTY child terminal reap"
+                                    terminal_reap_operation
                                 },
                                 source: child_error.unwrap_or(source),
                             });
                         }
                     }
-                    gate.retire();
                 }
-            },
-            Backend::Scripted(s) => s.kill(),
+                #[cfg(not(unix))]
+                {
+                    let _ = signal;
+                    let child_error = child_start_kill(target, || child.start_kill()).err();
+                    let reap = confirm_reap(PUMP_TEARDOWN, child.wait()).await;
+                    if let Err(source) = reap {
+                        return Err(TeardownFailure {
+                            cause,
+                            operation: if child_error.is_some() {
+                                hard_kill_operation
+                            } else {
+                                terminal_reap_operation
+                            },
+                            source: child_error.unwrap_or(source),
+                        });
+                    }
+                }
+                gate.retire();
+            }
         }
         Ok(())
     }
@@ -3253,25 +3214,21 @@ impl RunningProcess {
         // in the same step, so a watchdog's gated raw kill can never observe the
         // pid live after this reap freed it. Being synchronous, this fully closes
         // the window the async `backend_wait` backstop can only bound.
-        let exited = gate.reap_under_lock(|| match &mut self.backend {
-            Backend::Real(real) => match real.child_mut().try_wait() {
-                Ok(Some(status)) => {
-                    observed = Some(outcome_of_exit_status(&status));
-                    true
+        let exited = gate.reap_under_lock(|| {
+            let mut child = match &mut self.backend {
+                Backend::Real(real) => ReapableChild::Real(real.child_mut()),
+                #[cfg(feature = "pty")]
+                Backend::Pty(pty) => ReapableChild::Pty(pty.child_mut()),
+                Backend::Scripted(s) => {
+                    observed = s.outcome_now();
+                    return observed.is_some();
                 }
-                Ok(None) | Err(_) => false,
-            },
-            #[cfg(feature = "pty")]
-            Backend::Pty(pty) => match pty.child_mut().try_wait() {
-                Ok(Some(status)) => {
-                    observed = Some(outcome_of_pty_exit_status(&status));
-                    true
-                }
-                Ok(None) | Err(_) => false,
-            },
-            Backend::Scripted(s) => {
-                observed = s.outcome_now();
-                observed.is_some()
+            };
+            if let Ok(Some(outcome)) = child.try_wait() {
+                observed = Some(outcome);
+                true
+            } else {
+                false
             }
         });
         if exited {
@@ -3334,21 +3291,21 @@ impl RunningProcess {
     /// [`ErrorReason::Io`] if the OS rejects the kill for a reason other than the
     /// child having already been reaped (which is treated as a no-op success).
     pub fn start_kill(&mut self) -> Result<()> {
-        match &mut self.backend {
-            Backend::Real(real) => match real.child_mut().start_kill() {
-                Ok(()) => {}
-                // tokio/std currently return `Ok` for a reaped child; treat
-                // `InvalidInput` as the same no-op in case that ever changes.
-                Err(e) if e.kind() == std::io::ErrorKind::InvalidInput => {}
-                Err(e) => return Err(Error::io(e)),
-            },
+        let mut child = match &mut self.backend {
+            Backend::Real(real) => ReapableChild::Real(real.child_mut()),
             #[cfg(feature = "pty")]
-            Backend::Pty(pty) => match pty.child_mut().start_kill() {
-                Ok(()) => {}
-                Err(e) if e.kind() == std::io::ErrorKind::InvalidInput => {}
-                Err(e) => return Err(Error::io(e)),
-            },
-            Backend::Scripted(s) => s.kill(),
+            Backend::Pty(pty) => ReapableChild::Pty(pty.child_mut()),
+            Backend::Scripted(s) => {
+                s.kill();
+                return Ok(());
+            }
+        };
+        match child.start_kill() {
+            Ok(()) => {}
+            // tokio/std currently return `Ok` for a reaped child; treat
+            // `InvalidInput` as the same no-op in case that ever changes.
+            Err(e) if e.kind() == std::io::ErrorKind::InvalidInput => {}
+            Err(e) => return Err(Error::io(e)),
         }
         Ok(())
     }
@@ -3948,6 +3905,24 @@ mod tests {
         command
     }
 
+    #[cfg(all(unix, feature = "process-control"))]
+    fn signal_ignoring_command(marker: &std::path::Path, use_pty: bool) -> Command {
+        let command = Command::new("sh").args([
+            "-c",
+            &format!(
+                "trap '' TERM; printf 'teardown-prefix\\n'; : > '{}'; sleep 60",
+                marker.display()
+            ),
+        ]);
+        #[cfg(feature = "pty")]
+        if use_pty {
+            return command.use_pty();
+        }
+        #[cfg(not(feature = "pty"))]
+        let _ = use_pty;
+        command
+    }
+
     fn completed_command(marker: &std::path::Path) -> Command {
         #[cfg(unix)]
         return Command::new("sh").args([
@@ -4195,6 +4170,79 @@ mod tests {
         run.start_kill().expect("direct-child cleanup kill");
         run.backend_wait().await.expect("cleanup reap");
         let _ = std::fs::remove_file(marker);
+    }
+
+    #[cfg(all(unix, feature = "process-control"))]
+    async fn assert_shared_graceful_escalation_failure(
+        use_pty: bool,
+        target: &'static str,
+        expected_operation: &'static str,
+    ) {
+        let marker = marker_path(target);
+        let group = ProcessGroup::new().expect("group");
+        let mut run = group
+            .start(&signal_ignoring_command(&marker, use_pty))
+            .await
+            .expect("start signal-ignoring shared child");
+        wait_for_marker(&marker).await;
+        // Mirror the retire-before-pid-delivery handoff in `drive_to_exit_inner`
+        // and `wait_exit` before entering shared-group graceful teardown.
+        run.pid_gate.retire();
+        tokio::time::pause();
+        let faults = crate::sys::fault_injection::Faults::new()
+            .fail_every(
+                crate::sys::fault_injection::Site::DirectChildKill,
+                Some(target),
+                5,
+            )
+            .arm();
+        let grace = Duration::from_secs(1);
+        let started = tokio::time::Instant::now();
+
+        let failure = run
+            .graceful_teardown(grace, crate::sys::SIGTERM_RAW, TeardownCause::Cancellation)
+            .await
+            .expect_err("the injected hard escalation must leave reap unconfirmed");
+        assert_eq!(failure.cause, TeardownCause::Cancellation);
+        assert_eq!(failure.operation, expected_operation);
+        assert_eq!(failure.source.raw_os_error(), Some(5));
+        assert!(
+            started.elapsed() >= grace.saturating_add(PUMP_TEARDOWN),
+            "the common path must wait through grace and its bounded reap"
+        );
+        assert_eq!(
+            faults.fired(crate::sys::fault_injection::Site::DirectChildKill),
+            1
+        );
+        assert!(
+            !group.members().expect("members").is_empty(),
+            "the injected escalation failure must leave a live group member"
+        );
+
+        drop(faults);
+        group.kill_all().expect("cleanup shared group");
+        run.backend_wait().await.expect("cleanup child reap");
+        let _ = std::fs::remove_file(marker);
+    }
+
+    #[cfg(all(unix, feature = "process-control"))]
+    #[tokio::test(flavor = "current_thread")]
+    #[ignore = "spawns a real shared-group child for graceful-escalation fault injection"]
+    async fn shared_real_graceful_escalation_preserves_reap_timeout_failure() {
+        assert_shared_graceful_escalation_failure(
+            false,
+            "real",
+            "direct child hard-kill escalation",
+        )
+        .await;
+    }
+
+    #[cfg(all(unix, feature = "process-control", feature = "pty"))]
+    #[tokio::test(flavor = "current_thread")]
+    #[ignore = "spawns a shared-group PTY child for graceful-escalation fault injection"]
+    async fn shared_pty_graceful_escalation_preserves_reap_timeout_failure() {
+        assert_shared_graceful_escalation_failure(true, "pty", "PTY child hard-kill escalation")
+            .await;
     }
 
     #[tokio::test(flavor = "current_thread")]
