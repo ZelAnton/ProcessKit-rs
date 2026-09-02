@@ -804,7 +804,10 @@ pub(super) fn kill_via_weak(group: &Weak<ProcessGroup>, gate: &PidGate) -> std::
 /// shared-group timeout path, which owns no group and so reaches only its own
 /// direct child. Sends `signal`, polls liveness up to `grace`, then `SIGKILL`s a
 /// survivor; a child that exits on the signal ends the poll early and skips the
-/// hard kill. Windows has no signal tier — hard kill.
+/// hard kill. Linux/Android and Apple identify that exit before reap by reading
+/// the child's non-zombie state; the bare BSDs retain their signal-0 fallback and
+/// therefore cannot distinguish an unreaped zombie until the owner retires its
+/// pid gate. Windows has no signal tier — hard kill.
 ///
 /// The signal → poll → kill algorithm lives in the shared unix driver
 /// `crate::sys::graceful::run_pid`, which documents the load-bearing
