@@ -1757,12 +1757,14 @@ impl PipelineSession {
     ///
     /// # Panics
     ///
-    /// Has the same runtime requirements as [`RunningProcess::stdout_lines`](crate::RunningProcess::stdout_lines):
-    /// successful streaming setup needs an active Tokio runtime for the line
-    /// pumps, while the documented error path for non-piped or already-consumed
-    /// stdout returns before spawning. A runtime with its time driver enabled is
-    /// required when the last stage has a timeout or output-inactivity timeout
-    /// configured. It is also required when any stage has `cancel_grace`
+    /// A live pipeline session requires an active Tokio runtime with its time
+    /// driver enabled. Pipeline startup always arms the last-stage watcher, whose
+    /// polling uses [`tokio::time::sleep`], even when no timeout, output-inactivity
+    /// timeout, or graceful cancellation is configured. Successful streaming setup
+    /// also needs the runtime for the line pumps; the documented error path for
+    /// non-piped or already-consumed stdout still returns before spawning them.
+    /// The time driver is also used when the last stage has a timeout or
+    /// output-inactivity timeout configured, or when any stage has `cancel_grace`
     /// configured and a cancellation token fires; merely configuring the grace
     /// window without cancellation does not arm that timer.
     pub fn stdout_lines(&mut self) -> Result<StdoutLines> {
@@ -1785,12 +1787,14 @@ impl PipelineSession {
     ///
     /// # Panics
     ///
-    /// Has the same runtime requirements as [`RunningProcess::events`](crate::RunningProcess::events):
-    /// successful streaming setup needs an active Tokio runtime for the line
-    /// pumps, while the documented error path for non-piped or already-consumed
-    /// stdout returns before spawning. A runtime with its time driver enabled is
-    /// required when the last stage has a timeout or output-inactivity timeout
-    /// configured. It is also required when any stage has `cancel_grace`
+    /// A live pipeline session requires an active Tokio runtime with its time
+    /// driver enabled. Pipeline startup always arms the last-stage watcher, whose
+    /// polling uses [`tokio::time::sleep`], even when no timeout, output-inactivity
+    /// timeout, or graceful cancellation is configured. Successful streaming setup
+    /// also needs the runtime for the line pumps; the documented error path for
+    /// non-piped or already-consumed stdout still returns before spawning them.
+    /// The time driver is also used when the last stage has a timeout or
+    /// output-inactivity timeout configured, or when any stage has `cancel_grace`
     /// configured and a cancellation token fires; merely configuring the grace
     /// window without cancellation does not arm that timer.
     pub fn events(&mut self) -> Result<ProcessEvents> {
