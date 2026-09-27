@@ -2637,22 +2637,23 @@ impl Command {
         self.ok_codes.clone().unwrap_or_else(|| vec![0])
     }
 
-    /// The child's fully-resolved environment for the Windows raw-`CreateProcessW`
-    /// PTY spawn, which bypasses `std`'s env handling (ConPTY needs a raw spawn).
+    /// The child's fully-resolved environment for a Windows raw-`CreateProcessW`
+    /// spawn, which bypasses `std`'s env handling.
     ///
     /// `None` means "inherit the parent environment unchanged" (a null env block),
     /// `Some(list)` is the exact set of `KEY=VALUE` pairs the child should get —
     /// mirroring the [`env_clear`](Self::env_clear) / [`inherit_env`](Self::inherit_env)
     /// / [`env`](Self::env) / [`env_remove`](Self::env_remove) layering
-    /// [`build_tokio`](Self::build_tokio) applies (so a customized-env PTY run
+    /// [`build_tokio`](Self::build_tokio) applies (so a customized-env raw run
     /// matches a customized-env pipe run). UTF-8 keys are folded with the same
     /// ASCII-only case rule as [`env_key_eq`]; opaque keys retain their exact
     /// encoded bytes. The resulting canonical-key order also supplies the sorted
     /// Unicode environment block `CreateProcessW` requires. Computed only on
-    /// Windows, where the raw ConPTY spawn consumes it (on Unix the pty child
-    /// keeps `build_tokio`'s env, applied by `std`).
-    #[cfg(all(feature = "pty", windows))]
-    pub(crate) fn resolved_pty_env(&self) -> Option<Vec<(OsString, OsString)>> {
+    /// Windows, where raw spawns consume it (Unix spawns keep `build_tokio`'s env,
+    /// applied by `std`).
+    #[cfg(windows)]
+    #[allow(dead_code)] // used by raw Windows spawn paths with or without PTY
+    pub(crate) fn resolved_windows_env(&self) -> Option<Vec<(OsString, OsString)>> {
         let env_ops = self.spawn_env_ops();
         if !self.env_clear && self.inherit_env.is_none() && env_ops.is_empty() {
             return None; // no customization → inherit the parent env unchanged
@@ -6480,17 +6481,15 @@ mod tests {
         );
     }
 
-    #[cfg(all(feature = "pty", windows))]
+    #[cfg(windows)]
     #[test]
-    fn resolved_conpty_env_uses_shared_identity_defaults_and_explicit_overrides() {
+    fn resolved_windows_env_uses_shared_identity_defaults_and_explicit_overrides() {
         let env = Command::new("tui")
-            .use_pty()
-            .pty_size(120, 40)
             .env_clear()
             .env("columns", "132")
             .env_remove("LINES")
-            .resolved_pty_env()
-            .expect("PTY identity requires an explicit ConPTY environment block");
+            .resolved_windows_env()
+            .expect("customized raw Windows spawn needs an explicit environment block");
         let find = |name: &str| {
             env.iter()
                 .find(|(key, _)| key.to_string_lossy().eq_ignore_ascii_case(name))
@@ -6506,17 +6505,17 @@ mod tests {
         );
     }
 
-    #[cfg(all(feature = "pty", windows))]
+    #[cfg(windows)]
     #[test]
-    fn resolved_conpty_env_matches_ascii_only_key_identity() {
+    fn resolved_windows_env_matches_ascii_only_key_identity() {
         let env = Command::new("tui")
             .env_clear()
             .env("straße", "non-ascii")
             .env("STRASSE", "ascii")
             .env("path", "first")
             .env("PATH", "second")
-            .resolved_pty_env()
-            .expect("customized PTY environment");
+            .resolved_windows_env()
+            .expect("customized raw Windows environment");
 
         assert!(env.iter().any(|(key, value)| {
             key == OsStr::new("straße") && value == OsStr::new("non-ascii")
@@ -6534,9 +6533,9 @@ mod tests {
         assert_eq!(path_entries[0].1, OsStr::new("second"));
     }
 
-    #[cfg(all(feature = "pty", windows))]
+    #[cfg(windows)]
     #[test]
-    fn resolved_conpty_env_keeps_opaque_keys_exact() {
+    fn resolved_windows_env_keeps_opaque_keys_exact() {
         use std::ffi::OsString;
         use std::os::windows::ffi::OsStringExt;
 
@@ -6547,8 +6546,8 @@ mod tests {
             .env_clear()
             .env(&first, "first")
             .env(&second, "second")
-            .resolved_pty_env()
-            .expect("customized PTY environment");
+            .resolved_windows_env()
+            .expect("customized raw Windows environment");
 
         assert_eq!(env.len(), 2, "lossy U+FFFD keys must not collide");
         assert!(

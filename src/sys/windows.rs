@@ -748,12 +748,12 @@ impl Job {
         Ok(guard.disarm())
     }
 
-    /// Complete containment for a raw ConPTY child while applying the same Job
+    /// Complete containment for a raw Windows child while applying the same Job
     /// state disciplines as [`spawn`](Self::spawn): serialize against group
     /// suspend/resume walks, resume through the full suspend count, re-arm
     /// kill-on-close, and record an opt-in console process-group leader.
-    #[cfg(feature = "pty")]
-    pub(crate) fn contain_pty_child(
+    #[allow(dead_code)] // shared by ConPTY and feature-independent raw spawn paths
+    pub(crate) fn contain_raw_child(
         &self,
         process: HANDLE,
         primary_thread: HANDLE,
