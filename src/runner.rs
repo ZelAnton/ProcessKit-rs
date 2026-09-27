@@ -1145,7 +1145,7 @@ async fn launch_pty(
     // applied to `tokio_cmd`, so it must not materialize a Windows env block.
     #[cfg(windows)]
     let pty = group
-        .spawn_pty_with_options(&mut tokio_cmd, &opts, command.resolved_pty_env())
+        .spawn_pty_with_options(&mut tokio_cmd, &opts, command.resolved_windows_env())
         .map_err(|e| map_spawn_error(command, e))?;
     #[cfg(not(windows))]
     let pty = group

@@ -215,6 +215,13 @@ pub(crate) mod pid_gate;
 #[cfg(windows)]
 pub(crate) mod channel_reader;
 
+// Shared primitives for Windows raw `CreateProcessW` backends. Kept outside the
+// opt-in PTY module so other Windows spawn paths can reuse the exact quoting,
+// environment-block, and wide-string conversions.
+#[cfg(windows)]
+#[allow(dead_code)] // raw spawn consumers can be feature-independent of ConPTY
+pub(crate) mod windows_spawn;
+
 // The opt-in PTY launch backend (`Command::use_pty`): `openpty` (Unix) /
 // `CreatePseudoConsole` ConPTY (Windows) instead of three pipes, wired into the
 // SAME per-platform containment path as `Job::spawn` (K-032). Compiled only with

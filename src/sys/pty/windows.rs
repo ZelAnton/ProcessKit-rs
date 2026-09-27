@@ -9,10 +9,9 @@
 //! Object every other child joins, then resumed — so kill-on-close reaps the PTY
 //! child's whole tree exactly as for a pipe-spawned run.
 
-use std::ffi::{OsStr, OsString};
+use std::ffi::OsString;
 use std::future::Future;
 use std::io;
-use std::os::windows::ffi::OsStrExt;
 use std::os::windows::io::FromRawHandle;
 use std::pin::Pin;
 use std::sync::{
@@ -46,6 +45,7 @@ use windows_sys::Win32::System::Threading::{
 use crate::sys::SpawnOptions;
 use crate::sys::channel_reader::{ChannelReader, ReaderMessage};
 use crate::sys::pid_gate::PidGate;
+use crate::sys::windows_spawn::{build_command_line, build_env_block, to_wide_nul};
 
 use super::{PtyExitStatus, PtyReader, PtySpawn, PtyWriter};
 
@@ -373,86 +373,6 @@ unsafe fn close(handle: HANDLE) {
     }
 }
 
-/// Append `arg` to a `CreateProcessW` command line using the MSVCRT quoting
-/// rules `std` applies internally (which it does not expose): quote when the arg
-/// is empty or holds whitespace, double any run of backslashes that precedes a
-/// quote (or the closing quote), and escape embedded quotes.
-fn append_arg(out: &mut Vec<u16>, arg: &OsStr, force_quote: bool) {
-    let wide: Vec<u16> = arg.encode_wide().collect();
-    let quote = force_quote
-        || wide.is_empty()
-        || wide
-            .iter()
-            .any(|&c| c == u16::from(b' ') || c == u16::from(b'\t'));
-    if quote {
-        out.push(u16::from(b'"'));
-    }
-    let mut backslashes = 0usize;
-    for &c in &wide {
-        if c == u16::from(b'\\') {
-            backslashes += 1;
-        } else {
-            if c == u16::from(b'"') {
-                // 2n+1 backslashes before an embedded quote: the n already
-                // pushed in the loop, plus n+1 here.
-                for _ in 0..=backslashes {
-                    out.push(u16::from(b'\\'));
-                }
-            }
-            backslashes = 0;
-        }
-        out.push(c);
-    }
-    if quote {
-        // Double a trailing backslash run so it is not read as escaping the
-        // closing quote.
-        for _ in 0..backslashes {
-            out.push(u16::from(b'\\'));
-        }
-        out.push(u16::from(b'"'));
-    }
-}
-
-/// Build the NUL-terminated UTF-16 command line for the child from the resolved
-/// program and its arguments (read back from the tokio `Command`).
-fn build_command_line(cmd: &Command) -> Vec<u16> {
-    let std_cmd = cmd.as_std();
-    let mut line: Vec<u16> = Vec::new();
-    append_arg(&mut line, std_cmd.get_program(), true);
-    for arg in std_cmd.get_args() {
-        line.push(u16::from(b' '));
-        append_arg(&mut line, arg, false);
-    }
-    line.push(0);
-    line
-}
-
-/// Build the double-NUL-terminated UTF-16 environment block, or `None` to inherit
-/// the parent environment unchanged.
-fn build_env_block(env: Option<Vec<(OsString, OsString)>>) -> Option<Vec<u16>> {
-    let pairs = env?;
-    let mut block: Vec<u16> = Vec::new();
-    for (k, v) in pairs {
-        block.extend(k.encode_wide());
-        block.push(u16::from(b'='));
-        block.extend(v.encode_wide());
-        block.push(0);
-    }
-    // The block ends with an extra NUL; an empty block is just "\0\0".
-    block.push(0);
-    if block.len() == 1 {
-        block.push(0);
-    }
-    Some(block)
-}
-
-/// A NUL-terminated wide string for a `PCWSTR` argument.
-fn to_wide_nul(s: &OsStr) -> Vec<u16> {
-    let mut v: Vec<u16> = s.encode_wide().collect();
-    v.push(0);
-    v
-}
-
 /// Whether the launching process is itself attached to a console.
 ///
 /// `GetConsoleWindow` returns null exactly when this process has no console — the
@@ -708,7 +628,7 @@ impl Drop for SpawnRollback {
 /// Spawn `cmd` under a ConPTY, assigning the child to `job` for containment.
 ///
 /// `env` is the child's resolved environment (see
-/// [`Command::resolved_pty_env`](crate::Command)). The platform `Job` owns the
+/// [`Command::resolved_windows_env`](crate::Command)). The platform `Job` owns the
 /// assign/resume synchronization and graceful-control bookkeeping, keeping this
 /// raw launch path aligned with ordinary Windows spawn.
 pub(crate) fn spawn_pty(
@@ -942,7 +862,7 @@ where
     // assign → affinity → resume sequence, then re-arms survivor teardown and
     // records any CTRL leader. `rollback` still owns every resource if containment
     // itself fails.
-    job.contain_pty_child(
+    job.contain_raw_child(
         rollback.process_handle(),
         rollback.primary_thread_handle(),
         pid,
@@ -1990,7 +1910,7 @@ mod tests {
         );
 
         // The failed launch must not clear the spare latch: dropping the Job keeps
-        // the pre-existing child alive. A premature contain_pty_child call clears
+        // the pre-existing child alive. A premature contain_raw_child call clears
         // it and makes the process exit through KILL_ON_JOB_CLOSE. Poll rather than
         // awaiting `Child::wait`, which deliberately closes piped stdin first and
         // would itself make the interactive shell exit.
