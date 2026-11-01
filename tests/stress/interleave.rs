@@ -44,8 +44,8 @@
 //!    Linux every group's cgroup directory is removed on drop (reusing the
 //!    `common.rs` reap helpers).
 //!
-//! Gated behind `PROCESSKIT_STRESS` like every scenario here, so the normal PR
-//! matrix compiles it but pays nothing; the nightly `stress.yml` runs it.
+//! `PROCESSKIT_STRESS` enables this scenario.
+//! The normal PR matrix checks compilation, and the weekly `stress.yml` executes the scenario.
 
 use std::sync::Arc;
 use std::time::Duration;

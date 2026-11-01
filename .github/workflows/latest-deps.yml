@@ -5,8 +5,8 @@ name: latest dependencies
 # that breaks library consumers is visible before the next lockfile update.
 on:
   schedule:
-    # 05:37 UTC daily -- staggered after the 03:17/04:07 heavy scheduled tiers.
-    - cron: '37 5 * * *'
+    # Saturday at 05:37 UTC starts after the other scheduled test tiers.
+    - cron: '37 5 * * 6'
   workflow_dispatch:
 
 permissions:

@@ -546,13 +546,10 @@ once.
 
 ## How the crate tests itself: the stress tier
 
-The doubles above are for testing *your* code. The crate's own suite has an
-extra, non-functional layer you'll only meet if you hack on `processkit`
-itself: an opt-in **stress tier** (`tests/stress/`) that exercises behaviour at
-scale and under multiplicity — spawn bursts, cancel storms, mass teardown, and
-buffer floods. It is gated behind the `PROCESSKIT_STRESS` env var (so the normal
-PR matrix compiles it for free but pays nothing) and runs on its own scheduled /
-on-demand CI leg (`.github/workflows/stress.yml`), never in the fast PR run.
+The doubles above test your code.
+The crate also has an optional **stress tier** (`tests/stress/`) for spawn bursts, cancellation storms, mass teardown, and buffer floods.
+The normal PR matrix compiles this tier but skips its scenarios unless `PROCESSKIT_STRESS` enables them.
+The separate workflow (`.github/workflows/stress.yml`) runs these scenarios weekly on Saturday at 03:17 UTC and on manual dispatch.
 
 Its most searching scenario is the **seeded randomized-interleaving harness**
 (`tests/stress/interleave.rs`). A seed deterministically generates a *random

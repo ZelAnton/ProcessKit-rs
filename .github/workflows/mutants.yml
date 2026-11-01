@@ -1,11 +1,9 @@
 name: mutants
 
-# cargo-mutants exhaustively mutates the examined modules (scope defined in
-# .cargo/mutants.toml, which cargo-mutants auto-loads from the workspace root)
-# and re-runs the whole test suite for every mutant, which is far too slow and
-# noisy to gate a PR — even over a small, hermetic scope a full sweep can take
-# tens of minutes. Like the stress and fuzz tiers, it stays OUTSIDE the PR
-# matrix: nightly on a schedule and on-demand via the Actions tab.
+# cargo-mutants reads its scope from .cargo/mutants.toml in the workspace root.
+# It mutates the selected modules and runs the whole test suite for each mutant.
+# A full run can take tens of minutes, even for a small scope.
+# Like stress and fuzz, this tier runs weekly and on manual dispatch, outside the PR matrix.
 #
 # Why this tier is sharded (T-103)
 # --------------------------------
@@ -145,8 +143,8 @@ name: mutants
 # on the affected shard (the T-130 follow-up observation point).
 on:
   schedule:
-    # 05:29 UTC daily — staggered from stress.yml (03:17) and fuzz.yml (04:07).
-    - cron: '29 5 * * *'
+    # Saturday at 05:29 UTC separates this start from stress and fuzz.
+    - cron: '29 5 * * 6'
   workflow_dispatch:
 
 env:

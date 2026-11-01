@@ -6,9 +6,9 @@
 
 use processkit::Command;
 
-/// The stress tier is **opt-in**: every scenario early-returns unless
-/// `PROCESSKIT_STRESS` is set, so the normal PR matrix compiles the tier (free
-/// breakage-checking) but doesn't pay its cost. The nightly workflow sets it.
+/// `PROCESSKIT_STRESS` enables the stress scenarios.
+/// The normal PR matrix compiles them but skips execution when the variable is unset.
+/// The weekly workflow sets the variable.
 ///
 /// Returns `true` (and prints why) when the caller should skip. Use as the
 /// first line of each scenario: `if skip_unless_enabled("name") { return; }`.

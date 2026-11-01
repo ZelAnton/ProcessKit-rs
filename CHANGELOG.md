@@ -15,7 +15,10 @@ to a dated version section.
 -
 
 ### Changed
--
+
+- Run stress, fuzz, benchmark, mutation, and latest-dependency checks weekly to reduce GitHub Actions usage.
+  Manual runs remain available.
+  Retain fuzz corpora and Criterion baselines as artifacts for 30 days between runs.
 
 ### Fixed
 

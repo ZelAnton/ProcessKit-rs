@@ -2,11 +2,11 @@
 //! multiplicity, the dimension the correctness suite (`tests/integration`)
 //! doesn't cover.
 //!
-//! These spawn many real processes (50–100 at once, 100k-line floods, restart
-//! storms), so they are **gated behind the `PROCESSKIT_STRESS` env var** rather
-//! than `#[ignore]`: the normal PR matrix still *compiles* this binary (free
-//! breakage-checking) but every scenario early-returns instantly when the var
-//! is unset. The nightly `stress.yml` workflow sets it and runs them for real:
+//! These scenarios start 50–100 real processes at once, flood output with 100k lines,
+//! and cause restart storms.
+//! The `PROCESSKIT_STRESS` environment variable enables them without `#[ignore]`.
+//! The normal PR matrix compiles this binary but skips the scenarios when the variable is unset.
+//! The weekly `stress.yml` workflow sets the variable and runs the scenarios:
 //!
 //! ```text
 //! PROCESSKIT_STRESS=1 cargo test --all-features --test stress -- --test-threads=1
@@ -16,10 +16,8 @@
 //! (and a 100k-line flood), so running them in parallel would oversubscribe the
 //! machine and make the per-scenario timeouts meaningless.
 //!
-//! A skipped scenario (var unset) is recorded by libtest as a *pass*, not a
-//! skip — there is no stable runtime-skip API. That is fine for the PR matrix
-//! (whose only job here is to keep this binary compiling); the nightly is what
-//! actually exercises the scenarios.
+//! Libtest records a disabled scenario as a pass because it has no stable API for runtime skips.
+//! The PR matrix checks compilation, and the weekly workflow executes the scenarios.
 //!
 //! Each scenario asserts *correctness under load* — everything spawns, drains,
 //! dies, and is collected — never wall-clock numbers, which are inherently noisy.

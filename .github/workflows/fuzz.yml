@@ -7,9 +7,13 @@ name: fuzz
 # matrix: scheduled and on-demand only, never blocking a push/PR.
 on:
   schedule:
-    # 04:07 UTC daily — off the top of the hour, staggered from stress.yml's 03:17.
-    - cron: '7 4 * * *'
+    # Saturday at 04:07 UTC starts after stress.yml at 03:17.
+    - cron: '7 4 * * 6'
   workflow_dispatch:
+
+permissions:
+  contents: read
+  actions: read
 
 env:
   CARGO_TERM_COLOR: always
@@ -42,6 +46,12 @@ jobs:
           key: fuzz-corpus-${{ runner.os }}-${{ matrix.target }}-${{ github.run_id }}-${{ github.run_attempt }}
           restore-keys: |
             fuzz-corpus-${{ runner.os }}-${{ matrix.target }}-
+      # Artifacts preserve the corpus when caches expire between weekly runs.
+      - name: Restore retained fuzz corpus
+        run: bash tools/restore_scheduled_artifact.sh "fuzz-${{ matrix.target }}-corpus" "fuzz/corpus/${{ matrix.target }}"
+        env:
+          GH_TOKEN: ${{ github.token }}
+          DEFAULT_BRANCH: ${{ github.event.repository.default_branch }}
       # Bounded wall-clock budget (10 minutes): enough to catch regressions on
       # a schedule without an open-ended job. Run longer locally for a deeper
       # sweep: `cargo +nightly fuzz run <target>`.
@@ -65,6 +75,15 @@ jobs:
         with:
           path: fuzz/corpus/${{ matrix.target }}
           key: fuzz-corpus-${{ runner.os }}-${{ matrix.target }}-${{ github.run_id }}-${{ github.run_attempt }}
+      - name: Upload fuzz corpus
+        if: ${{ !cancelled() && steps.fuzz.outcome != 'skipped' }}
+        uses: actions/upload-artifact@v7
+        with:
+          name: fuzz-${{ matrix.target }}-corpus
+          path: fuzz/corpus/${{ matrix.target }}
+          if-no-files-found: warn
+          retention-days: 30
+          overwrite: true
       - name: Upload crash artifacts
         if: ${{ always() && steps.fuzz.outcome == 'failure' }}
         uses: actions/upload-artifact@v7

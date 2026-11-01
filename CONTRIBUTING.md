@@ -55,6 +55,35 @@ When a stable `name()` / `from_name()` dictionary changes, update the canonical
 dictionary from the public enum methods and byte-compares it with the committed
 manifest.
 
+### Scheduled verification
+
+The expensive verification workflows run once each week to reduce GitHub Actions usage.
+The schedule uses Saturday and UTC:
+
+| Workflow | Start time |
+| --- | --- |
+| `stress.yml` | 03:17 |
+| `fuzz.yml` | 04:07 |
+| `bench.yml` | 04:37 |
+| `mutants.yml` | 05:29 |
+| `latest-deps.yml` | 05:37 |
+
+Use `workflow_dispatch` to start an additional run.
+Push and pull request checks keep their existing coverage.
+The dependency advisory scan still runs daily at 06:13 UTC.
+
+Fuzz corpora and Criterion baselines use retained artifacts as well as caches.
+GitHub can remove caches after seven days without access, so weekly runs also restore artifacts.
+The artifacts remain available for 30 days.
+Restoration selects the latest artifact from the current branch, with the default branch as a fallback.
+If no artifact exists, the workflow uses the available cache or seed data.
+
+Run the artifact restoration tests with this command:
+
+```bash
+python3 -m unittest discover -s tools -p test_restore_scheduled_artifact.py
+```
+
 ### Build-disk maintenance
 
 Cargo does not garbage-collect obsolete incremental sessions under `target/`.
